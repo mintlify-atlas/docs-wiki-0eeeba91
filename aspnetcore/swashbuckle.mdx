@@ -1,0 +1,223 @@
+---
+title: "Swashbuckle Integration — ABP-Aware Swagger Document UI"
+sidebarTitle: "Swashbuckle"
+description: "Volo.Abp.Swashbuckle — AbpSwashbuckleModule, ABP-aware Swagger UI HTML, OIDC flow model and the schema/document filters that hide infrastructure types."
+---
+
+`Volo.Abp.Swashbuckle` is the framework's wrapper around `Swashbuckle.AspNetCore`. It is not a re‑implementation — it just adds a handful of filters and a custom Swagger UI HTML resolver so the generated OpenAPI document and Swagger UI look right when the API is composed of auto‑generated ABP controllers, OIDC‑secured endpoints and dynamic JS proxies.
+
+Module path: `framework/src/Volo.Abp.Swashbuckle/Volo/Abp/Swashbuckle/`.
+
+## Module declaration
+
+```csharp
+// AbpSwashbuckleModule.cs
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpSwashbuckleModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSwashbuckleModule>();
+        });
+    }
+}
+```
+
+The module embeds its own Swagger UI assets (`index.html`, JS, CSS) as virtual files so a custom `ISwaggerHtmlResolver` can substitute them at runtime. This is what enables features like the ABP‑themed Swagger UI in the application templates and the tenant‑aware "Authorize" dialog.
+
+## `Volo/Abp/Swashbuckle/` files
+
+| File | Role |
+| --- | --- |
+| `AbpSwashbuckleModule.cs` | The `AbpModule` shown above. |
+| `AbpSwaggerOidcFlows.cs` | A small data class wrapping the OIDC flow definitions handed to `AddSwaggerGen(...)`. |
+| `AbpSwashbuckleController.cs` | Hosts the embedded `index.html` and serves it under the Swagger UI route. |
+| `AbpSwashbuckleDocumentFilter.cs` | `IDocumentFilter` that removes infrastructure controllers (e.g. `AbpApiDefinitionController`, integration services) from the OpenAPI document unless `AbpAspNetCoreMvcOptions.ExposeIntegrationServices` is true. |
+| `AbpSwashbuckleEnumSchemaFilter.cs` | `ISchemaFilter` that emits string enums with their declared names rather than ordinals, and adds an `x-enumNames` extension consumed by NSwag‑based clients. |
+| `ISwaggerHtmlResolver.cs` / `SwaggerHtmlResolver.cs` | Replaces the static `index.html` served by Swashbuckle with the embedded ABP variant. |
+
+### Microsoft DI extensions
+
+The module also ships the `AddAbpSwaggerGen(...)`, `AddAbpSwaggerGenWithOAuth(...)`, `UseAbpSwaggerUI(...)` extension methods under `Microsoft/Extensions/DependencyInjection/` and `Microsoft/AspNetCore/Builder/` — chosen namespaces so they appear in the standard `using Microsoft.Extensions.DependencyInjection;` `using Microsoft.AspNetCore.Builder;` blocks the host already has.
+
+## `AddAbpSwaggerGen` — what it adds on top of `AddSwaggerGen`
+
+```csharp
+public static IServiceCollection AddAbpSwaggerGen(
+    this IServiceCollection services,
+    Action<SwaggerGenOptions> setupAction = null)
+{
+    return services.AddSwaggerGen(options =>
+    {
+        options.DocumentFilter<AbpSwashbuckleDocumentFilter>();
+        options.SchemaFilter<AbpSwashbuckleEnumSchemaFilter>();
+        // ABP-specific operation conventions
+        setupAction?.Invoke(options);
+    });
+}
+```
+
+Concrete behaviors layered on top of vanilla Swashbuckle:
+
+- **`AbpSwashbuckleDocumentFilter`** strips endpoints whose `AbpRemoteServiceConvention` group is "Integration" (matched against `AbpAspNetCoreMvcOptions.IgnoredControllersOnModelExclusion`). The result: internal microservice‑to‑microservice endpoints don't pollute the user‑facing Swagger doc.
+- **`AbpSwashbuckleEnumSchemaFilter`** loops `OpenApiSchema.Enum` and pushes `OpenApiString(name)` instead of `OpenApiInteger(value)` so the rendered Swagger UI shows `"Active"` instead of `1`. It also writes the `x-enumNames` extension array used by the dynamic TypeScript proxy generator.
+- ABP also adds a convention that sets `OperationId` deterministically from the application service method name (rather than Swashbuckle's default that includes controller class name + verb), so OIDC `clientId` allow‑lists per operation are stable across releases.
+
+## OIDC flow descriptor
+
+```csharp
+// AbpSwaggerOidcFlows.cs (excerpt)
+public class AbpSwaggerOidcFlows
+{
+    public OpenApiOAuthFlow AuthorizationCode { get; set; }
+    public OpenApiOAuthFlow Implicit { get; set; }
+    public OpenApiOAuthFlow Password { get; set; }
+    public OpenApiOAuthFlow ClientCredentials { get; set; }
+}
+```
+
+Passed to `AddAbpSwaggerGenWithOAuth(...)` so the "Authorize" dialog in Swagger UI offers Authorization Code + PKCE by default, matching the templates' OpenIddict configuration.
+
+## `AddAbpSwaggerGenWithOAuth` — typical host wiring
+
+```csharp
+context.Services.AddAbpSwaggerGenWithOAuth(
+    authority: configuration["AuthServer:Authority"],
+    scopes: new Dictionary<string, string>
+    {
+        { "MyApp", "MyApp API" }
+    },
+    setupAction: options =>
+    {
+        options.SwaggerDoc("v1", new OpenApiInfo { Title = "MyApp API", Version = "v1" });
+    });
+```
+
+This registers:
+
+1. The two filters above.
+2. An `AddSecurityDefinition("oauth2", ...)` of type `OAuth2` with the flows from `AbpSwaggerOidcFlows`.
+3. An `AddSecurityRequirement(...)` that attaches `oauth2` to every operation by default.
+
+## `UseAbpSwaggerUI` — server‑side wiring
+
+```csharp
+app.UseAbpSwaggerUI(options =>
+{
+    options.SwaggerEndpoint("/swagger/v1/swagger.json", "MyApp API");
+
+    options.OAuthClientId(configuration["AuthServer:SwaggerClientId"]);
+    options.OAuthScopes("MyApp");
+    options.OAuthUsePkce();
+});
+```
+
+`UseAbpSwaggerUI`:
+
+- Substitutes the embedded `index.html` via `ISwaggerHtmlResolver` — this is the file that contains the "ABP_OAuthInitInfo" script reading `__tenant` from the URL and forwarding it as a request header so authorize calls land on the right tenant.
+- Calls Swashbuckle's `UseSwaggerUI(...)` underneath with the customized options.
+
+## `AbpSwashbuckleController`
+
+A thin controller exposing two endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/swagger/ui-static/{**file}` | Streams the embedded JS/CSS from the virtual file system. |
+| `/swagger/abp-config.json` | Returns runtime config (current tenant, OAuth client id) that the embedded `index.html` reads on load. |
+
+These exist so the Swagger UI works without copying the customized HTML to `wwwroot/` and without requiring a build step for the host.
+
+## `AbpSwashbuckleDocumentFilter` in detail
+
+The filter iterates the OpenAPI document's `Paths` collection. For each path:
+
+1. Resolves the matching `ApiDescription` from the `ApiDescriptionGroupCollection`.
+2. Checks `RemoteServiceAttribute.IsMetadataEnabled` on the action's `MethodInfo` and on the controller type.
+3. Checks `AbpAspNetCoreMvcOptions.IgnoredControllersOnModelExclusion`.
+4. If either says the operation is internal, removes the path.
+
+This filter is what makes `[RemoteService(IsMetadataEnabled = false)]` actually hide an endpoint from Swagger — without the filter, Swashbuckle would still emit it.
+
+## Combining with the dynamic JS proxies
+
+The dynamic `/api/abp/api-definition` endpoint (in `Volo.Abp.AspNetCore.Mvc.ApiExploring`) emits a JSON description of all controllers used by the client SDK's proxy generator. The two endpoints are independent:
+
+- `/swagger/v1/swagger.json` is the OpenAPI document — consumed by Swagger UI, NSwag CLI, Postman.
+- `/api/abp/api-definition` is ABP's own description — consumed by `@abp/utils` to generate strongly typed JS proxies at SPA build time.
+
+`AbpSwashbuckleDocumentFilter` only affects the former. The latter has its own filtering via `AbpApiDescriptionModelOptions.IgnoredInterfaces`.
+
+## `AbpSwashbuckleEnumSchemaFilter` in detail
+
+```csharp
+// AbpSwashbuckleEnumSchemaFilter.cs (paraphrased)
+public class AbpSwashbuckleEnumSchemaFilter : ISchemaFilter
+{
+    public void Apply(OpenApiSchema schema, SchemaFilterContext context)
+    {
+        if (context.Type.IsEnum)
+        {
+            schema.Enum.Clear();
+            foreach (var name in Enum.GetNames(context.Type))
+            {
+                schema.Enum.Add(new OpenApiString(name));
+            }
+            // x-enumNames extension consumed by NSwag / @abp/utils proxy generator
+            schema.Extensions["x-enumNames"] = new OpenApiArray(/* names */);
+        }
+    }
+}
+```
+
+Without this filter, the generated TypeScript SDK would use numeric enum values, which (a) break when an enum member is renumbered in a later release and (b) make API console examples harder to read.
+
+## Custom `ISwaggerHtmlResolver`
+
+```csharp
+// ISwaggerHtmlResolver.cs
+public interface ISwaggerHtmlResolver
+{
+    string Resolve(SwaggerUIOptions options);
+}
+```
+
+The default implementation `SwaggerHtmlResolver` reads the embedded `Volo/Abp/Swashbuckle/index.html` (added via `options.FileSets.AddEmbedded<AbpSwashbuckleModule>()`) and substitutes placeholders like `{{abpConfigUrl}}` so the page boots with the right tenant key and OAuth client id.
+
+Custom hosts can swap the resolver:
+
+```csharp
+context.Services.Replace(
+    ServiceDescriptor.Singleton<ISwaggerHtmlResolver, MyBrandedHtmlResolver>());
+```
+
+## Why a custom Swagger UI HTML at all?
+
+Vanilla Swashbuckle's `IndexStream` returns a static file with hard‑coded asset URLs. ABP needs:
+
+1. A `__tenant` cookie / header switch in the "Authorize" dialog.
+2. A configurable OAuth `clientId` and `scopes` per environment (read at runtime from `abp-config.json`, not baked at build time).
+3. Theme integration (the LeptonX themes change Swagger UI colours).
+
+Embedding the HTML and serving it from `AbpSwashbuckleController` is what makes all three possible without forcing every host to copy the HTML to `wwwroot/`.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    `AbpAspNetCoreMvcOptions.ExposeIntegrationServices` and `IgnoredControllersOnModelExclusion` consulted by the document filter.
+  </Card>
+  <Card title="Controllers & conventions" icon="route" href="/aspnetcore/mvc-controllers-and-conventions">
+    `[RemoteService(IsMetadataEnabled = false)]` is how authors opt an action out of Swagger.
+  </Card>
+  <Card title="OpenID Connect" icon="lock" href="/aspnetcore/auth-openidconnect">
+    The auth flow that powers Swagger UI's "Authorize" dialog.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    Where the Swagger UI is mounted relative to authentication and authorization.
+  </Card>
+</CardGroup>

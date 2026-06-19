@@ -1,0 +1,363 @@
+---
+title: "build/ — Build Scripts"
+description: "Every PowerShell script in the build/ folder explained: common.ps1, build-all.ps1, build-all-release.ps1, test-all.ps1. Parameters, side effects, and real excerpts."
+---
+
+The `build/` folder at the repo root contains just four PowerShell files. They are the entry points that compile and test every solution in the ABP repository, and they're called by both [GitHub Actions](/build/ci-and-versioning) (`build-and-test.yml`) and the [release pipeline](/build/deploy-scripts) (`1-fetch-and-build.ps1` → `build-all-release.ps1`).
+
+## Folder contents
+
+```text build/
+build-all-release.ps1   # Full Release build, used by the deploy pipeline
+build-all.ps1           # Debug build (CI default + local dev)
+common.ps1              # Shared: solution list + the -f "full" switch
+test-all.ps1            # dotnet test --no-build with coverage
+```
+
+There are no other scripts here — `delete-bin-obj.ps1` (a frequent helper) lives at the repo root, not in `build/`, and the NuGet packaging scripts live in `nupkg/` (see [/build/deploy-scripts](/build/deploy-scripts#nuget-pack-and-push)).
+
+<Info>
+All four scripts assume the current directory is `build/`. They use `(Get-Item -Path "./" -Verbose).FullName` to capture `$rootFolder`, then `Join-Path $rootFolder $solutionPath` to resolve each solution path relative to it. Run them from anywhere else and `Set-Location` calls won't land where you expect.
+</Info>
+
+## `common.ps1` — the shared solution list
+
+This is the "library" that the other three scripts dot-source. It does two things: defines `$rootFolder` and builds `$solutionPaths` based on a single `-f` ("full") switch.
+
+<CodeGroup>
+```powershell common.ps1 — header
+$full = $args[0]
+
+# COMMON PATHS
+
+$rootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+# List of solutions used only in development mode
+$solutionPaths = @(
+        "../framework",
+        "../modules/basic-theme",
+        "../modules/users",
+        "../modules/permission-management",
+        "../modules/setting-management",
+        "../modules/feature-management",
+        "../modules/identity",
+        "../modules/identityserver",
+        "../modules/openiddict",
+        "../modules/tenant-management",
+        "../modules/audit-logging",
+        "../modules/background-jobs",
+        "../modules/account",
+        "../modules/cms-kit",
+        "../modules/blob-storing-database"
+    )
+```
+
+```powershell common.ps1 — the -f full mode
+if ($full -eq "-f")
+{
+    # List of additional solutions required for full build
+    $solutionPaths += (
+        "../modules/client-simulation",
+        "../modules/virtual-file-explorer",
+        "../modules/docs",
+        "../modules/blogging",
+        "../templates/module/aspnet-core",
+        "../templates/app/aspnet-core",
+        "../templates/console",
+        "../templates/app-nolayers/aspnet-core",
+        "../abp_io/AbpIoLocalization",
+        "../source-code"
+    )
+    if ($env:OS -eq "Windows_NT") {
+        $solutionPaths += "../templates/wpf"
+    }
+}else{
+    Write-host ""
+    Write-host ":::::::::::::: !!! You are in development mode !!! ::::::::::::::" `
+        -ForegroundColor red -BackgroundColor yellow
+    Write-host ""
+}
+```
+</CodeGroup>
+
+### How `-f` changes the build set
+
+| Without `-f` (dev mode)                         | With `-f` (full mode)                                          |
+| ----------------------------------------------- | -------------------------------------------------------------- |
+| 15 core solutions (`framework/` + base modules) | All dev solutions **plus** the heavy modules and all templates |
+| ~5 min on a workstation                         | ~30 min+                                                       |
+| Used by `build-all.ps1` (CI default)            | Used by `build-all-release.ps1`                                |
+| No template projects                            | All templates compiled (`app`, `app-nolayers`, `module`, `console`)<br/>plus `wpf` on Windows |
+| No `abp_io/AbpIoLocalization`                   | Includes `abp_io/AbpIoLocalization` and `source-code/`         |
+
+The big red yellow-background "development mode" banner is a deliberate warning: forgetting `-f` is the #1 cause of "I built locally and it worked but the release failed" because templates aren't compiled.
+
+### Parameters
+
+| Name        | Type     | Default | Effect                                                                 |
+| ----------- | -------- | ------- | ---------------------------------------------------------------------- |
+| `$args[0]`  | string   | `$null` | If equal to the literal string `-f`, appends the full-mode solutions.  |
+
+There is no `param(…)` block — the script reads `$args[0]` positionally. Any other value (or no argument) puts you in dev mode.
+
+## `build-all.ps1` — Debug build
+
+Dot-sources `common.ps1`, forwards whatever argument it received, then walks every solution running `dotnet build`.
+
+```powershell build-all.ps1
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Build all solutions
+
+Write-Host $solutionPaths
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+**Notes on the behaviour:**
+
+- `dotnet build` without `--configuration` defaults to **Debug**.
+- No `--no-restore` — each solution restores fresh. This is intentional because solutions don't share a lock file at this level.
+- Exits with `$LASTEXITCODE` on the first failure, after returning to `$rootFolder` so the shell isn't left somewhere random.
+- The `Write-Host $solutionPaths` at the top is for log clarity — CI logs show exactly which solutions are about to be built.
+
+### Usage
+
+```powershell
+# Dev-mode Debug build (what CI runs)
+cd build
+.\build-all.ps1
+
+# Full Debug build (rare; usually you want build-all-release.ps1 instead)
+.\build-all.ps1 -f
+```
+
+### When CI runs this
+
+`.github/workflows/build-and-test.yml` calls `./build-all.ps1` without `-f`:
+
+```yaml .github/workflows/build-and-test.yml (excerpt)
+- name: Build All
+  run: ./build-all.ps1
+  working-directory: ./build
+  shell: pwsh
+```
+
+That keeps the PR-time CI fast (~10 min on `ubuntu-22.04`) — templates aren't built on every PR, only on release.
+
+## `build-all-release.ps1` — Release build
+
+This is the script the release pipeline calls (via `deploy/1-fetch-and-build.ps1`). It hard-codes `-f` and passes `--configuration Release -- /maxcpucount`:
+
+```powershell build-all-release.ps1
+. ".\common.ps1" -f
+
+# Build all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+### Key differences vs `build-all.ps1`
+
+<CardGroup cols={2}>
+  <Card title="Hardcoded -f" icon="lock">
+    Always full mode. There's no way to do a "partial release build" with this script — that's by design.
+  </Card>
+  <Card title="--configuration Release" icon="rocket">
+    Triggers Release-mode optimizations and outputs to `bin/Release/`. Required because `nupkg/pack.ps1` later does `dotnet pack --no-build` and expects Release binaries.
+  </Card>
+  <Card title="/maxcpucount" icon="microchip">
+    The `--` separator passes the rest as MSBuild args. `/maxcpucount` (no value) tells MSBuild to use *all* logical CPUs for parallel project compilation within each solution.
+  </Card>
+  <Card title="No parameters" icon="circle-minus">
+    No `$args` at all — you cannot opt out of full Release. If you need flexibility, edit `common.ps1` directly.
+  </Card>
+</CardGroup>
+
+### Why `-- /maxcpucount` matters
+
+The `nupkg/pack.ps1` step later runs `dotnet pack` with the same flag:
+
+```powershell nupkg/pack.ps1 (excerpt)
+foreach($project in $projects) {
+    Set-Location $projectFolder
+    dotnet pack -c Release --no-build -- /maxcpucount
+    ...
+}
+```
+
+The `--no-build` flag depends on the artifacts produced here. If you skip `build-all-release.ps1` and try to pack, you get "Project file does not exist or has not been built" errors. Treat the build → pack chain as atomic.
+
+## `test-all.ps1` — Test runner
+
+Same shape as `build-all.ps1`, but runs `dotnet test` with coverage collection:
+
+```powershell test-all.ps1
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Test all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+### Flag breakdown
+
+| Flag                                | What it does                                                            |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `--no-build`                        | Trust the binaries from `build-all.ps1` or `build-all-release.ps1`.    |
+| `--no-restore`                      | Skip restore — the build script already restored.                       |
+| `--collect:"XPlat Code Coverage"`   | Use the cross-platform coverage collector (Coverlet).                   |
+
+The `coverlet.collector` reference that makes the third flag work comes from `Directory.Build.props` — it's auto-injected into every project whose path contains `test` and whose name ends with `.Tests` or `.TestBase`:
+
+```xml Directory.Build.props (recap)
+<PropertyGroup>
+  <IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test'))
+    and ($(MSBuildProjectName.EndsWith('.Tests'))
+    or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+</PropertyGroup>
+
+<ItemGroup>
+  <PackageReference Condition="'$(IsTestProject)' == 'true'" Include="coverlet.collector">
+    ...
+  </PackageReference>
+</ItemGroup>
+```
+
+That's why test projects don't need to add `coverlet.collector` themselves — see [/build/ci-and-versioning#directory-build-props](/build/ci-and-versioning#directory-build-props).
+
+### Codecov integration
+
+After `test-all.ps1` finishes, CI runs the Codecov upload action:
+
+```yaml .github/workflows/build-and-test.yml (excerpt)
+- name: Test All
+  run: ./test-all.ps1
+  working-directory: ./build
+  shell: pwsh
+
+- name: Codecov
+  uses: codecov/codecov-action@v2
+```
+
+The action auto-discovers `coverage.cobertura.xml` files written by Coverlet across every test project and uploads them to `codecov.io`. The repo's `codecov.yml` at the root configures coverage targets.
+
+## Running the scripts
+
+<Steps>
+  <Step title="Install the .NET SDK pinned by global.json">
+    `global.json` at the repo root pins the SDK with `rollForward: latestFeature`:
+    ```json global.json
+    {
+      "sdk": {
+        "version": "10.0.100",
+        "rollForward": "latestFeature"
+      }
+    }
+    ```
+    Any 10.0.x SDK will be picked up; older majors won't.
+  </Step>
+  <Step title="cd into build/">
+    ```powershell
+    cd build
+    ```
+    All four scripts use `./` and relative `../` paths — you must be in `build/` for them to work.
+  </Step>
+  <Step title="Dev iteration loop">
+    ```powershell
+    .\build-all.ps1
+    .\test-all.ps1
+    ```
+    Both default to dev mode (no `-f`), so they finish quickly.
+  </Step>
+  <Step title="Pre-PR check (mirror CI)">
+    ```powershell
+    .\build-all.ps1
+    .\test-all.ps1
+    ```
+    That's the exact pair CI runs. If both succeed locally and you haven't touched npm/Angular code, your PR will pass `build-and-test.yml`.
+  </Step>
+  <Step title="Release rehearsal">
+    ```powershell
+    .\build-all-release.ps1
+    ```
+    Required before running `nupkg/pack.ps1` — see [/build/deploy-scripts](/build/deploy-scripts).
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<Accordion title="`Build failed for the solution: ../templates/wpf`">
+  `templates/wpf` is only added in `-f` mode and only on `Windows_NT`. If you're on Linux/macOS and somehow this fires, check that `common.ps1` still has the `if ($env:OS -eq "Windows_NT")` guard. The WPF SDK targets net*-windows and won't restore on non-Windows.
+</Accordion>
+
+<Accordion title="`MSB1009: Project file does not exist` during pack">
+  You probably ran `nupkg/pack.ps1` without running `build-all-release.ps1` first. `pack.ps1` uses `dotnet pack --no-build` which requires existing Release binaries.
+</Accordion>
+
+<Accordion title="`dotnet test` succeeds but Codecov has no data">
+  Verify the test project's path contains the word `test` and its name ends with `.Tests` or `.TestBase` — the auto-injection in `Directory.Build.props` won't fire otherwise. Once that's right, `coverage.cobertura.xml` will land under `<project>/TestResults/<guid>/`.
+</Accordion>
+
+<Accordion title="`Set-Location : Cannot find path '../framework'`">
+  You're not in the `build/` directory. The scripts resolve relative to `pwd`, not to `$PSScriptRoot`.
+</Accordion>
+
+## Where to look next
+
+<CardGroup cols={3}>
+  <Card title="Deploy scripts" icon="rocket" href="/build/deploy-scripts">
+    `nupkg/pack.ps1`, `nupkg/push_packages.ps1`, the deploy/ orchestrator, and the npm side.
+  </Card>
+  <Card title="CI workflows" icon="github" href="/build/ci-and-versioning">
+    How `build-and-test.yml`, `angular.yml`, and `codeql-analysis.yml` wire up to these scripts.
+  </Card>
+  <Card title="Repository layout" icon="folder-tree" href="/overview/build-system">
+    The high-level tour of all the folders these scripts touch.
+  </Card>
+</CardGroup>
+
+## Recap
+
+- **`common.ps1`** is the only file you ever need to edit when adding a solution to the build set.
+- **`build-all.ps1`** = Debug, accepts `-f`, called by `.github/workflows/build-and-test.yml`.
+- **`build-all-release.ps1`** = Release, hardcoded `-f`, called by `deploy/1-fetch-and-build.ps1`.
+- **`test-all.ps1`** = `dotnet test --no-build` with cross-platform coverage, accepts `-f`.
+- All four scripts dot-source `common.ps1`, walk `$solutionPaths`, exit with `$LASTEXITCODE` on first failure, and end with `Set-Location $rootFolder`.

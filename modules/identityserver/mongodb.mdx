@@ -1,0 +1,520 @@
+---
+title: "MongoDB provider"
+description: "AbpIdentityServerMongoDbContext, the AbpIdentityServerMongoDbModule, and the Mongo*Repository implementations that persist Client, ApiResource, ApiScope, IdentityResource, PersistedGrant and DeviceFlowCodes as MongoDB documents."
+---
+
+<Info>
+Source root: `modules/identityserver/src/Volo.Abp.IdentityServer.MongoDB/`
+
+Use this provider when your application uses MongoDB. The aggregate roots and repository contracts that these classes implement are defined in the [Domain layer](/modules/identityserver/domain). For the relational equivalent, see [`/modules/identityserver/efcore`](/modules/identityserver/efcore).
+</Info>
+
+## Package layout
+
+```text
+Volo.Abp.IdentityServer.MongoDB/
+└── Volo/Abp/IdentityServer/MongoDB/
+    ├── AbpIdentityServerMongoDbContext.cs
+    ├── AbpIdentityServerMongoDbContextExtensions.cs
+    ├── AbpIdentityServerMongoDbModule.cs
+    ├── IAbpIdentityServerMongoDbContext.cs
+    ├── MongoApiResourceRepository.cs
+    ├── MongoApiScopeRepository.cs
+    ├── MongoClientRepository.cs
+    ├── MongoDeviceFlowCodesRepository.cs
+    ├── MongoIdentityResourceRepository.cs
+    └── MongoPersistentGrantRepository.cs
+```
+
+Compared to the [EF Core provider](/modules/identityserver/efcore), the MongoDB provider is dramatically smaller because the IdentityServer schema maps naturally to MongoDB's nested-document model — there is one collection per aggregate root, and all children are stored as embedded arrays inside that document.
+
+## `AbpIdentityServerMongoDbModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityServerDomainModule),
+    typeof(AbpMongoDbModule)
+)]
+public class AbpIdentityServerMongoDbModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<IIdentityServerBuilder>(
+            builder =>
+            {
+                builder.AddAbpStores();
+            }
+        );
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<AbpIdentityServerMongoDbContext>(options =>
+        {
+            options.AddRepository<ApiResource, MongoApiResourceRepository>();
+            options.AddRepository<ApiScope, MongoApiScopeRepository>();
+            options.AddRepository<IdentityResource, MongoIdentityResourceRepository>();
+            options.AddRepository<Client, MongoClientRepository>();
+            options.AddRepository<PersistedGrant, MongoPersistentGrantRepository>();
+            options.AddRepository<DeviceFlowCodes, MongoDeviceFlowCodesRepository>();
+        });
+    }
+}
+```
+
+`PreConfigureServices` registers ABP's IdentityServer4 store adapters on `IIdentityServerBuilder` before the [Domain module](/modules/identityserver/domain) runs its own `ConfigureServices`. That is what prevents the in-memory fallback from kicking in.
+
+`ConfigureServices` only needs to register the MongoDB context and the six aggregate repositories — the basic `IRepository<T, Guid>` registrations are derived automatically from the context.
+
+## `IAbpIdentityServerMongoDbContext`
+
+The interface lists one `IMongoCollection<T>` per aggregate root:
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpIdentityServerDbProperties.ConnectionStringName)]
+public interface IAbpIdentityServerMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<ApiResource> ApiResources { get; }
+    IMongoCollection<ApiScope> ApiScopes { get; }
+    IMongoCollection<Client> Clients { get; }
+    IMongoCollection<IdentityResource> IdentityResources { get; }
+    IMongoCollection<PersistedGrant> PersistedGrants { get; }
+    IMongoCollection<DeviceFlowCodes> DeviceFlowCodes { get; }
+}
+```
+
+Two attributes shape ABP's behaviour:
+
+- **`[IgnoreMultiTenancy]`** — IdentityServer configuration is host-global. ABP will not inject a `TenantId` filter into the queryables.
+- **`[ConnectionStringName("AbpIdentityServer")]`** (the constant comes from `AbpIdentityServerDbProperties.ConnectionStringName`) — ABP looks for `ConnectionStrings:AbpIdentityServer` first, then falls back to `Default`. Use this to point the IS data at its own MongoDB database.
+
+The concrete `AbpIdentityServerMongoDbContext`:
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpIdentityServerDbProperties.ConnectionStringName)]
+public class AbpIdentityServerMongoDbContext
+    : AbpMongoDbContext, IAbpIdentityServerMongoDbContext
+{
+    public IMongoCollection<ApiResource> ApiResources => Collection<ApiResource>();
+    public IMongoCollection<ApiScope> ApiScopes => Collection<ApiScope>();
+    public IMongoCollection<Client> Clients => Collection<Client>();
+    public IMongoCollection<IdentityResource> IdentityResources => Collection<IdentityResource>();
+    public IMongoCollection<PersistedGrant> PersistedGrants => Collection<PersistedGrant>();
+    public IMongoCollection<DeviceFlowCodes> DeviceFlowCodes => Collection<DeviceFlowCodes>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureIdentityServer();
+    }
+}
+```
+
+`Collection<T>()` is the inherited helper that resolves the configured collection name and uses the `IMongoDatabase` for this DbContext.
+
+## `ConfigureIdentityServer()` for MongoDB
+
+The model builder extension sets the **collection name** for each aggregate (prefixed with `IdentityServer`, same as the EF Core tables):
+
+```csharp
+public static void ConfigureIdentityServer(this IMongoModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    builder.Entity<ApiResource>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "ApiResources";
+    });
+
+    builder.Entity<ApiScope>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "ApiScopes";
+    });
+
+    builder.Entity<IdentityResource>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "IdentityResources";
+    });
+
+    builder.Entity<Client>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "Clients";
+    });
+
+    builder.Entity<PersistedGrant>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "PersistedGrants";
+    });
+
+    builder.Entity<DeviceFlowCodes>(b =>
+    {
+        b.CollectionName = AbpIdentityServerDbProperties.DbTablePrefix + "DeviceFlowCodes";
+    });
+}
+```
+
+That is the whole schema. The MongoDB driver discovers the BSON layout from the C# property names on each aggregate, and ABP's `[BsonIgnoreExtraElements]` defaults handle backwards compatibility.
+
+### Embedded children
+
+Where the [EF Core provider](/modules/identityserver/efcore#child-entity-composite-keys) creates a separate table for every child (`IdentityServerClientGrantTypes`, `IdentityServerClientSecrets`, ...), MongoDB stores them all as nested arrays on the parent document:
+
+```js
+// IdentityServerClients document
+{
+  "_id": UUID("..."),
+  "ClientId": "MyApp_Web",
+  "ClientName": "MyApp Web",
+  "Enabled": true,
+  "RequirePkce": true,
+  "AccessTokenLifetime": 3600,
+  "AllowedGrantTypes": [
+    { "ClientId": UUID("..."), "GrantType": "authorization_code" },
+    { "ClientId": UUID("..."), "GrantType": "refresh_token" }
+  ],
+  "AllowedScopes": [
+    { "ClientId": UUID("..."), "Scope": "openid" },
+    { "ClientId": UUID("..."), "Scope": "profile" }
+  ],
+  "ClientSecrets": [
+    { "ClientId": UUID("..."), "Type": "SharedSecret", "Value": "...", "Expiration": null }
+  ],
+  "RedirectUris": [...],
+  "PostLogoutRedirectUris": [...],
+  "Claims": [...],
+  "Properties": [...]
+}
+```
+
+This means that aggregate-root operations are always single-document writes, which is convenient — but it also means that LINQ filters that touch the embedded arrays produce server-side query operators rather than joins. The repositories below use `Where(x => x.AllowedCorsOrigins.Any(...))`-style predicates and rely on the MongoDB driver to translate them to `$elemMatch`.
+
+## `MongoClientRepository`
+
+```csharp
+public class MongoClientRepository
+    : MongoDbRepository<IAbpIdentityServerMongoDbContext, Client, Guid>,
+      IClientRepository
+{
+    public MongoClientRepository(
+        IMongoDbContextProvider<IAbpIdentityServerMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<Client> FindByClientIdAsync(
+        string clientId, bool includeDetails = true,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                x => x.ClientId == clientId,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Client>> GetListAsync(
+        string sorting, int skipCount, int maxResultCount,
+        string filter = null, bool includeDetails = false,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .OrderBy(sorting.IsNullOrWhiteSpace() ? nameof(Client.ClientName) : sorting)
+            .PageBy(skipCount, maxResultCount)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<long> GetCountAsync(
+        string filter = null, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .LongCountAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<string>> GetAllDistinctAllowedCorsOriginsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .SelectMany(x => x.AllowedCorsOrigins)
+            .Select(y => y.Origin)
+            .Distinct()
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<bool> CheckClientIdExistAsync(
+        string clientId, Guid? expectedId = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .AnyAsync(
+                c => c.Id != expectedId && c.ClientId == clientId,
+                GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Two interesting differences vs the EF Core version:
+
+- **`includeDetails`** is ignored — the children are already in the document. There is no equivalent to `.IncludeDetails()` because there is nothing to eagerly load.
+- **`GetAllDistinctAllowedCorsOriginsAsync`** uses `SelectMany` over the embedded `AllowedCorsOrigins` array. The MongoDB driver translates this to a pipeline with `$unwind` + `$group`.
+
+There is also no overridden `DeleteAsync` — since the children are embedded, deleting the document removes them automatically.
+
+## `MongoApiResourceRepository`
+
+```csharp
+public class MongoApiResourceRepository
+    : MongoDbRepository<IAbpIdentityServerMongoDbContext, ApiResource, Guid>,
+      IApiResourceRepository
+{
+    public virtual async Task<ApiResource> FindByNameAsync(
+        string apiResourceName, bool includeDetails = true,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .OrderBy(ar => ar.Id)
+            .FirstOrDefaultAsync(
+                ar => ar.Name == apiResourceName,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<ApiResource>> FindByNameAsync(
+        string[] apiResourceNames, bool includeDetails = true,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(ar => apiResourceNames.AsEnumerable().Contains(ar.Name))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<ApiResource>> GetListByScopesAsync(
+        string[] scopeNames, bool includeDetails = false,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(ar => ar.Scopes.Any(x => scopeNames.AsEnumerable().Contains(x.Scope)))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<bool> CheckNameExistAsync(
+        string name, Guid? expectedId = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .AnyAsync(
+                ar => ar.Id != expectedId && ar.Name == name,
+                GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+`GetListByScopesAsync` is the query the `ResourceStore` runs when a token request resolves scopes to resources. Because `ApiResource.Scopes` is an embedded array, the driver translates the predicate to a single `$elemMatch` against the `Scopes` field — no `$lookup` needed.
+
+The MongoDB `ApiResource` document looks like this:
+
+```js
+{
+  "_id": UUID("..."),
+  "Name": "MyApi",
+  "DisplayName": "My API",
+  "Enabled": true,
+  "ShowInDiscoveryDocument": true,
+  "Scopes": [
+    { "ApiResourceId": UUID("..."), "Scope": "MyApi" },
+    { "ApiResourceId": UUID("..."), "Scope": "MyApi.read" }
+  ],
+  "UserClaims": [
+    { "ApiResourceId": UUID("..."), "Type": "role" }
+  ],
+  "Secrets": [...],
+  "Properties": [...]
+}
+```
+
+## `MongoPersistentGrantRepository`
+
+The operational store is where most of the runtime write volume happens. The MongoDB implementation leans on `DeleteDirectAsync` for the cleanup paths so expired rows are wiped in a single command:
+
+```csharp
+public class MongoPersistentGrantRepository
+    : MongoDbRepository<IAbpIdentityServerMongoDbContext, PersistedGrant, Guid>,
+      IPersistentGrantRepository
+{
+    public virtual async Task<PersistedGrant> FindByKeyAsync(
+        string key, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(x => x.Key == key)
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<PersistedGrant>> GetListBySubjectIdAsync(
+        string subjectId, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(x => x.SubjectId == subjectId)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<PersistedGrant>> GetListByExpirationAsync(
+        DateTime maxExpirationDate, int maxResultCount,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(x => x.Expiration != null && x.Expiration < maxExpirationDate)
+            .OrderBy(x => x.ClientId)
+            .Take(maxResultCount)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteExpirationAsync(
+        DateTime maxExpirationDate, CancellationToken cancellationToken = default)
+    {
+        await DeleteDirectAsync(
+            x => x.Expiration != null && x.Expiration < maxExpirationDate,
+            cancellationToken: cancellationToken);
+    }
+
+    public virtual async Task DeleteAsync(
+        string subjectId = null, string sessionId = null,
+        string clientId = null, string type = null,
+        CancellationToken cancellationToken = default)
+    {
+        var persistedGrants = await (await FilterAsync(
+                subjectId, sessionId, clientId, type, cancellationToken))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        foreach (var persistedGrant in persistedGrants)
+        {
+            await DeleteAsync(persistedGrant, false, GetCancellationToken(cancellationToken));
+        }
+    }
+
+    private async Task<IQueryable<PersistedGrant>> FilterAsync(
+        string subjectId, string sessionId, string clientId, string type,
+        CancellationToken cancellationToken = default)
+    {
+        return (await GetQueryableAsync(cancellationToken))
+            .WhereIf(!subjectId.IsNullOrWhiteSpace(), x => x.SubjectId == subjectId)
+            .WhereIf(!sessionId.IsNullOrWhiteSpace(), x => x.SessionId == sessionId)
+            .WhereIf(!clientId.IsNullOrWhiteSpace(), x => x.ClientId == clientId)
+            .WhereIf(!type.IsNullOrWhiteSpace(), x => x.Type == type);
+    }
+}
+```
+
+The `TokenCleanupBackgroundWorker` ultimately calls `DeleteExpirationAsync` here, which becomes a single `deleteMany` server-side. There is no need to load documents into memory first.
+
+## Recommended indexes
+
+The MongoDB provider does not currently create indexes programmatically — applications are expected to define them as part of their MongoDB deployment. For a production deployment, create at least:
+
+```js
+// IdentityServerClients
+db.IdentityServerClients.createIndex({ ClientId: 1 }, { unique: true });
+
+// IdentityServerPersistedGrants
+db.IdentityServerPersistedGrants.createIndex({ Key: 1 }, { unique: true });
+db.IdentityServerPersistedGrants.createIndex({ SubjectId: 1, ClientId: 1, Type: 1 });
+db.IdentityServerPersistedGrants.createIndex({ SubjectId: 1, SessionId: 1, Type: 1 });
+db.IdentityServerPersistedGrants.createIndex({ Expiration: 1 });
+
+// IdentityServerDeviceFlowCodes
+db.IdentityServerDeviceFlowCodes.createIndex({ DeviceCode: 1 }, { unique: true });
+db.IdentityServerDeviceFlowCodes.createIndex({ UserCode: 1 });
+db.IdentityServerDeviceFlowCodes.createIndex({ Expiration: 1 });
+
+// IdentityServerApiResources / IdentityServerApiScopes / IdentityServerIdentityResources
+db.IdentityServerApiResources.createIndex({ Name: 1 }, { unique: true });
+db.IdentityServerApiScopes.createIndex({ Name: 1 }, { unique: true });
+db.IdentityServerIdentityResources.createIndex({ Name: 1 }, { unique: true });
+```
+
+These mirror the indexes the [EF Core provider](/modules/identityserver/efcore) creates explicitly via `HasIndex(...)`.
+
+## Adding the module to a host
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityServerMongoDbModule),
+    typeof(AbpIdentityMongoDbModule),
+    typeof(AbpAccountWebIdentityServerModule), // login UI
+    typeof(AbpAspNetCoreMvcModule)
+)]
+public class MyAuthServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbConnectionOptions>(options =>
+        {
+            options.ConnectionStrings.Default =
+                context.Services.GetConfiguration().GetConnectionString("Default");
+        });
+    }
+}
+```
+
+If you want your own application's MongoDB context to also expose the IdentityServer collections (so configuration and business data share a database), inherit `AbpIdentityServerMongoDbContext` and call `modelBuilder.ConfigureIdentityServer()` from `CreateModel`:
+
+```csharp
+public class MyAppMongoDbContext
+    : AbpMongoDbContext, IAbpIdentityServerMongoDbContext
+{
+    public IMongoCollection<ApiResource> ApiResources => Collection<ApiResource>();
+    public IMongoCollection<ApiScope> ApiScopes => Collection<ApiScope>();
+    public IMongoCollection<Client> Clients => Collection<Client>();
+    public IMongoCollection<IdentityResource> IdentityResources => Collection<IdentityResource>();
+    public IMongoCollection<PersistedGrant> PersistedGrants => Collection<PersistedGrant>();
+    public IMongoCollection<DeviceFlowCodes> DeviceFlowCodes => Collection<DeviceFlowCodes>();
+
+    // ... your own collections ...
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureIdentityServer();
+        modelBuilder.ConfigureIdentity();
+        // ... your own configuration ...
+    }
+}
+```
+
+## Connection string isolation
+
+Same story as EF Core — because `IAbpIdentityServerMongoDbContext` carries `[ConnectionStringName("AbpIdentityServer")]`, you can point IS data at a separate MongoDB:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "mongodb://localhost:27017/MyApp",
+    "AbpIdentityServer": "mongodb://localhost:27017/MyApp_IdentityServer"
+  }
+}
+```
+
+`AbpMongoDbContextProvider` resolves the right `IMongoDatabase` per context instance.
+
+## Identity-resource seeding
+
+The seeder lives in the [Domain layer](/modules/identityserver/domain#identityresource) — there is no MongoDB-specific override. On startup, your `DbMigrationService` (or equivalent) calls `IIdentityResourceDataSeeder.CreateStandardResourcesAsync()`, which writes `openid`, `profile`, `email`, `address`, `phone` and `role` documents into `IdentityServerIdentityResources`, then mirrors their claim types into the [Identity module's](/modules/identity/overview) claim-type repository.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="cube" href="/modules/identityserver/domain">
+    Aggregate roots and repository contracts.
+  </Card>
+  <Card title="EF Core provider" icon="database" href="/modules/identityserver/efcore">
+    Relational equivalent — useful for understanding what the document layout replaces.
+  </Card>
+  <Card title="Identity module" icon="users" href="/modules/identity/overview">
+    User and role aggregates that this module signs in against.
+  </Card>
+  <Card title="Account / IS host" icon="house-lock" href="/modules/account/identityserver-host">
+    Opinionated host with login UI and OIDC endpoints.
+  </Card>
+  <Card title="OpenIddict (forward path)" icon="shield-check" href="/modules/openiddict/overview" />
+  <Card title="OIDC client setup" icon="key" href="/aspnetcore/auth-openidconnect" />
+</CardGroup>

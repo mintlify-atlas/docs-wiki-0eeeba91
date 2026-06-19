@@ -1,0 +1,424 @@
+---
+title: "Application Layer"
+description: "TenantAppService — the ICrudAppService for tenants — and the connection-string operations exposed on top of it."
+---
+
+# Application Layer
+
+The application layer is split, like every ABP module, into:
+
+- **`Volo.Abp.TenantManagement.Application.Contracts`** — DTOs, the `ITenantAppService` interface, permissions, remote-service constants.
+- **`Volo.Abp.TenantManagement.Application`** — the concrete `TenantAppService` plus a base class and Mapperly mappers.
+
+```
+modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/
+└── Volo/Abp/TenantManagement/
+    ├── AbpTenantManagementApplicationContractsModule.cs
+    ├── AbpTenantManagementPermissionDefinitionProvider.cs
+    ├── GetTenantsInput.cs
+    ├── ITenantAppService.cs
+    ├── TenantCreateDto.cs
+    ├── TenantCreateOrUpdateDtoBase.cs
+    ├── TenantDto.cs
+    ├── TenantManagementPermissions.cs
+    ├── TenantManagementRemoteServiceConsts.cs
+    └── TenantUpdateDto.cs
+
+modules/tenant-management/src/Volo.Abp.TenantManagement.Application/
+└── Volo/Abp/TenantManagement/
+    ├── AbpTenantManagementApplicationMapperlyMappers.cs
+    ├── AbpTenantManagementApplicationModule.cs
+    ├── TenantAppService.cs
+    └── TenantManagementAppServiceBase.cs
+```
+
+## The contract: `ITenantAppService`
+
+File: `ITenantAppService.cs`
+
+```csharp
+namespace Volo.Abp.TenantManagement;
+
+public interface ITenantAppService
+    : ICrudAppService<TenantDto, Guid, GetTenantsInput, TenantCreateDto, TenantUpdateDto>
+{
+    Task<string> GetDefaultConnectionStringAsync(Guid id);
+
+    Task UpdateDefaultConnectionStringAsync(Guid id, string defaultConnectionString);
+
+    Task DeleteDefaultConnectionStringAsync(Guid id);
+}
+```
+
+By inheriting from `ICrudAppService<TDto, Guid, TGetListInput, TCreate, TUpdate>` it inherits the standard five operations:
+
+| Method | Signature |
+|--------|-----------|
+| Get by id | `Task<TenantDto> GetAsync(Guid id)` |
+| List | `Task<PagedResultDto<TenantDto>> GetListAsync(GetTenantsInput input)` |
+| Create | `Task<TenantDto> CreateAsync(TenantCreateDto input)` |
+| Update | `Task<TenantDto> UpdateAsync(Guid id, TenantUpdateDto input)` |
+| Delete | `Task DeleteAsync(Guid id)` |
+
+…then layers on three connection-string operations specific to multi-tenant DB routing (see [/data/connection-strings](/data/connection-strings)).
+
+<Info>
+This module does **not** expose `Activate` / `Deactivate` as discrete endpoints. ABP models tenant lifecycle differently: a tenant is either created and `IsDeleted = false` (active), or soft-deleted via the standard delete operation. If you need a hard activate/deactivate flag, extend `Tenant` via the [object extensions system](/data/connection-strings) and override `TenantAppService.UpdateAsync`.
+</Info>
+
+## DTOs
+
+### `TenantDto`
+
+```csharp
+public class TenantDto : ExtensibleEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public string Name { get; set; }
+
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+Inherits `ExtensibleEntityDto<Guid>` so that any extra properties added through ABP's object-extending API (`ObjectExtensionManager`) automatically flow through serialization.
+
+### `TenantCreateOrUpdateDtoBase`
+
+```csharp
+public abstract class TenantCreateOrUpdateDtoBase : ExtensibleObject
+{
+    [Required]
+    [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxNameLength))]
+    [Display(Name = "TenantName")]
+    public string Name { get; set; }
+
+    public TenantCreateOrUpdateDtoBase() : base(false) { }
+}
+```
+
+The `DynamicStringLength` attribute reads `TenantConsts.MaxNameLength` *at runtime*, so applications that bump the limit get the correct validation message without recompiling DTOs.
+
+### `TenantCreateDto`
+
+```csharp
+public class TenantCreateDto : TenantCreateOrUpdateDtoBase
+{
+    [Required]
+    [EmailAddress]
+    [MaxLength(256)]
+    public virtual string AdminEmailAddress { get; set; }
+
+    [Required]
+    [MaxLength(128)]
+    [DisableAuditing]
+    public virtual string AdminPassword { get; set; }
+}
+```
+
+`AdminEmailAddress` and `AdminPassword` are **not** persisted on `Tenant`. They are forwarded as `Properties["AdminEmail"]` / `Properties["AdminPassword"]` on the outgoing `TenantCreatedEto` so that subscribers (Identity / Identity Pro) can seed an initial admin user in the new tenant's database. `[DisableAuditing]` ensures the password is never persisted to the audit log.
+
+### `TenantUpdateDto`
+
+```csharp
+public class TenantUpdateDto : TenantCreateOrUpdateDtoBase, IHasConcurrencyStamp
+{
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+### `GetTenantsInput`
+
+```csharp
+public class GetTenantsInput : PagedAndSortedResultRequestDto
+{
+    public string Filter { get; set; }
+}
+```
+
+`Filter` is a substring match against `Name` (case-sensitive on the database side — adjust the repository if you need ILIKE).
+
+## `TenantManagementAppServiceBase`
+
+A tiny base class — all application services in the module inherit it so that the localization resource for error messages is preconfigured:
+
+```csharp
+public abstract class TenantManagementAppServiceBase : ApplicationService
+{
+    protected TenantManagementAppServiceBase()
+    {
+        ObjectMapperContext = typeof(AbpTenantManagementApplicationModule);
+        LocalizationResource = typeof(AbpTenantManagementResource);
+    }
+}
+```
+
+## `TenantAppService` — full walk-through
+
+File: `Volo.Abp.TenantManagement.Application/Volo/Abp/TenantManagement/TenantAppService.cs`
+
+### Authorization & constructor
+
+```csharp
+[Authorize(TenantManagementPermissions.Tenants.Default)]
+public class TenantAppService : TenantManagementAppServiceBase, ITenantAppService
+{
+    protected IDataSeeder DataSeeder { get; }
+    protected ITenantRepository TenantRepository { get; }
+    protected ITenantManager TenantManager { get; }
+    protected IDistributedEventBus DistributedEventBus { get; }
+    protected ILocalEventBus LocalEventBus { get; }
+
+    public TenantAppService(
+        ITenantRepository tenantRepository,
+        ITenantManager tenantManager,
+        IDataSeeder dataSeeder,
+        IDistributedEventBus distributedEventBus,
+        ILocalEventBus localEventBus)
+    {
+        DataSeeder = dataSeeder;
+        TenantRepository = tenantRepository;
+        TenantManager = tenantManager;
+        DistributedEventBus = distributedEventBus;
+        LocalEventBus = localEventBus;
+    }
+}
+```
+
+The class-level `[Authorize(...Default)]` makes every endpoint require *at minimum* `AbpTenantManagement.Tenants`. Mutating endpoints add a second `[Authorize(...)]` for the specific child permission.
+
+### Reads
+
+```csharp
+public virtual async Task<TenantDto> GetAsync(Guid id)
+{
+    return ObjectMapper.Map<Tenant, TenantDto>(
+        await TenantRepository.GetAsync(id)
+    );
+}
+
+public virtual async Task<PagedResultDto<TenantDto>> GetListAsync(GetTenantsInput input)
+{
+    if (input.Sorting.IsNullOrWhiteSpace())
+    {
+        input.Sorting = nameof(Tenant.Name);
+    }
+
+    var count = await TenantRepository.GetCountAsync(input.Filter);
+    var list = await TenantRepository.GetListAsync(
+        input.Sorting,
+        input.MaxResultCount,
+        input.SkipCount,
+        input.Filter
+    );
+
+    return new PagedResultDto<TenantDto>(
+        count,
+        ObjectMapper.Map<List<Tenant>, List<TenantDto>>(list)
+    );
+}
+```
+
+Sort defaults to `Name` (alphabetical) when the client doesn't specify one. There is no `includeDetails: true` here — the list view never needs connection strings, only the dedicated `GetDefaultConnectionStringAsync` does.
+
+### Create — the heaviest endpoint
+
+```csharp
+[Authorize(TenantManagementPermissions.Tenants.Create)]
+public virtual async Task<TenantDto> CreateAsync(TenantCreateDto input)
+{
+    var tenant = await TenantManager.CreateAsync(input.Name);
+    input.MapExtraPropertiesTo(tenant);
+
+    await TenantRepository.InsertAsync(tenant);
+
+    await CurrentUnitOfWork.SaveChangesAsync();
+
+    await DistributedEventBus.PublishAsync(
+        new TenantCreatedEto
+        {
+            Id = tenant.Id,
+            Name = tenant.Name,
+            Properties =
+            {
+                    { "AdminEmail", input.AdminEmailAddress },
+                    { "AdminPassword", input.AdminPassword }
+            }
+        });
+
+    using (CurrentTenant.Change(tenant.Id, tenant.Name))
+    {
+        //TODO: Handle database creation?
+        // TODO: Seeder might be triggered via event handler.
+        await DataSeeder.SeedAsync(
+                        new DataSeedContext(tenant.Id)
+                            .WithProperty("AdminEmail", input.AdminEmailAddress)
+                            .WithProperty("AdminPassword", input.AdminPassword)
+                        );
+    }
+
+    return ObjectMapper.Map<Tenant, TenantDto>(tenant);
+}
+```
+
+What's going on, step by step:
+
+<Steps>
+  <Step title="Build the aggregate">
+    `TenantManager.CreateAsync` validates uniqueness via `AbpTenantValidator` and returns a fresh `Tenant` with a generated Guid.
+  </Step>
+  <Step title="Forward extension properties">
+    `input.MapExtraPropertiesTo(tenant)` copies any extra fields the host application added through `ObjectExtensionManager` — see ABP's object-extending guide.
+  </Step>
+  <Step title="Persist & flush">
+    `InsertAsync` + an explicit `SaveChangesAsync` so that the tenant row exists before the distributed event ships. The publication is **inside** the UoW — if seeding throws, the event message is rolled back along with the row.
+  </Step>
+  <Step title="Publish TenantCreatedEto">
+    The `Properties` dictionary carries `AdminEmail` / `AdminPassword` so downstream modules (Identity) can seed the host-side `IdentityUser` and grant it `admin` role.
+  </Step>
+  <Step title="Switch tenant context + seed">
+    `CurrentTenant.Change(tenant.Id, tenant.Name)` flips `ICurrentTenant.Id` for the duration of the `using` block, so the `IDataSeeder` runs *as that tenant* — anything it writes flows through `IMultiTenant` data-filtering automatically.
+  </Step>
+</Steps>
+
+<Note>
+The two `TODO` comments come straight from the source — automatic per-tenant database **creation** (e.g. running EF Core migrations against the new connection string) is *not* handled by this service. Subscribe to `TenantCreatedEto` from an infrastructure handler if you need it.
+</Note>
+
+### Update
+
+```csharp
+[Authorize(TenantManagementPermissions.Tenants.Update)]
+public virtual async Task<TenantDto> UpdateAsync(Guid id, TenantUpdateDto input)
+{
+    var tenant = await TenantRepository.GetAsync(id);
+
+    await TenantManager.ChangeNameAsync(tenant, input.Name);
+
+    tenant.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+    input.MapExtraPropertiesTo(tenant);
+
+    await TenantRepository.UpdateAsync(tenant);
+
+    return ObjectMapper.Map<Tenant, TenantDto>(tenant);
+}
+```
+
+- `ChangeNameAsync` raises `TenantChangedEvent` *before* renaming, so the old normalized-name cache key is invalidated even if the update later rolls back.
+- `SetConcurrencyStampIfNotNull` performs optimistic-concurrency checking — clients that POST a stale stamp get `AbpDbConcurrencyException`.
+
+### Delete
+
+```csharp
+[Authorize(TenantManagementPermissions.Tenants.Delete)]
+public virtual async Task DeleteAsync(Guid id)
+{
+    var tenant = await TenantRepository.FindAsync(id);
+    if (tenant == null)
+    {
+        return;
+    }
+
+    await TenantRepository.DeleteAsync(tenant);
+}
+```
+
+Tenants are soft-deleted (because `Tenant : FullAuditedAggregateRoot<Guid>`). The row remains but `IsDeleted = true`, `DeleterId`, `DeletionTime` are populated and the EF Core / Mongo soft-delete filter hides it from subsequent queries. The standard `EntityChangeEventHelper` raises a `TenantDeletedEto` on the distributed event bus.
+
+### Connection-string operations
+
+```csharp
+[Authorize(TenantManagementPermissions.Tenants.ManageConnectionStrings)]
+public virtual async Task<string> GetDefaultConnectionStringAsync(Guid id)
+{
+    var tenant = await TenantRepository.GetAsync(id);
+    return tenant?.FindDefaultConnectionString();
+}
+
+[Authorize(TenantManagementPermissions.Tenants.ManageConnectionStrings)]
+public virtual async Task UpdateDefaultConnectionStringAsync(Guid id, string defaultConnectionString)
+{
+    var tenant = await TenantRepository.GetAsync(id);
+    if (tenant.FindDefaultConnectionString() != defaultConnectionString)
+    {
+        await LocalEventBus.PublishAsync(new TenantChangedEvent(tenant.Id, tenant.NormalizedName));
+    }
+    tenant.SetDefaultConnectionString(defaultConnectionString);
+    await TenantRepository.UpdateAsync(tenant);
+}
+
+[Authorize(TenantManagementPermissions.Tenants.ManageConnectionStrings)]
+public virtual async Task DeleteDefaultConnectionStringAsync(Guid id)
+{
+    var tenant = await TenantRepository.GetAsync(id);
+    tenant.RemoveDefaultConnectionString();
+    await LocalEventBus.PublishAsync(new TenantChangedEvent(tenant.Id, tenant.NormalizedName));
+    await TenantRepository.UpdateAsync(tenant);
+}
+```
+
+Two observations:
+
+1. The `TenantChangedEvent` is **only** raised when the value actually changes (the `UpdateDefaultConnectionStringAsync` branch). `DeleteDefaultConnectionStringAsync` *always* raises it, on the assumption that going from "has connection string" to "doesn't have one" is always a change.
+2. There is **no** public method to manage *named* (non-default) connection strings via the app service — only the `Default` one. The `ConnectionStringsModal` in the Web layer ([web-and-blazor](/modules/tenant-management/web-and-blazor)) talks to the aggregate's `SetConnectionString(name, value)` indirectly by mutating `Tenant.ConnectionStrings` and re-saving.
+
+<Tip>
+If you need named-connection-string CRUD over HTTP (for sharded modules: `AbpIdentity`, `AbpAuditLogging`, …), create a dedicated `TenantConnectionStringAppService` in your host that wraps `ITenantRepository` and calls `tenant.SetConnectionString(name, value)` directly. The aggregate already supports it.
+</Tip>
+
+## Permissions
+
+File: `AbpTenantManagementPermissionDefinitionProvider.cs`
+
+```csharp
+public class AbpTenantManagementPermissionDefinitionProvider : PermissionDefinitionProvider
+{
+    public override void Define(IPermissionDefinitionContext context)
+    {
+        var tenantManagementGroup = context.AddGroup(
+            TenantManagementPermissions.GroupName,
+            L("Permission:TenantManagement"));
+
+        var tenantsPermission = tenantManagementGroup.AddPermission(
+            TenantManagementPermissions.Tenants.Default,
+            L("Permission:TenantManagement"),
+            multiTenancySide: MultiTenancySides.Host);
+
+        tenantsPermission.AddChild(TenantManagementPermissions.Tenants.Create,
+            L("Permission:Create"), multiTenancySide: MultiTenancySides.Host);
+        tenantsPermission.AddChild(TenantManagementPermissions.Tenants.Update,
+            L("Permission:Edit"), multiTenancySide: MultiTenancySides.Host);
+        tenantsPermission.AddChild(TenantManagementPermissions.Tenants.Delete,
+            L("Permission:Delete"), multiTenancySide: MultiTenancySides.Host);
+        tenantsPermission.AddChild(TenantManagementPermissions.Tenants.ManageFeatures,
+            L("Permission:ManageFeatures"), multiTenancySide: MultiTenancySides.Host);
+        tenantsPermission.AddChild(TenantManagementPermissions.Tenants.ManageConnectionStrings,
+            L("Permission:ManageConnectionStrings"), multiTenancySide: MultiTenancySides.Host);
+    }
+
+    private static LocalizableString L(string name)
+        => LocalizableString.Create<AbpTenantManagementResource>(name);
+}
+```
+
+Every permission is `multiTenancySide: MultiTenancySides.Host` — they cannot be granted to roles inside a tenant, only host-side admins.
+
+## Mapperly mappings
+
+File: `AbpTenantManagementApplicationMapperlyMappers.cs`
+
+```csharp
+[Mapper]
+internal static partial class AbpTenantManagementApplicationMapperlyMappers
+{
+    public static partial TenantDto MapToTenantDto(Tenant tenant);
+    // ...generated code maps ExtensibleEntityDto<Guid> properties and ConcurrencyStamp
+}
+```
+
+The mappers are registered into the ABP `IObjectMapper` via `AbpTenantManagementApplicationModule.ConfigureServices`. No AutoMapper profile is required.
+
+## Next
+
+- [http-api](/modules/tenant-management/http-api) — how `TenantController` proxies these methods to HTTP.
+- [web-and-blazor](/modules/tenant-management/web-and-blazor) — the UI on top.
+- [/tenancy/tenant-management-module](/tenancy/tenant-management-module) — module-installation guide.
+- [/data/connection-strings](/data/connection-strings) — what the `Default` connection string actually controls.

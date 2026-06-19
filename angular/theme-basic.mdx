@@ -1,0 +1,292 @@
+---
+title: "@abp/ng.theme.basic"
+description: "Default Bootstrap-based theme — application/account/empty layouts, side menu, nav items, language switcher, current-user dropdown."
+---
+
+`@abp/ng.theme.basic` (source: `npm/ng-packs/packages/theme-basic/`) provides ABP's **out‑of‑the‑box layouts**. It builds on `@abp/ng.theme.shared` for shared widgets (modal, toaster, loader bar, breadcrumb) and only contributes the page chrome: header, sidebar, footer, content area.
+
+```text
+npm/ng-packs/packages/theme-basic/src/lib/
+├── components/
+│   ├── application-layout/    ApplicationLayoutComponent  (eLayoutType.application)
+│   ├── account-layout/        AccountLayoutComponent      (eLayoutType.account)
+│   ├── empty-layout/          EmptyLayoutComponent        (eLayoutType.empty)
+│   ├── nav-items/             NavItemsComponent, CurrentUserComponent, LanguagesComponent
+│   ├── routes/                RoutesComponent (recursive side menu)
+│   ├── logo/                  LogoComponent
+│   ├── page-alert-container/  PageAlertContainerComponent
+│   └── validation-error/      ValidationErrorComponent
+├── services/
+│   └── layout.service.ts      window-size aware menu/drawer state
+├── handlers/
+├── providers/
+├── constants/
+├── enums/
+├── models/
+└── theme-basic.module.ts
+```
+
+Bootstrap and the matching ABP base styles come from the companion CSS assets distributed alongside the npm package.
+
+## The three layout components
+
+ABP routes carry a `layout` data property (`eLayoutType.application`, `eLayoutType.account`, `eLayoutType.empty`) that the `DynamicLayoutComponent` (from `@abp/ng.core`) maps to a concrete component. `@abp/ng.theme.basic` ships the three default implementations and registers them through `provideThemeBasicConfig()`.
+
+### `ApplicationLayoutComponent`
+
+The fully‑furnished layout used by management screens — top bar, collapsible side menu, breadcrumb, content outlet, page alert container.
+
+```ts theme-basic/src/lib/components/application-layout/application-layout.component.ts
+@Component({
+  selector: 'abp-layout-application',
+  templateUrl: './application-layout.component.html',
+  animations: [slideFromBottom, collapseWithMargin],
+  providers: [LayoutService, SubscriptionService],
+  imports: [
+    NgTemplateOutlet,
+    LogoComponent,
+    PageAlertContainerComponent,
+    RoutesComponent,
+    NavItemsComponent,
+    ReplaceableTemplateDirective,
+    RouterOutlet,
+  ],
+})
+export class ApplicationLayoutComponent implements AfterViewInit {
+  public readonly service = inject(LayoutService);
+  // required for dynamic component
+  static type = eLayoutType.application;
+
+  ngAfterViewInit() {
+    this.service.subscribeWindowSize();
+  }
+}
+```
+
+`LayoutService.subscribeWindowSize()` toggles the sidebar drawer when the viewport crosses the configured breakpoint, so the layout is responsive by default.
+
+### `AccountLayoutComponent`
+
+Used by the login / register / forgot‑password screens served by `@abp/ng.account`. It keeps the side menu collapsed and projects the `AuthWrapperComponent` (a content‑projection slot for the marketing/illustration side of the page).
+
+```ts theme-basic/src/lib/components/account-layout/account-layout.component.ts
+@Component({
+  selector: 'abp-layout-account',
+  templateUrl: './account-layout.component.html',
+  animations: [collapseWithMargin],
+  providers: [LayoutService, SubscriptionService],
+  imports: [
+    NgTemplateOutlet,
+    LogoComponent,
+    RoutesComponent,
+    NavItemsComponent,
+    AuthWrapperComponent,
+    PageAlertContainerComponent,
+    ReplaceableTemplateDirective,
+    RouterOutlet,
+  ],
+})
+export class AccountLayoutComponent implements AfterViewInit {
+  service = inject(LayoutService);
+
+  // required for dynamic component
+  static type = eLayoutType.account;
+
+  authWrapperKey = 'Account.AuthWrapperComponent';
+
+  ngAfterViewInit() {
+    this.service.subscribeWindowSize();
+  }
+}
+```
+
+`authWrapperKey = 'Account.AuthWrapperComponent'` is the **replaceable component key** — applications register a replacement under this key to swap the marketing panel for their own design without forking the layout.
+
+### `EmptyLayoutComponent`
+
+Renders only `<router-outlet>` and a `PageAlertContainerComponent`. Useful for embed pages, OAuth callback handlers and printable views (`eLayoutType.empty`).
+
+## The side menu — `RoutesComponent` and `NavItemsComponent`
+
+`components/routes/routes.component.ts` walks the ABP `RoutesService` tree (from `@abp/ng.core`) and renders nested menu items, honouring `requiredPolicy`, `iconClass`, `order` and the `invisible` flag.
+
+```html
+<!-- excerpt from routes.component.html -->
+<ul class="lpx-menu-routes">
+  <li *ngFor="let route of routes$ | async">
+    <a [routerLink]="route.path" routerLinkActive="active"
+       *abpPermission="route.requiredPolicy">
+      <i [class]="route.iconClass"></i>
+      <span>{{ route.name | abpLocalization }}</span>
+    </a>
+  </li>
+</ul>
+```
+
+`NavItemsComponent` (`components/nav-items/nav-items.component.ts`) renders **top toolbar** items that modules push through `NAV_ITEMS_TOKEN` from `@abp/ng.theme.shared`. The default set includes:
+
+- `LanguagesComponent` — language dropdown reading from `ConfigStateService.getDeep('localization.languages')` and changing the active culture via `SessionStateService.setLanguage(...)`.
+- `CurrentUserComponent` — avatar dropdown with "Manage your profile" and "Sign out". The "Manage your profile" entry is registered by `@abp/ng.oauth` via `NavigateToManageProfileProvider`.
+
+## Layout extension points
+
+| Extension point | Where | How to use |
+| --- | --- | --- |
+| Replace a layout component | `ReplaceableTemplateDirective` with the layout key | `ReplaceableComponentsService.add({ key: eThemeBasicComponents.ApplicationLayout, component: MyLayoutComponent })` |
+| Add a nav item | `NavItemsService.addItems` | Push a `NavItem` object containing `name`, `iconClass`, `order`, `component?` |
+| Add a user‑menu item | `UserMenuService.addItems` | Same API as nav items |
+| Add a side‑menu route | `RoutesService.add` | Register a `Route` with `path`, `name`, `iconClass`, `requiredPolicy`, `parentName`, `order` |
+| Customise the logo | `LogoComponent` replacement via `eThemeBasicComponents.Logo` | Provide a replaceable component |
+| Switch the brand colours | CSS variables in the bundled stylesheet | Override the `--lpx-…` variables in your global stylesheet |
+
+`eThemeBasicComponents` (in `enums/`) lists every replaceable key (`ApplicationLayout`, `AccountLayout`, `EmptyLayout`, `Logo`, `Toolbar`, …).
+
+## `LayoutService`
+
+`services/layout.service.ts` keeps responsive state in sync:
+
+```ts theme-basic/src/lib/services/layout.service.ts
+@Injectable()
+export class LayoutService {
+  private windowService = inject(AbpWindowService);
+
+  isCollapsed = signal(false);
+  smallScreen = signal(false);
+
+  subscribeWindowSize() {
+    fromEvent(this.windowService.window, 'resize')
+      .pipe(startWith(null), debounceTime(100))
+      .subscribe(() => {
+        const width = this.windowService.window.innerWidth;
+        this.smallScreen.set(width < 992);
+      });
+  }
+}
+```
+
+Pages can inject `LayoutService` and read `isCollapsed`/`smallScreen` signals if they need to adapt their own widgets to the drawer state.
+
+## Plugging the theme into an app
+
+`provideThemeBasicConfig()` (in `theme-basic/config`) registers the layout components with `DynamicLayoutComponent`, contributes the default nav items and pulls in the bundled stylesheet:
+
+```ts app.config.ts
+import { provideAbpCore, withOptions } from '@abp/ng.core';
+import { provideAbpOAuth } from '@abp/ng.oauth';
+import { provideAbpThemeShared } from '@abp/ng.theme.shared';
+import { provideThemeBasicConfig } from '@abp/ng.theme.basic/config';
+
+export const appConfig = {
+  providers: [
+    provideAbpCore(withOptions({ environment })),
+    provideAbpOAuth(),
+    provideAbpThemeShared(),
+    provideThemeBasicConfig(),
+  ],
+};
+```
+
+To switch to another theme (Lepton X, Lepton, your own), drop in the matching `provide*ThemeConfig()` instead of `provideThemeBasicConfig()` — the feature modules don't change.
+
+## Replacing a layout
+
+```ts
+import { ReplaceableComponentsService } from '@abp/ng.core';
+import { eThemeBasicComponents } from '@abp/ng.theme.basic';
+
+constructor(private replaceable: ReplaceableComponentsService) {
+  this.replaceable.add({
+    key: eThemeBasicComponents.ApplicationLayout,
+    component: MyCustomApplicationLayoutComponent,
+  });
+}
+```
+
+That single call swaps the application layout for every route in the app — including all lazy‑loaded management modules.
+
+## Adding a nav item from your module
+
+```ts app.providers.ts
+import { provideAppInitializer, inject } from '@angular/core';
+import { RoutesService, eLayoutType } from '@abp/ng.core';
+
+export const REGISTER_NAV = provideAppInitializer(() => {
+  const routes = inject(RoutesService);
+
+  routes.add([
+    {
+      name: 'MyProject::Reports',
+      iconClass: 'fas fa-chart-bar',
+      path: '/reports',
+      layout: eLayoutType.application,
+      requiredPolicy: 'MyProject.Reports.View',
+      order: 5,
+    },
+    {
+      name: 'MyProject::SalesReport',
+      parentName: 'MyProject::Reports',
+      path: '/reports/sales',
+    },
+  ]);
+});
+```
+
+`RoutesService` (from `@abp/ng.core`) is an `AbstractNavTreeService<Route>` — the same base class as `SettingTabsService` and `UserMenuService`. The `parentName` field nests routes; `requiredPolicy` honours `||` and `&&` (see [`PermissionService`](/angular/core#permissionservice)).
+
+## Adding a user menu item
+
+```ts
+import { UserMenuService } from '@abp/ng.theme.shared';
+
+constructor(userMenu: UserMenuService) {
+  userMenu.addItems([
+    {
+      id: 'MyApp.Notifications',
+      text: 'MyApp::Notifications',
+      icon: 'fa fa-bell',
+      order: 100,
+      action: () => this.openNotifications(),
+    },
+  ]);
+}
+```
+
+The default user menu renders the items contributed by every consumer; the matching template lives in `nav-items/current-user.component.html`.
+
+## Customising the logo
+
+`LogoComponent` (`components/logo/logo.component.ts`) reads a brand template token. The simplest replacement is to swap the component via `ReplaceableComponentsService`:
+
+```ts
+constructor(replaceable: ReplaceableComponentsService) {
+  replaceable.add({
+    key: eThemeBasicComponents.Logo,
+    component: MyBrandLogoComponent,
+  });
+}
+```
+
+## Validation error component
+
+`components/validation-error/validation-error.component.ts` provides the standard reactive‑forms error renderer used by every ABP form (`<abp-validation-error>` is reused inside extensible forms, the login form and the user create modal).
+
+## Page alert container
+
+`components/page-alert-container/page-alert-container.component.ts` subscribes to `PageAlertService` (from `@abp/ng.theme.shared`) and renders the alerts injected by feature modules — e.g. a yellow "You have a pending tenant migration" banner — at the top of every screen.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.theme.shared" href="/angular/theme-shared" icon="palette">
+    The base widgets and animations used inside these layouts.
+  </Card>
+  <Card title="@abp/ng.account" href="/angular/account" icon="user">
+    Hosts its routes inside the `account` layout and projects content into `AuthWrapperComponent`.
+  </Card>
+  <Card title="@abp/ng.oauth" href="/angular/oauth" icon="key">
+    Provides the "Manage your profile" nav entry through `NavigateToManageProfileProvider`.
+  </Card>
+  <Card title="Overview" href="/angular/overview" icon="layer-group">
+    See the full package dependency graph.
+  </Card>
+</CardGroup>

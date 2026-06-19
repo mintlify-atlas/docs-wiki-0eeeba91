@@ -1,0 +1,588 @@
+---
+title: "abp install-libs, add-package, add-module"
+description: "InstallLibsCommand processes abp.resourcemapping.js files; AddPackageCommand adds a NuGet/NPM package + [DependsOn] attribute; AddModuleCommand stitches every package of a multi-package module into the right projects of an existing solution."
+---
+
+These three commands modify existing solutions. They share the same model: find the right projects, run a side-effectful operation on each, and write the result back. The supporting services live in [`Volo/Abp/Cli/LIbs/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs) and [`Volo/Abp/Cli/ProjectModification/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification).
+
+<Info>
+Source files:
+- [`InstallLibsCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/InstallLibsCommand.cs) + [`InstallLibsService.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs) + [`ResourceMapping.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/ResourceMapping.cs).
+- [`AddPackageCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/AddPackageCommand.cs) + [`ProjectNugetPackageAdder.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/ProjectNugetPackageAdder.cs) + [`ProjectNpmPackageAdder.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/ProjectNpmPackageAdder.cs).
+- [`AddModuleCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/AddModuleCommand.cs) + [`SolutionModuleAdder.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/SolutionModuleAdder.cs).
+</Info>
+
+## `abp install-libs` — copy npm assets into wwwroot
+
+The MVC and Blazor Server UIs serve their JavaScript and CSS from `wwwroot/libs/`. Those folders are not committed to git; they are reproduced from `node_modules` by `abp install-libs` after `npm install` / `yarn`.
+
+### Entry point
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/InstallLibsCommand.cs
+public class InstallLibsCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "install-libs";
+
+    public ILogger<InstallLibsCommand> Logger { get; set; }
+
+    protected IInstallLibsService InstallLibsService { get; }
+
+    public InstallLibsCommand(IInstallLibsService installLibsService)
+    {
+        InstallLibsService = installLibsService;
+        Logger = NullLogger<InstallLibsCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var workingDirectoryArg = commandLineArgs.Options.GetOrNull(
+            Options.WorkingDirectory.Short,
+            Options.WorkingDirectory.Long
+        );
+
+        var workingDirectory = workingDirectoryArg ?? Directory.GetCurrentDirectory();
+
+        if (!Directory.Exists(workingDirectory))
+        {
+            throw new CliUsageException(
+                "Specified directory does not exist." +
+                Environment.NewLine + Environment.NewLine +
+                GetUsageInfo()
+            );
+        }
+
+        await InstallLibsService.InstallLibsAsync(workingDirectory);
+    }
+    // ... GetUsageInfo, Options.WorkingDirectory, GetShortDescription ...
+}
+```
+
+A single option (`-wd`) selects the working directory.
+
+### `InstallLibsService.InstallLibsAsync`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs
+public async Task InstallLibsAsync(string directory)
+{
+    var projectPaths = FindAllProjects(directory);
+    if (!projectPaths.Any())
+    {
+        Logger.LogError("No project found in the directory.");
+        return;
+    }
+
+    if (!NpmHelper.IsNpmInstalled())
+    {
+        Logger.LogWarning("NPM is not installed, visit https://nodejs.org/en/download/ and install NPM");
+        return;
+    }
+
+    Logger.LogInformation($"Found {projectPaths.Count} projects.");
+    foreach (var projectPath in projectPaths)
+    {
+        Logger.LogInformation($"{Path.GetDirectoryName(projectPath)}");
+    }
+
+    foreach (var projectPath in projectPaths)
+    {
+        var projectDirectory = Path.GetDirectoryName(projectPath);
+
+        // angular
+        if (projectPath.EndsWith("angular.json"))
+        {
+            NpmHelper.RunYarn(projectDirectory);
+        }
+
+        // MVC or BLAZOR SERVER
+        if (projectPath.EndsWith(".csproj"))
+        {
+            var packageJsonFilePath = Path.Combine(Path.GetDirectoryName(projectPath), "package.json");
+
+            if (!File.Exists(packageJsonFilePath))
+            {
+                continue;
+            }
+
+            NpmHelper.RunYarn(projectDirectory);
+
+            await CleanAndCopyResources(projectDirectory);
+        }
+    }
+}
+```
+
+The two project shapes handled:
+
+| Project type | Detection | Action |
+| --- | --- | --- |
+| Angular workspace | `angular.json` next to project | `yarn install` only — Angular's own build pipeline picks up assets from `node_modules`. |
+| MVC / Blazor Server / Blazor WASM with `package.json` | `.csproj` with `Microsoft.NET.Sdk.Web` / `…Razor` / `…BlazorWebAssembly` + `package.json` | `yarn install` then `CleanAndCopyResources` — empty `wwwroot/libs`, then re-copy the files declared by every `abp.resourcemapping.js`. |
+
+Project discovery filter:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs
+private List<string> FindAllProjects(string directory)
+{
+    return Directory.GetFiles(directory, "*.csproj", SearchOption.AllDirectories)
+        .Union(Directory.GetFiles(directory, "angular.json", SearchOption.AllDirectories))
+        .Where(file => ExcludeDirectory.All(x => file.IndexOf(x + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) == -1))
+        .Where(file =>
+        {
+            if (file.EndsWith(".csproj"))
+            {
+                var packageJsonFilePath = Path.Combine(Path.GetDirectoryName(file), "package.json");
+                if (!File.Exists(packageJsonFilePath))
+                {
+                    return false;
+                }
+
+                using (var reader = File.OpenText(file))
+                {
+                    var fileTexts = reader.ReadToEnd();
+                    return fileTexts.Contains("Microsoft.NET.Sdk.Web") ||
+                           fileTexts.Contains("Microsoft.NET.Sdk.Razor") ||
+                           fileTexts.Contains("Microsoft.NET.Sdk.BlazorWebAssembly");
+                }
+            }
+            return true;
+        })
+        .OrderBy(x => x)
+        .ToList();
+}
+```
+
+`ExcludeDirectory` filters out `node_modules`, `.git`, `.idea`, `_templates`, `bin/debug`, `obj/debug`.
+
+### `ResourceMapping` — what gets copied
+
+`abp.resourcemapping.js` files are the contract between npm packages and `wwwroot/libs/`. Each is a JavaScript file with a single `module.exports` assignment. `ResourceMapping` deserialises them:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/ResourceMapping.cs
+public class ResourceMapping
+{
+    public Dictionary<string, string> Aliases { get; set; }
+
+    public List<string> Clean { get; set; }
+
+    public Dictionary<string, string> Mappings { get; set; }
+
+    public ResourceMapping()
+    {
+        Aliases = new Dictionary<string, string>
+            {
+                {"@node_modules", "./node_modules"},
+                {"@libs", "./wwwroot/libs"},
+            };
+        Clean = new List<string>();
+        Mappings = new Dictionary<string, string>();
+    }
+
+    public void ReplaceAliases()
+    {
+        for (var i = 0; i < Mappings.Count; i++)
+        {
+            var mapping = Mappings.ElementAt(i);
+            Mappings.Remove(mapping.Key);
+
+            var key = mapping.Key;
+            var value = mapping.Value;
+
+            foreach (var alias in Aliases)
+            {
+                key = key.Replace(alias.Key, alias.Value);
+                value = value.Replace(alias.Key, alias.Value);
+            }
+
+            Mappings[key] = value;
+        }
+
+        for (var i = 0; i < Clean.Count; i++)
+        {
+            foreach (var alias in Aliases)
+            {
+                Clean[i] = Clean[i].Replace(alias.Key, alias.Value);
+            }
+        }
+    }
+}
+```
+
+A typical `abp.resourcemapping.js` looks like:
+
+```js
+module.exports = {
+  aliases: { },
+  clean: [ ],
+  mappings: {
+    "@node_modules/jquery/dist/*": "@libs/jquery/",
+    "@node_modules/@fortawesome/fontawesome-free/webfonts/*": "@libs/@fortawesome/fontawesome-free/webfonts/"
+  }
+};
+```
+
+The service:
+
+1. Strips `module.exports =` and the trailing `;`.
+2. Feeds the JSON-ish object to Newtonsoft (which allows unquoted property names).
+3. Calls `ReplaceAliases()` so `@node_modules` and `@libs` become `./node_modules` and `./wwwroot/libs`.
+4. Deletes everything under `wwwroot/libs/` (from `Clean`), then re-copies the patterns listed in `Mappings`.
+
+`FileMatchResult` carries the matched path and the "stem" (the path part captured by `*` / `**`):
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/FileMatchResult.cs
+public class FileMatchResult
+{
+    public string Path { get; }
+
+    public string Stem { get; }
+
+    public FileMatchResult(string path, string stem)
+    {
+        Path = path;
+        Stem = stem;
+    }
+}
+```
+
+Matching uses `Microsoft.Extensions.FileSystemGlobbing` so `**/*.css` and `dist/*` both work.
+
+### Copy pipeline
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs
+private void CopyResourcesToLibs(string fileDirectory, ResourceMapping resourceMapping)
+{
+    foreach (var mapping in resourceMapping.Mappings)
+    {
+        var destPath = Path.Combine(fileDirectory, mapping.Value);
+        var files = FindFiles(fileDirectory, mapping.Key);
+
+        foreach (var file in files)
+        {
+            var destFilePath = Path.Combine(destPath, file.Stem);
+            if (File.Exists(destFilePath))
+            {
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destFilePath));
+            File.Copy(file.Path, destFilePath);
+        }
+    }
+}
+```
+
+Existing files are **not** overwritten. To force a refresh, delete `wwwroot/libs/` first (or rely on `Clean` patterns) and re-run.
+
+### When to run
+
+- After `abp new` (already triggered automatically unless `-sib`).
+- After `npm install <pkg>` that ships static assets.
+- After `abp add-package @abp/<pkg>` (an NPM-flavoured `add-package`) — that does not copy assets, so a subsequent `abp install-libs` is needed.
+
+See also [ASP.NET Core MVC UI packages](/aspnetcore/mvc-ui-packages) for the full story of how MVC themes consume these `libs/` folders.
+
+## `abp add-package` — single package
+
+`abp add-package` distinguishes NuGet from NPM by looking at the target name's first character:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/AddPackageCommand.cs
+public virtual async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    if (commandLineArgs.Target == null)
+    {
+        throw new CliUsageException(
+            "Package name is missing!" +
+            Environment.NewLine + Environment.NewLine +
+            GetUsageInfo()
+        );
+    }
+
+    var isNpmPackage = false;
+    var isNugetPackage = true;
+
+    if (commandLineArgs.Target.StartsWith("@"))
+    {
+        isNpmPackage = true;
+        isNugetPackage = false;
+    }
+
+    var version = commandLineArgs.Options.GetOrNull(Options.Version.Short, Options.Version.Long);
+    var withSourceCode = commandLineArgs.Options.ContainsKey(Options.SourceCode.Long);
+
+    if (isNugetPackage)
+    {
+        var addSourceCodeToSolutionFile = withSourceCode && commandLineArgs.Options.ContainsKey("add-to-solution-file");
+
+        await ProjectNugetPackageAdder.AddAsync(
+            GetSolutionFile(commandLineArgs),
+            GetProjectFile(commandLineArgs),
+            commandLineArgs.Target,
+            version,
+            true,
+            withSourceCode,
+            addSourceCodeToSolutionFile
+        );
+    }
+    else if (isNpmPackage)
+    {
+        await ProjectNpmPackageAdder.AddNpmPackageAsync(
+            GetAngularDirectory(commandLineArgs),
+            commandLineArgs.Target,
+            version,
+            withSourceCode
+        );
+    }
+}
+```
+
+| Heuristic | Outcome |
+| --- | --- |
+| `Volo.Abp.X` (no `@`) | NuGet path: `ProjectNugetPackageAdder.AddAsync`. |
+| `@abp/X` (starts with `@`) | NPM path: `ProjectNpmPackageAdder.AddNpmPackageAsync`. |
+
+### NuGet flow — `ProjectNugetPackageAdder.AddAsync`
+
+The adder does more than `dotnet add package`. It also:
+
+1. Resolves the package version from `Directory.Packages.props` / `Directory.Build.props` / sibling `.csproj` files via `SolutionPackageVersionFinder`.
+2. Runs `dotnet add <project> package <name> --version <v>` via `CmdHelper`.
+3. Re-reads the target `.csproj`, finds the `AbpModule`-derived class in the project, and inserts a `[DependsOn(typeof(<X>))]` attribute on it. This is what `UsingStatementAdder` and `ModuleClassDependcyAdder` are for.
+4. Optionally downloads the source code (`--with-source-code`) and adds it to the `.sln` (`--add-to-solution-file`).
+
+### NPM flow
+
+`ProjectNpmPackageAdder.AddNpmPackageAsync`:
+
+1. `yarn add <name>@<version>` inside the Angular project directory.
+2. For Angular packages, updates `angular.json` to register any static assets the package needs.
+
+### Help block (verbatim)
+
+```text
+'add-package' command is used to add an ABP package to a project.
+It should be used in a folder containing a .csproj file, .sln file, .slnx file or packages.json.
+
+Usage:
+  abp add-package <package-name> [options]
+
+Options:
+  -p|--project <project-file>
+  -s|--solution <solution-file>
+  --with-source-code
+  --add-to-solution-file
+  -ad|--angular-directory <angular-project-directory>
+  -v|--version <version>
+
+Examples:
+
+  abp add-package Volo.Abp.FluentValidation
+  abp add-package Volo.Abp.FluentValidation -p Acme.BookStore.Application
+  abp add-package @abp/signalr
+  abp add-package @abp/ng.theme.basic
+```
+
+### Project-file selection
+
+If `-p`/`--project` is given, that file is used. Otherwise the current directory is scanned for a single `.csproj`. With multiple, the command throws a `CliUsageException` listing them and asking the user to pick one. The same logic applies to `-s`/`--solution`.
+
+## `abp add-module` — module composed of many packages
+
+A "module" in ABP is a coordinated set of `.Domain` / `.Application` / `.HttpApi` / `.Web` / `.MongoDB` / `.EntityFrameworkCore` packages. `abp add-module Volo.Blogging` adds each package to the project in your solution that matches its target layer.
+
+### Entry point
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/AddModuleCommand.cs
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    if (commandLineArgs.Target == null)
+    {
+        throw new CliUsageException(
+            "Module name is missing!" +
+            Environment.NewLine + Environment.NewLine +
+            GetUsageInfo()
+        );
+    }
+
+    if (_options.DisabledModulesToAddToSolution.Contains(commandLineArgs.Target))
+    {
+        throw new CliUsageException(
+            $"{commandLineArgs.Target} Module is not available for this command! You can check the module's documentation for more info."
+        );
+    }
+
+    var newTemplate = commandLineArgs.Options.ContainsKey(Options.NewTemplate.Long);
+    var template = commandLineArgs.Options.GetOrNull(Options.Template.Short, Options.Template.Long);
+    var newProTemplate = !string.IsNullOrEmpty(template) && template == ModuleProTemplate.TemplateName;
+    var withSourceCode = newTemplate || newProTemplate || commandLineArgs.Options.ContainsKey(Options.SourceCode.Long);
+    var addSourceCodeToSolutionFile = withSourceCode && commandLineArgs.Options.ContainsKey("add-to-solution-file");
+    var skipOpeningDocumentation = commandLineArgs.Options.ContainsKey(Options.SkipOpeningDocumentation.Long);
+    var skipDbMigrations = newTemplate || newProTemplate || commandLineArgs.Options.ContainsKey(Options.DbMigrations.Skip);
+    var solutionFile = GetSolutionFile(commandLineArgs);
+
+    var version = commandLineArgs.Options.GetOrNull(Options.Version.Short, Options.Version.Long);
+    if (version == null)
+    {
+        if (commandLineArgs.Target.Contains("LeptonX"))
+        {
+            version = SolutionPackageVersionFinder.FindByCsprojVersion(solutionFile, excludedKeywords: null, includedKeyword: "LeptonX");
+
+            if (version.Contains("*"))
+            {
+                version = SolutionPackageVersionFinder.FindByDllVersion(solutionFile, "Volo.Abp.*LeptonX*");
+            }
+        }
+        else
+        {
+            version = SolutionPackageVersionFinder.FindByCsprojVersion(solutionFile);
+        }
+    }
+
+    var moduleInfo = await SolutionModuleAdder.AddAsync(
+         solutionFile,
+         commandLineArgs.Target,
+         version,
+         skipDbMigrations,
+         withSourceCode,
+         addSourceCodeToSolutionFile,
+         newTemplate,
+         newProTemplate,
+         skipOpeningDocumentation
+     );
+    // ... store moduleInfo into _lastAddedModuleInfo ...
+}
+```
+
+Note the **`DisabledModulesToAddToSolution`** check — `AbpCliCoreModule` pre-disables `Volo.Abp.LeptonXTheme.Pro` and `Volo.Abp.LeptonXTheme.Lite` because they need to be added via `abp add-package` or theme switching, not `add-module`.
+
+### Disabled module entries
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliCoreModule.cs
+options.DisabledModulesToAddToSolution.Add("Volo.Abp.LeptonXTheme.Pro");
+options.DisabledModulesToAddToSolution.Add("Volo.Abp.LeptonXTheme.Lite");
+```
+
+You can add to this list from your own ABP application module if you ship a module that shouldn't be installed solution-wide.
+
+### `SolutionModuleAdder.AddAsync`
+
+The adder is the brain. It:
+
+1. Fetches the module's package metadata from `nuget.abp.io` (which packages it contains, where they target).
+2. For each package, finds the matching project via `ProjectFinder.FindNuGetTargetProjectFile`. The match is **suffix-based**: `.Domain` → the project whose assembly name ends with `.Domain`.
+3. For each match, calls `ProjectNugetPackageAdder.AddAsync` to wire up the `<PackageReference>` and the `[DependsOn]` attribute.
+4. If `--with-source-code`, downloads the module source under `modules/<ModuleName>/` and replaces the package refs with `ProjectReference`s.
+5. If `--with-source-code --add-to-solution-file`, calls `SolutionFileModifier.AddModuleToSolutionFileAsync` to insert each project into the `.sln`.
+6. Returns a `ModuleWithMastersInfo` describing what was added (display name, docs links, installation-complete message).
+7. Unless `--skip-db-migrations` is set, runs `dotnet ef migrations add Added_<Module>` against the migration-startup project (`-sp`).
+8. Unless `--skip-opening-documentation` is set, opens the module's documentation page in the browser.
+
+### Project-suffix routing
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/ProjectFinder.cs
+switch (target)
+{
+    case NuGetPackageTarget.Web:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".Web");
+    case NuGetPackageTarget.IdentityServer:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".IdentityServer") ??
+               FindProjectEndsWith(projectFiles, assemblyNames, ".AuthServer");
+    case NuGetPackageTarget.EntityFrameworkCore:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".EntityFrameworkCore");
+    case NuGetPackageTarget.MongoDB:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".MongoDB");
+    case NuGetPackageTarget.Application:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".Application") ??
+               FindProjectEndsWith(projectFiles, assemblyNames, ".Web");
+    case NuGetPackageTarget.ApplicationContracts:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".Application.Contracts");
+    case NuGetPackageTarget.Domain:
+        return FindProjectEndsWith(projectFiles, assemblyNames, ".Domain") ??
+               FindProjectEndsWith(projectFiles, assemblyNames, ".Application") ??
+               FindProjectEndsWith(projectFiles, assemblyNames, ".Web");
+    // ...
+}
+```
+
+That single switch is why solutions generated by `abp new` have stable project-name suffixes — anything diverging from `Acme.BookStore.Domain` / `Acme.BookStore.Application` / `Acme.BookStore.HttpApi.Host` breaks `add-module`.
+
+### Solution-file editing
+
+`SolutionFileModifier` shells out to `dotnet sln`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/SolutionFileModifier.cs
+public async Task RemoveProjectFromSolutionFileAsync(string solutionFile, string projectName)
+{
+    var list = _cmdHelper.RunCmdAndGetOutput($"dotnet sln \"{solutionFile}\" list");
+
+    foreach (var line in list.Split(new[] { Environment.NewLine, "\n" }, StringSplitOptions.None))
+    {
+        if (Path.GetFileNameWithoutExtension(line.Trim()).Equals(projectName, StringComparison.InvariantCultureIgnoreCase))
+        {
+            _cmdHelper.RunCmd($"dotnet sln \"{solutionFile}\" remove \"{line.Trim()}\"");
+            break;
+        }
+    }
+}
+
+public async Task AddModuleToSolutionFileAsync(ModuleWithMastersInfo module, string solutionFile)
+{
+    await AddModuleAsync(module, solutionFile);
+}
+```
+
+Each module package becomes `modules/<ModuleName>/src/<ProjectName>/<ProjectName>.csproj` and is added under solution folder `src` (or `test`). See [project-modification](/cli/project-modification#solutionfilemodifier).
+
+### Help block (verbatim)
+
+```text
+'add-module' command is used to add a multi-package ABP module to a solution.
+It should be used in a folder containing a .sln or .slnx file.
+
+Usage:
+  abp add-module <module-name> [options]
+
+Options:
+  --new
+  --with-source-code
+  --add-to-solution-file
+  -s|--solution <solution-file>
+  --skip-db-migrations <boolean>
+  -sp|--startup-project <startup-project-path>
+  -v|--version <version>
+
+Examples:
+
+  abp add-module Volo.Blogging
+  abp add-module Volo.Blogging -s Acme.BookStore
+  abp add-module Volo.Blogging -s Acme.BookStore --skip-db-migrations false
+  abp add-module Volo.Blogging -s Acme.BookStore -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+  abp add-module ProductManagement --new -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+  abp add-module ProductManagement --new --add-to-solution-file -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+```
+
+`--new` builds a fresh project for the module instead of consuming a published package; it's the building block Studio uses behind "Add a new module".
+
+## End-to-end: install-libs + add-package + bundle
+
+A typical iteration after editing an MVC theme:
+
+```
+$ abp add-package Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonX -p src/Acme.BookStore.Web/Acme.BookStore.Web.csproj
+$ abp install-libs
+$ dotnet run --project src/Acme.BookStore.Web
+```
+
+For Blazor WASM:
+
+```
+$ abp add-package Volo.Abp.AspNetCore.Components.WebAssembly.LeptonXTheme -p src/Acme.BookStore.Blazor.WebAssembly/Acme.BookStore.Blazor.WebAssembly.csproj
+$ abp bundle
+$ dotnet run --project src/Acme.BookStore.Blazor.WebAssembly
+```
+
+## Related
+
+- [`abp new`](/cli/new-command) — calls `InstallLibsService` automatically (unless `-sib`).
+- [Project modification](/cli/project-modification) — every modifier `add-package`/`add-module` rely on.
+- [ASP.NET Core MVC UI packages](/aspnetcore/mvc-ui-packages) — what the copied `wwwroot/libs/` actually does at runtime.
+- [Angular generators & schematics](/angular/generators-and-schematics) — the equivalent for adding ABP modules to an Angular workspace (`npx ng add @abp/ng.X`).

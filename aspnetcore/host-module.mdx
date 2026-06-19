@@ -1,0 +1,208 @@
+---
+title: "ASP.NET Core Host Module — Volo.Abp.AspNetCore Wiring"
+sidebarTitle: "Host Module"
+description: "The Volo.Abp.AspNetCore base module — wires auditing, security, UoW, exception handling, virtual file system and HTTP into the ASP.NET Core pipeline."
+---
+
+`Volo.Abp.AspNetCore` is the base Web host module of the framework. Every ASP.NET Core project — MVC, Razor Pages, Blazor Server, HTTP API host — depends on it transitively, because `AbpAspNetCoreMvcModule`, `AbpAspNetCoreMultiTenancyModule`, `AbpAspNetCoreSerilogModule`, `AbpAspNetCoreSignalRModule` and every theming package list it in their `[DependsOn(...)]` graph. Its job is small but central: take the framework's cross‑cutting modules (auditing, authorization, unit of work, exception handling) and make them available to ASP.NET Core middleware and DI.
+
+## Packages
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.AspNetCore" icon="server">
+    The host module itself. Implementation at `framework/src/Volo.Abp.AspNetCore/`. Contains middleware (`AbpUnitOfWorkMiddleware`, exception handling), the `IWebHostEnvironment` plumbing and the static‑files / virtual file system glue.
+  </Card>
+  <Card title="Volo.Abp.AspNetCore.Abstractions" icon="diagram-project">
+    Public contracts shared between ASP.NET Core code and modules that mustn't take the full Web host dependency. Path: `framework/src/Volo.Abp.AspNetCore.Abstractions/`.
+  </Card>
+</CardGroup>
+
+## `AbpAspNetCoreModule`
+
+The module is declared at `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/AbpAspNetCoreModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAuditingModule),
+    typeof(AbpSecurityModule),
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpUnitOfWorkModule),
+    typeof(AbpHttpModule),
+    typeof(AbpAuthorizationModule),
+    typeof(AbpValidationModule),
+    typeof(AbpExceptionHandlingModule),
+    typeof(AbpAspNetCoreAbstractionsModule)
+    )]
+public class AbpAspNetCoreModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        var abpHostEnvironment = context.Services.GetSingletonInstance<IAbpHostEnvironment>();
+        if (abpHostEnvironment.EnvironmentName.IsNullOrWhiteSpace())
+        {
+            abpHostEnvironment.EnvironmentName = context.Services.GetHostingEnvironment().EnvironmentName;
+        }
+        // ...
+    }
+}
+```
+
+`[DependsOn]` declares the transitive module graph (see [/core/modularity](/core/modularity)). `PreConfigureServices` synchronizes `IAbpHostEnvironment.EnvironmentName` with the ASP.NET Core `IHostEnvironment` so framework code that cannot take an `IHostEnvironment` dependency (it lives below `Volo.Abp.Core`) still sees `"Development"` / `"Production"`.
+
+The module also calls `services.AddHttpUserAgentParser()` (from the `MyCSharp.HttpUserAgentParser.DependencyInjection` package referenced in `using` directives), so `IWebClientInfoProvider` can fill user‑agent fields in audit logs without each application configuring the parser itself.
+
+## What the dependencies bring in
+
+| Depends-on module | Purpose in the Web host |
+| --- | --- |
+| `AbpAuditingModule` | `IAuditingManager`, `AuditingHelper` and the `AbpAuditActionFilter` registered by `AbpMvcOptionsExtensions.AddAbp(...)`. |
+| `AbpSecurityModule` | `ICurrentUser`, `ICurrentTenant` accessors, dynamic claims principal contributors. |
+| `AbpVirtualFileSystemModule` | Embedded view, JS, CSS files exposed through `AbpAspNetCoreContentFileProvider`. |
+| `AbpUnitOfWorkModule` | `IUnitOfWorkManager` for `AbpUowActionFilter` / `AbpUowPageFilter` / `AbpUnitOfWorkMiddleware`. |
+| `AbpHttpModule` | `RemoteServiceErrorInfo`, `RemoteServiceErrorResponse`, `IHttpClientFactoryProxy` shared with HTTP API clients. |
+| `AbpAuthorizationModule` | `IAuthorizationService`, `IPermissionChecker` consumed by `AbpAuthorizationFilter`. |
+| `AbpValidationModule` | `IObjectValidator` used by `AbpValidationActionFilter`. |
+| `AbpExceptionHandlingModule` | `IExceptionToErrorInfoConverter` chain that the `AbpExceptionFilter` and `AbpExceptionHandlingMiddleware` delegate to. |
+| `AbpAspNetCoreAbstractionsModule` | Contracts only — see below. |
+
+## Files under `Volo.Abp.AspNetCore/Volo/Abp/AspNetCore`
+
+The folders directly under the host module's namespace match the cross‑cutting concerns it integrates:
+
+| Folder | What's there |
+| --- | --- |
+| `Auditing/` | `AbpAuditResultMiddleware`, `AuditingActionFilterExtensions`, helpers that read the current `HttpContext` into audit logs. |
+| `Controllers/` | Base controllers and conventional registrar pieces shared with `Volo.Abp.AspNetCore.Mvc`. |
+| `DependencyInjection/` | `AbpAspNetCoreConventionalRegistrar` — registers middleware classes as transient DI services. |
+| `ExceptionHandling/` | `AbpExceptionHandlingMiddleware` and `AbpExceptionPageMiddleware` that convert exceptions to `RemoteServiceErrorResponse`. |
+| `Middleware/` | `AbpMiddlewareBase` — the base class used by `MultiTenancyMiddleware`, `AbpSerilogMiddleware`, `AbpUnitOfWorkMiddleware`. |
+| `RazorViews/` | Programmatic Razor error pages used by `AbpMvcLibsService`, multi‑tenancy error page, etc. |
+| `Security/` | `AbpSecurityHeadersMiddleware` and `AbpSecurityHeadersOptions`. |
+| `SecurityLog/` | `AbpSecurityLogActionFilter` — captures sensitive operations into the security log table. |
+| `StaticFiles/` | `AbpStaticFilesMiddleware` and helpers that map embedded static files. |
+| `Threading/` | `AbpCancellationTokenProvider` implementation that reads `HttpContext.RequestAborted`. |
+| `Tracing/` | `AspNetCoreCorrelationIdProvider` — reads the `X-Correlation-Id` header or generates one. |
+| `Uow/` | `AbpUnitOfWorkMiddleware` (the `app.UseUnitOfWork()` extension). |
+| `VirtualFileSystem/` | `AbpAspNetCoreContentFileProvider`, `AbpWebContentFileProviderExtensions`. |
+| `WebClientInfo/` | `HttpContextWebClientInfoProvider` — reads IP, browser, OS into audit records. |
+
+<Note>
+  `AbpMiddlewareBase` is the base class every ABP middleware inherits — see `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Middleware/AbpMiddlewareBase.cs`. It declares `Task InvokeAsync(HttpContext, RequestDelegate)` and is registered via `services.AddTransient<TMiddleware>()` so the DI container resolves middleware instances per request.
+</Note>
+
+## `AbpAspNetCoreAbstractionsModule`
+
+`framework/src/Volo.Abp.AspNetCore.Abstractions/Volo/Abp/AspNetCore/AbpAspNetCoreAbstractionsModule.cs` is a near‑empty module. It exists so contract‑level packages (for example `Volo.Abp.AspNetCore.Authentication.JwtBearer`) can depend on ABP's ASP.NET Core abstractions without pulling the full Web host. It exposes:
+
+| Folder | Contents |
+| --- | --- |
+| `Authentication/` | `IAbpClaimsPrincipalAccessor` and friends — shared between JWT, OAuth and OIDC packages. |
+| `Filters/` | `IAbpAutoControllerAttribute` and similar marker attributes. |
+| `VirtualFileSystem/` | Abstractions used by themes and tests that don't want a `Microsoft.Extensions.FileProviders` dependency. |
+| `WebClientInfo/` | `IWebClientInfoProvider` interface; the implementation lives in `Volo.Abp.AspNetCore`. |
+
+```csharp
+// AbpAspNetCoreAbstractionsModule.cs
+public class AbpAspNetCoreAbstractionsModule : AbpModule
+{
+    // empty by design — used only to declare a [DependsOn(typeof(AbpAspNetCoreAbstractionsModule))] target
+}
+```
+
+## Wiring the middleware in a host module
+
+A typical Web host's `OnApplicationInitialization` calls the extension methods registered by this group. They appear in the application templates under `templates/app/aspnet-core/` and reproduce the order from [/aspnetcore/overview](/aspnetcore/overview):
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    var env = context.GetEnvironment();
+
+    app.UseForwardedHeaders();
+    app.UseAbpRequestLocalization();
+    app.UseCorrelationId();
+    app.UseStaticFiles();
+    app.UseRouting();
+    app.UseAuthentication();
+    app.UseAbpOpenIddictValidation();
+    app.UseMultiTenancy();                // MultiTenancyMiddleware
+    app.UseUnitOfWork();                  // AbpUnitOfWorkMiddleware
+    app.UseDynamicClaims();
+    app.UseAuthorization();
+    app.UseSwagger();
+    app.UseAbpSwaggerUI(/* ... */);
+    app.UseAuditing();
+    app.UseAbpSerilogEnrichers();         // AbpSerilogMiddleware
+    app.UseConfiguredEndpoints();         // maps endpoints from AbpEndpointRouterOptions
+}
+```
+
+Each `app.UseXxx()` extension lives in a separate module (`UseMultiTenancy` ships in `Volo.Abp.AspNetCore.MultiTenancy`, `UseAbpSerilogEnrichers` in `Volo.Abp.AspNetCore.Serilog`). They share the `AbpMiddlewareBase` base class so request semantics — `await next(context)` — are identical across the family.
+
+## Endpoint routing — `AbpEndpointRouterOptions`
+
+`AbpEndpointRouterOptions` (in `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Endpoints/`) is a list of `Action<IEndpointRouteBuilder>` configurators that `app.UseConfiguredEndpoints()` executes in order. Modules contribute their endpoints by writing into it:
+
+```csharp
+Configure<AbpEndpointRouterOptions>(options =>
+{
+    options.EndpointConfigureActions.Add(endpointContext =>
+    {
+        endpointContext.Endpoints.MapHub<NotificationHub>("/signalr-hubs/notification");
+    });
+});
+```
+
+The SignalR module uses exactly this hook to auto‑map hubs — see [/aspnetcore/signalr](/aspnetcore/signalr).
+
+## Auditing integration
+
+`AbpAuditingModule` is the first `[DependsOn]` entry. Inside this host module, two pieces tie auditing to the request:
+
+| Component | Path | Job |
+| --- | --- | --- |
+| `AbpAuditResultMiddleware` | `Auditing/` | Captures the final `HttpResponse.StatusCode` and writes it into the active audit log entry. |
+| `AbpAuditingHelper` extension via `HttpContext` | `Auditing/AuditingActionFilterExtensions.cs` | Reads URL, HTTP verb, client IP and user agent from `HttpContext` into the audit row. |
+
+The MVC action filter (`AbpAuditActionFilter` in `Volo.Abp.AspNetCore.Mvc/Auditing/`) opens the audit scope; the middleware closes it. Without this dual setup, an exception thrown before the action filter ran would leave an orphan audit entry.
+
+## Security headers
+
+`Security/AbpSecurityHeadersMiddleware.cs` writes:
+
+- `Content-Security-Policy` — with a per‑request script nonce so inline scripts emitted by Razor pages are accepted.
+- `X-Content-Type-Options: nosniff`.
+- `X-Frame-Options: SAMEORIGIN`.
+- `Referrer-Policy: strict-origin-when-cross-origin`.
+
+`AbpSecurityHeadersOptions` exposes `IgnoredScriptNoncePaths` — used by the OIDC module to exempt `/signout-oidc` (see [/aspnetcore/auth-openidconnect](/aspnetcore/auth-openidconnect)).
+
+## Static files and the virtual file system
+
+The host module bridges ABP's `IVirtualFileProvider` to ASP.NET Core's `IFileProvider` chain via `AbpAspNetCoreContentFileProvider`. Effects:
+
+- Any module's embedded `wwwroot/` files are served directly without copying to disk at publish time.
+- Razor views can `@inject` services that read embedded JSON config files.
+- The bundle manager (`Volo.Abp.AspNetCore.Bundling`) walks the virtual file system to find bundle contributor inputs.
+
+## Conventional registrar — `AbpAspNetCoreConventionalRegistrar`
+
+`DependencyInjection/AbpAspNetCoreConventionalRegistrar.cs` is the registrar that finds every `AbpMiddlewareBase` derivative and registers it as a transient DI service. This is why `MultiTenancyMiddleware`, `AbpSerilogMiddleware` and `AbpUnitOfWorkMiddleware` work without each one calling `services.AddTransient<TMiddleware>()` from its module.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Modularity" icon="diagram-project" href="/core/modularity">
+    The `[DependsOn]` graph: every Web host module depends on `AbpAspNetCoreModule`, which depends on the eight framework modules listed above.
+  </Card>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    `AbpAspNetCoreMvcModule` builds on this host module and adds action filters, conventions, formatters, anti‑forgery, validation and proxy scripting.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    The end‑to‑end flow that uses every middleware described here.
+  </Card>
+  <Card title="Multi‑tenancy" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    `MultiTenancyMiddleware` extends `AbpMiddlewareBase` from this module.
+  </Card>
+</CardGroup>

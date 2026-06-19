@@ -1,0 +1,257 @@
+---
+title: "SignalR Integration — AbpHub And Auto Hub Mapping"
+sidebarTitle: "SignalR"
+description: "Volo.Abp.AspNetCore.SignalR — AbpHub base class, AbpSignalROptions, HubRouteAttribute and the automatic MapHub endpoint registration."
+---
+
+`Volo.Abp.AspNetCore.SignalR` integrates ASP.NET Core SignalR into ABP's pipeline. It supplies an `AbpHub` base class with lazy access to `CurrentUser`, `CurrentTenant`, `Clock` and localization; auto‑discovers all `Hub` subclasses and maps them under `/signalr-hubs/<name>`; registers hub filters that propagate authentication, audit context and the hub context accessor.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.SignalR/Volo/Abp/AspNetCore/SignalR/`.
+
+## `AbpAspNetCoreSignalRModule`
+
+```csharp
+// AbpAspNetCoreSignalRModule.cs (excerpt)
+[DependsOn(typeof(AbpAspNetCoreModule))]
+public class AbpAspNetCoreSignalRModule : AbpModule
+{
+    private static readonly MethodInfo MapHubGenericMethodInfo =
+        typeof(AbpAspNetCoreSignalRModule)
+            .GetMethod("MapHub", BindingFlags.Static | BindingFlags.NonPublic)!;
+
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpSignalRConventionalRegistrar());
+        AutoAddHubTypes(context.Services);
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var routePatterns = new List<string> { "/signalr-hubs" };
+        var signalRServerBuilder = context.Services.AddSignalR(options =>
+        {
+            options.DisableImplicitFromServicesParameters = true;
+            options.AddFilter<AbpHubContextAccessorHubFilter>();
+            options.AddFilter<AbpAuthenticationHubFilter>();
+            options.AddFilter<AbpAuditHubFilter>();
+        });
+
+        context.Services.ExecutePreConfiguredActions(signalRServerBuilder);
+
+        Configure<AbpEndpointRouterOptions>(options =>
+        {
+            // adds an endpoint configurator that iterates Options.Hubs and calls MapHub<THub>(...)
+        });
+    }
+
+    private static void MapHub<THub>(
+        IEndpointRouteBuilder endpoints, string pattern, Action<HttpConnectionDispatcherOptions> configure)
+        where THub : Hub
+    {
+        endpoints.MapHub<THub>(pattern, configure);
+    }
+}
+```
+
+Key behaviors:
+
+| Behavior | How it works |
+| --- | --- |
+| Hubs are discovered automatically | `AbpSignalRConventionalRegistrar` plus `AutoAddHubTypes(...)` find every `Hub` subclass in loaded ABP assemblies and add a `HubConfig` to `AbpSignalROptions.Hubs`. Hubs decorated `[DisableAutoHubMap]` are skipped. |
+| Hubs are mapped via `AbpEndpointRouterOptions` | A configurator iterates `Options.Hubs` and calls `MapHub<THub>(pattern, opts)` so `app.UseConfiguredEndpoints()` picks them up. |
+| The route comes from `HubRouteAttribute` | Defaults to `/signalr-hubs/<name‑without‑Hub‑suffix>.ToKebabCase()`. |
+| Three hub filters are registered | Hub‑context‑accessor, authentication, audit. They make `[Authorize]` and ABP audit logs work for hub method invocations. |
+| Implicit `FromServices` is disabled | Hub method parameters must be passed by the client; DI services come via constructor injection. |
+
+## `AbpHub` and `AbpHubBase`
+
+```csharp
+// AbpHub.cs (excerpt)
+public abstract class AbpHub : Hub
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected ILogger Logger => LazyServiceProvider.LazyGetService<ILogger>(
+        provider => LoggerFactory?.CreateLogger(GetType().FullName!) ?? NullLogger.Instance);
+
+    protected ICurrentUser CurrentUser => LazyServiceProvider.LazyGetService<ICurrentUser>()!;
+    protected ICurrentTenant CurrentTenant => LazyServiceProvider.LazyGetService<ICurrentTenant>()!;
+    protected IAuthorizationService AuthorizationService =>
+        LazyServiceProvider.LazyGetService<IAuthorizationService>()!;
+    protected IClock Clock => LazyServiceProvider.LazyGetService<IClock>()!;
+    protected IStringLocalizerFactory StringLocalizerFactory =>
+        LazyServiceProvider.LazyGetService<IStringLocalizerFactory>()!;
+
+    protected IStringLocalizer L
+    {
+        get
+        {
+            if (_localizer == null) _localizer = CreateLocalizer();
+            return _localizer;
+        }
+    }
+    private IStringLocalizer? _localizer;
+    private Type? _localizationResource = typeof(DefaultResource);
+
+    protected virtual IStringLocalizer CreateLocalizer()
+    {
+        if (LocalizationResource != null)
+            return StringLocalizerFactory.Create(LocalizationResource);
+        var localizer = StringLocalizerFactory.CreateDefaultOrNull();
+        if (localizer == null)
+            throw new AbpException(/* ... */);
+        return localizer;
+    }
+}
+
+public abstract class AbpHub<T> : Hub<T> where T : class { /* identical surface */ }
+```
+
+There is no separate `AbpHubBase` file; the inheritance mirror — `AbpHub : Hub` (untyped clients) and `AbpHub<T> : Hub<T>` (strongly typed client interface) — provides both flavors. Both classes expose the same lazy accessors as `AbpController` so hub authors don't need to inject `ICurrentUser` etc. by hand.
+
+## `AbpSignalROptions`
+
+```csharp
+// AbpSignalROptions.cs
+public class AbpSignalROptions
+{
+    public HubConfigList Hubs { get; }
+
+    /// <summary>Default: 5 seconds.</summary>
+    public TimeSpan? CheckDynamicClaimsInterval { get; set; }
+
+    public AbpSignalROptions()
+    {
+        Hubs = new HubConfigList();
+        CheckDynamicClaimsInterval = TimeSpan.FromSeconds(5);
+    }
+}
+```
+
+| Property | Purpose |
+| --- | --- |
+| `Hubs` | Mutable list of `HubConfig` entries the module mapper iterates. Use `Hubs.Add<MyHub>("/custom-path")` to remap or `Hubs.Remove<MyHub>()` to skip a hub. |
+| `CheckDynamicClaimsInterval` | How often the authentication hub filter rechecks dynamic claims (see [/aspnetcore/auth-jwt-bearer](/aspnetcore/auth-jwt-bearer)). |
+
+## `HubRouteAttribute`
+
+```csharp
+// HubRouteAttribute.cs
+public class HubRouteAttribute : Attribute
+{
+    public string RoutePattern { get; set; }
+
+    public HubRouteAttribute(string routePattern) { RoutePattern = routePattern; }
+
+    public virtual string GetRoutePatternForType(Type hubType) => RoutePattern;
+
+    public static string GetRoutePattern<THub>() where THub : Hub => GetRoutePattern(typeof(THub));
+
+    public static string GetRoutePattern(Type hubType)
+    {
+        var routeAttribute = hubType.GetSingleAttributeOrNull<HubRouteAttribute>();
+        if (routeAttribute != null) return routeAttribute.GetRoutePatternForType(hubType);
+        return "/signalr-hubs/" + hubType.Name.RemovePostFix("Hub").ToKebabCase();
+    }
+}
+```
+
+The mapping logic — used by the endpoint configurator and by the JS client to compute connection URLs — falls back to a kebab‑case name when the attribute is absent. So:
+
+| Class name | Default route |
+| --- | --- |
+| `NotificationHub` | `/signalr-hubs/notification` |
+| `MyChatRoomHub` | `/signalr-hubs/my-chat-room` |
+
+Override with the attribute:
+
+```csharp
+[HubRoute("/messaging/chat")]
+public class MyChatRoomHub : AbpHub { /* ... */ }
+```
+
+## `DisableAutoHubMapAttribute`
+
+Drop on a hub class to keep `AbpAspNetCoreSignalRModule` from auto‑mapping it. Use when the hub is mapped manually with extra options (e.g. custom `HttpConnectionDispatcherOptions`):
+
+```csharp
+[DisableAutoHubMap]
+public class MyManualHub : AbpHub { }
+
+// In Configure<AbpEndpointRouterOptions>
+options.EndpointConfigureActions.Add(ctx =>
+    ctx.Endpoints.MapHub<MyManualHub>("/special", o => o.Transports = HttpTransportType.WebSockets));
+```
+
+## Hub filters
+
+The module registers three filters via `options.AddFilter<...>()`:
+
+| Filter | File | Job |
+| --- | --- | --- |
+| `AbpHubContextAccessorHubFilter` | `AbpHubContextAccessorHubFilter.cs` | Pushes the current `Hub` instance into `IAbpHubContextAccessor` so non‑hub services can find the connection. |
+| `AbpAuthenticationHubFilter` | `Authentication/AbpAuthenticationHubFilter.cs` | Re‑evaluates dynamic claims on long‑lived connections so revoked permissions take effect after `AbpSignalROptions.CheckDynamicClaimsInterval`. |
+| `AbpAuditHubFilter` | `Auditing/AbpAuditHubFilter.cs` | Wraps each hub method invocation in an `IAuditingManager` scope. |
+
+### `IAbpHubContextAccessor` / `AbpHubContext` / `DefaultAbpHubContextAccessor`
+
+```csharp
+// IAbpHubContextAccessor.cs
+public interface IAbpHubContextAccessor
+{
+    AbpHubContext? Current { get; set; }
+}
+```
+
+The accessor is filled by `AbpHubContextAccessorHubFilter` for the duration of a hub invocation. Code outside the hub can resolve it from DI to read the connection id, user identity etc.
+
+## `AbpSignalRUserIdProvider`
+
+`AbpSignalRUserIdProvider.cs` returns `ICurrentUser.Id?.ToString()`. This is what SignalR uses when an application calls `IHubContext.Clients.User(userId)` — without an override, SignalR would use the `NameIdentifier` claim, which is the same value in most setups but is `Guid` shaped in ABP and `Guid.ToString()` is the canonical representation.
+
+## Authorization on hubs
+
+`[AbpAuthorize]` is not a separate attribute for hubs — use ASP.NET Core's `[Authorize(Policy = "MyPolicy")]` on the hub class or hub method. The combination of the standard `AuthorizeFilter` plus `AbpAuthenticationHubFilter` (for dynamic claims) gives ABP‑aware authorization.
+
+```csharp
+[Authorize(Policy = "MyApp.Notifications.Receive")]
+public class NotificationHub : AbpHub
+{
+    public async Task Subscribe(string topic)
+    {
+        await Groups.AddToGroupAsync(Context.ConnectionId, topic);
+    }
+}
+```
+
+## `HubConfig` / `HubConfigList`
+
+`HubConfig.cs` exposes:
+
+```csharp
+public class HubConfig
+{
+    public Type HubType { get; }
+    public string? RoutePattern { get; set; }
+    public Action<HttpConnectionDispatcherOptions>? ConfigureOptions { get; set; }
+}
+```
+
+`HubConfigList` derives from `List<HubConfig>` with strongly typed `Add<THub>(...)`/`Remove<THub>()` helpers. The endpoint configurator iterates this list at startup.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Host module" icon="server" href="/aspnetcore/host-module">
+    `AbpEndpointRouterOptions` and the `app.UseConfiguredEndpoints()` extension that maps hubs.
+  </Card>
+  <Card title="JWT Bearer" icon="key" href="/aspnetcore/auth-jwt-bearer">
+    Dynamic claims refresh for hub connections.
+  </Card>
+  <Card title="Multi‑tenancy" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    Hub invocations run with `ICurrentTenant` populated from the original HTTP handshake.
+  </Card>
+  <Card title="Current user" icon="shield-halved" href="/security/overview">
+    `AbpSignalRUserIdProvider` reads `ICurrentUser.Id`.
+  </Card>
+</CardGroup>

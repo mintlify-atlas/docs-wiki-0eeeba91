@@ -1,0 +1,376 @@
+---
+title: "Data Seeding: Contributors and the DataSeeder Pipeline"
+sidebarTitle: "Data Seeding"
+description: "Use IDataSeedContributor and IDataSeeder to populate initial data, with the real IdentityDataSeeder / IdentityDataSeedContributor as a worked example."
+---
+
+ABP's data‑seeding pipeline is the framework's standard answer to "how do I plant initial rows that every install needs?". It lives in `framework/src/Volo.Abp.Data/Volo/Abp/Data/`. The execution model is simple: every type that implements `IDataSeedContributor` is auto‑registered by `AbpDataModule`, ordered into `DataSeedContributorList`, and run by `DataSeeder` inside a Unit of Work. Modules ship their own contributors (Identity adds an `admin` user and roles; Permission Management seeds default grants; etc.) and your application can add its own.
+
+This page walks the abstractions, the auto‑registration mechanism in `AbpDataModule`, and a complete real example: `IdentityDataSeeder` + `IdentityDataSeedContributor` from `modules/identity/src/Volo.Abp.Identity.Domain/`.
+
+## Contracts
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataSeeder.cs
+public interface IDataSeeder
+{
+    Task SeedAsync(DataSeedContext context);
+}
+
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataSeedContributor.cs
+public interface IDataSeedContributor
+{
+    Task SeedAsync(DataSeedContext context);
+}
+```
+
+Same shape, different roles:
+
+- **`IDataSeeder`** — the orchestrator. There is one (`DataSeeder`). Hosts call it.
+- **`IDataSeedContributor`** — one piece of seed work. Each module supplies one or more.
+
+## DataSeedContext
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataSeedContext.cs
+public class DataSeedContext
+{
+    public Guid? TenantId { get; set; }
+
+    public object? this[string name] {
+        get => Properties.GetOrDefault(name);
+        set => Properties[name] = value;
+    }
+
+    [NotNull]
+    public Dictionary<string, object?> Properties { get; }
+
+    public DataSeedContext(Guid? tenantId = null)
+    {
+        TenantId = tenantId;
+        Properties = new Dictionary<string, object?>();
+    }
+
+    public virtual DataSeedContext WithProperty(string key, object? value)
+    {
+        Properties[key] = value;
+        return this;
+    }
+}
+```
+
+Two pieces of state:
+
+- `TenantId` — null for host seeding, the tenant id for per‑tenant seeding. Seed contributors are expected to wrap their work in `using (CurrentTenant.Change(context.TenantId))`.
+- `Properties` — a free‑form bag. Modules use named string keys to pass overrides (see Identity's `AdminEmail` example below).
+
+## Auto-registration
+
+`AbpDataModule.PreConfigureServices` adds every implementor of `IDataSeedContributor` to `AbpDataSeedOptions.Contributors`:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDataModule.cs
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    AutoAddDataSeedContributors(context.Services);
+}
+
+private static void AutoAddDataSeedContributors(IServiceCollection services)
+{
+    var contributors = new List<Type>();
+
+    services.OnRegistered(context =>
+    {
+        if (typeof(IDataSeedContributor).IsAssignableFrom(context.ImplementationType))
+        {
+            contributors.Add(context.ImplementationType);
+        }
+    });
+
+    services.Configure<AbpDataSeedOptions>(options =>
+    {
+        options.Contributors.AddIfNotContains(contributors);
+    });
+}
+```
+
+<Note>
+You usually do **not** need to register your contributor explicitly. Just implement `IDataSeedContributor` on a class that ABP's conventional registrar picks up (e.g. `ITransientDependency`) and it's in the list.
+</Note>
+
+`AbpDataSeedOptions.Contributors` is a `DataSeedContributorList` (`framework/src/Volo.Abp.Data/Volo/Abp/Data/DataSeedContributorList.cs`) — a plain `List<Type>` ordered by registration order. If you need to influence the order, configure the options post‑hoc:
+
+```csharp
+public override void PostConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpDataSeedOptions>(options =>
+    {
+        // Move my contributor to the end so it runs after Identity seeded the admin
+        options.Contributors.Remove(typeof(MyTenantBootstrapDataSeedContributor));
+        options.Contributors.Add(typeof(MyTenantBootstrapDataSeedContributor));
+    });
+}
+```
+
+## DataSeeder — the orchestrator
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataSeeder.cs
+public class DataSeeder : IDataSeeder, ITransientDependency
+{
+    protected IServiceScopeFactory ServiceScopeFactory { get; }
+    protected AbpDataSeedOptions Options { get; }
+
+    public DataSeeder(IOptions<AbpDataSeedOptions> options, IServiceScopeFactory serviceScopeFactory)
+    {
+        ServiceScopeFactory = serviceScopeFactory;
+        Options = options.Value;
+    }
+
+    [UnitOfWork]
+    public virtual async Task SeedAsync(DataSeedContext context)
+    {
+        using (var scope = ServiceScopeFactory.CreateScope())
+        {
+            if (context.Properties.ContainsKey(DataSeederExtensions.SeedInSeparateUow))
+            {
+                var manager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+                foreach (var contributorType in Options.Contributors)
+                {
+                    var options = context.Properties.TryGetValue(DataSeederExtensions.SeedInSeparateUowOptions, out var uowOptions)
+                        ? (AbpUnitOfWorkOptions) uowOptions! : new AbpUnitOfWorkOptions();
+                    var requiresNew = context.Properties.TryGetValue(DataSeederExtensions.SeedInSeparateUowRequiresNew, out var obj) && (bool) obj!;
+
+                    using (var uow = manager.Begin(options, requiresNew))
+                    {
+                        var contributor = (IDataSeedContributor)scope.ServiceProvider.GetRequiredService(contributorType);
+                        await contributor.SeedAsync(context);
+                        await uow.CompleteAsync();
+                    }
+                }
+            }
+            else
+            {
+                foreach (var contributorType in Options.Contributors)
+                {
+                    var contributor = (IDataSeedContributor)scope.ServiceProvider.GetRequiredService(contributorType);
+                    await contributor.SeedAsync(context);
+                }
+            }
+        }
+    }
+}
+```
+
+Two modes:
+
+| Mode                 | Triggered by `context.Properties[...]` flag                                                  | Behavior                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Single UoW (default) | none                                                                                         | One ambient UoW (`[UnitOfWork]` on `SeedAsync`) wraps every contributor.                |
+| Per‑contributor UoW  | `DataSeederExtensions.SeedInSeparateUow` (plus optional `SeedInSeparateUowOptions` / `...RequiresNew`) | Each contributor gets its own UoW; failures don't roll back earlier contributors.       |
+
+<Tip>
+The default single‑UoW mode is what you want for a fresh database — one big transaction, atomic. The "separate UoW" mode is for cases like "the tenant database migrator runs many contributors, some of which trigger their own savepoints, and we want isolation between them".
+</Tip>
+
+## Worked example: Identity
+
+`IdentityDataSeedContributor` is the thin façade that's auto‑discovered:
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/IdentityDataSeedContributor.cs
+public class IdentityDataSeedContributor : IDataSeedContributor, ITransientDependency
+{
+    public const string AdminEmailPropertyName    = "AdminEmail";
+    public const string AdminEmailDefaultValue    = "admin@abp.io";
+    public const string AdminUserNamePropertyName = "AdminUserName";
+    public const string AdminUserNameDefaultValue = "admin";
+    public const string AdminPasswordPropertyName = "AdminPassword";
+    public const string AdminPasswordDefaultValue = "1q2w3E*";
+
+    protected IIdentityDataSeeder IdentityDataSeeder { get; }
+
+    public IdentityDataSeedContributor(IIdentityDataSeeder identityDataSeeder)
+    {
+        IdentityDataSeeder = identityDataSeeder;
+    }
+
+    public virtual Task SeedAsync(DataSeedContext context)
+    {
+        return IdentityDataSeeder.SeedAsync(
+            context?[AdminEmailPropertyName]    as string ?? AdminEmailDefaultValue,
+            context?[AdminPasswordPropertyName] as string ?? AdminPasswordDefaultValue,
+            context?.TenantId,
+            context?[AdminUserNamePropertyName] as string ?? AdminUserNameDefaultValue
+        );
+    }
+}
+```
+
+Two things to notice:
+
+- It pulls overrides from `DataSeedContext.Properties` so a host can pass tenant‑specific admin credentials at seed time.
+- It implements `ITransientDependency` — that's enough for ABP's conventional registrar to register it, and `AbpDataModule.PreConfigureServices` to drop it into `AbpDataSeedOptions.Contributors`.
+
+The actual work lives in `IdentityDataSeeder` (real domain service):
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/IdentityDataSeeder.cs
+public class IdentityDataSeeder : ITransientDependency, IIdentityDataSeeder
+{
+    [UnitOfWork]
+    public virtual async Task<IdentityDataSeedResult> SeedAsync(
+        string adminEmail,
+        string adminPassword,
+        Guid? tenantId = null,
+        string? adminUserName = null)
+    {
+        Check.NotNullOrWhiteSpace(adminEmail,    nameof(adminEmail));
+        Check.NotNullOrWhiteSpace(adminPassword, nameof(adminPassword));
+
+        using (CurrentTenant.Change(tenantId))
+        {
+            await IdentityOptions.SetAsync();
+
+            var result = new IdentityDataSeedResult();
+
+            if (adminUserName.IsNullOrWhiteSpace())
+                adminUserName = IdentityDataSeedContributor.AdminUserNameDefaultValue;
+
+            var adminUser = await UserRepository.FindByNormalizedUserNameAsync(
+                LookupNormalizer.NormalizeName(adminUserName)
+            );
+            if (adminUser != null) return result;   // idempotent
+
+            adminUser = new IdentityUser(
+                GuidGenerator.Create(),
+                adminUserName,
+                adminEmail,
+                tenantId
+            ) { Name = adminUserName };
+
+            // ... create admin role, assign role, set password ...
+
+            result.CreatedAdminUser = true;
+            return result;
+        }
+    }
+}
+```
+
+<Info>
+The seeder is **idempotent**. Re‑running it just re‑checks "does `admin` exist?" — if so, return. This is critical because the same seeder runs on every DbMigrator pass and on every new tenant.
+</Info>
+
+## Calling SeedAsync from a host
+
+### From the `DbMigrator` console app
+
+ABP's standard `DbMigrator` host loops through tenants and calls `IDataSeeder.SeedAsync` for each plus the host:
+
+```csharp
+public class MyDbMigrationService : ITransientDependency
+{
+    private readonly IDataSeeder _dataSeeder;
+    private readonly ICurrentTenant _currentTenant;
+    // ...
+
+    public async Task MigrateAsync()
+    {
+        // host
+        using (_currentTenant.Change(null))
+        {
+            await MigrateDatabaseAsync();
+            await _dataSeeder.SeedAsync();
+        }
+
+        // tenants
+        var tenants = await _tenantRepository.GetListAsync(includeDetails: true);
+        foreach (var tenant in tenants)
+        {
+            using (_currentTenant.Change(tenant.Id))
+            {
+                await MigrateTenantDatabasesAsync(tenant);
+                await _dataSeeder.SeedAsync(new DataSeedContext(tenant.Id));
+            }
+        }
+    }
+}
+```
+
+### From a web host bootstrap
+
+```csharp
+public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    app.UseAbpRequestLocalization();
+    // ...
+
+    using var scope = context.ServiceProvider.CreateScope();
+    var seeder = scope.ServiceProvider.GetRequiredService<IDataSeeder>();
+    await seeder.SeedAsync(new DataSeedContext()
+        .WithProperty(IdentityDataSeedContributor.AdminEmailPropertyName, "admin@mycorp.com")
+        .WithProperty(IdentityDataSeedContributor.AdminPasswordPropertyName, "Y0urS3cret!"));
+}
+```
+
+## Writing your own contributor
+
+<Steps>
+  <Step title="Implement IDataSeedContributor">
+    ```csharp
+    public class BookCategorySeedContributor : IDataSeedContributor, ITransientDependency
+    {
+        private readonly IRepository<BookCategory, Guid> _repo;
+        private readonly IGuidGenerator _guids;
+
+        public BookCategorySeedContributor(
+            IRepository<BookCategory, Guid> repo,
+            IGuidGenerator guids)
+        {
+            _repo = repo;
+            _guids = guids;
+        }
+
+        public async Task SeedAsync(DataSeedContext context)
+        {
+            if (await _repo.CountAsync() > 0) return;  // idempotent guard
+
+            await _repo.InsertManyAsync(new[]
+            {
+                new BookCategory(_guids.Create(), "Programming"),
+                new BookCategory(_guids.Create(), "Math"),
+                new BookCategory(_guids.Create(), "Fiction"),
+            });
+        }
+    }
+    ```
+  </Step>
+  <Step title="Honour the tenant context">
+    Always wrap writes in `using (_currentTenant.Change(context.TenantId)) { ... }` if the entity is `IMultiTenant`.
+  </Step>
+  <Step title="Be idempotent">
+    Check existence before inserting. The contributor will be re‑invoked.
+  </Step>
+  <Step title="Use the DataSeedContext.Properties bag for overrides">
+    The pattern Identity uses: define constants for property names and defaults, accept overrides from the bag.
+  </Step>
+</Steps>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.Data" icon="database" href="/data/volo-abp-data">
+    Where `AbpDataModule` auto-registers contributors.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    The transactional boundary that wraps `SeedAsync`.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The API contributors use to insert seeded entities.
+  </Card>
+  <Card title="Tenancy: data filtering" icon="building" href="/tenancy/data-filtering">
+    Per-tenant seeding interaction with `IMultiTenant`.
+  </Card>
+</CardGroup>

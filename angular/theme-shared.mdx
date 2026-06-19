@@ -1,0 +1,349 @@
+---
+title: "@abp/ng.theme.shared"
+description: "Theme-agnostic UI services and widgets — modal, confirmation, toaster, loader bar, ngx-datatable defaults, error handlers."
+---
+
+`@abp/ng.theme.shared` (source: `npm/ng-packs/packages/theme-shared/`) ships the **widgets every ABP theme needs**, so a custom theme only has to provide the layout chrome — header, sidebar, footer — and reuse these primitives for modals, toasts, breadcrumbs, buttons, the loader bar and the global error wrapper.
+
+```text
+npm/ng-packs/packages/theme-shared/src/lib/
+├── components/
+│   ├── modal/                  ModalComponent + ModalRefService
+│   ├── confirmation/           ConfirmationComponent
+│   ├── toast/                  ToastComponent
+│   ├── toast-container/        ToastContainerComponent
+│   ├── http-error-wrapper/     HttpErrorWrapperComponent (404/403/500)
+│   ├── loader-bar/             LoaderBarComponent
+│   ├── loading/                LoadingComponent
+│   ├── breadcrumb/             BreadcrumbComponent
+│   ├── button/                 ButtonComponent
+│   ├── card/                   abp-card primitives
+│   ├── checkbox/
+│   ├── form-input/
+│   ├── password/
+│   ├── internet-connection-status/
+│   └── spinner/
+├── directives/
+│   ├── ngx-datatable-default.directive.ts
+│   ├── ngx-datatable-list.directive.ts
+│   └── abp-visible.directive.ts
+├── services/
+│   ├── confirmation.service.ts
+│   ├── toaster.service.ts
+│   ├── nav-items.service.ts / user-menu.service.ts
+│   ├── router-error-handler.service.ts
+│   ├── status-code-error-handler.service.ts
+│   ├── authentication-error-handler.service.ts
+│   ├── abp-format-error-handler.service.ts
+│   ├── page-alert.service.ts
+│   └── …
+├── animations/
+└── theme-shared.module.ts
+```
+
+The package depends on `@abp/ng.core`, `@swimlane/ngx-datatable` and `@ng-bootstrap/ng-bootstrap`.
+
+## `ngx-datatable` defaults
+
+`directives/ngx-datatable-default.directive.ts` attaches sane defaults to any `<ngx-datatable default>` instance:
+
+```ts theme-shared/src/lib/directives/ngx-datatable-default.directive.ts
+@Directive({
+  selector: 'ngx-datatable[default]',
+  exportAs: 'ngxDatatableDefault',
+})
+export class NgxDatatableDefaultDirective implements AfterViewInit, OnDestroy {
+  private table = inject(DatatableComponent);
+  private document = inject<MockDocument>(DOCUMENT);
+  private platformId = inject(PLATFORM_ID);
+
+  @Input() class = 'material bordered';
+
+  @HostBinding('class') get classes(): string {
+    return `ngx-datatable ${this.class}`;
+  }
+
+  constructor() {
+    this.table.columnMode = ColumnMode.force;
+    this.table.footerHeight = 50;
+    this.table.headerHeight = 50;
+    this.table.rowHeight = 'auto';
+    this.table.scrollbarH = true;
+    this.table.virtualization = false;
+  }
+}
+```
+
+`NgxDatatableListDirective` wires an [`ABP.ListService`](/angular/core#permissionservice) to the table, automatically handling page/sort/filter changes. The extensible table from `@abp/ng.components/extensible` combines both directives.
+
+```html
+<ngx-datatable
+  default
+  [rows]="data?.items ?? []"
+  [count]="data?.totalCount ?? 0"
+  [list]="list"
+  (page)="list.page = $event.offset">
+  <ngx-datatable-column [name]="'AbpIdentity::UserName' | abpLocalization" prop="userName"></ngx-datatable-column>
+</ngx-datatable>
+```
+
+## `ModalComponent`
+
+`components/modal/modal.component.ts` is a thin wrapper around `NgbModal` that adds:
+
+- Bound `visible` state via Angular signals (`model()`).
+- Optional unsaved‑changes guard that re‑opens a `ConfirmationService` dialog.
+- Programmatic `busy` state shared with `<abp-button abpSubmit>`.
+
+```ts theme-shared/src/lib/components/modal/modal.component.ts
+@Component({
+  selector: 'abp-modal',
+  templateUrl: './modal.component.html',
+  styleUrls: ['./modal.component.scss'],
+  providers: [SubscriptionService],
+  imports: [NgTemplateOutlet],
+})
+export class ModalComponent implements OnInit, OnDestroy, DismissableModal {
+  protected readonly confirmationService = inject(ConfirmationService);
+  protected readonly modal = inject(NgbModal);
+  protected readonly modalRefService = inject(ModalRefService);
+  protected readonly suppressUnsavedChangesWarningToken = inject(
+    SUPPRESS_UNSAVED_CHANGES_WARNING, { optional: true },
+  );
+  protected readonly destroyRef = inject(DestroyRef);
+  private document = inject(DOCUMENT);
+
+  visible = model<boolean>(false);
+
+  busy = input(false, {
+    transform: (value: boolean) => {
+      if (this.abpSubmit() && this.abpSubmit() instanceof ButtonComponent) {
+        this.abpSubmit().loading = value;
+      }
+      return value;
+    },
+  });
+
+  options = input<NgbModalOptions>({ keyboard: true });
+}
+```
+
+Usage in any feature module:
+
+```html
+<abp-modal [(visible)]="isModalVisible" [busy]="modalBusy" [options]="{ size: 'lg' }">
+  <ng-template #abpHeader>
+    <h3>{{ 'AbpIdentity::NewUser' | abpLocalization }}</h3>
+  </ng-template>
+
+  <ng-template #abpBody>
+    <abp-extensible-form [selectedRecord]="selected"></abp-extensible-form>
+  </ng-template>
+
+  <ng-template #abpFooter>
+    <button type="button" class="btn btn-secondary" abpClose>
+      {{ 'AbpUi::Cancel' | abpLocalization }}
+    </button>
+    <abp-button abpSubmit (click)="save()">
+      {{ 'AbpUi::Save' | abpLocalization }}
+    </abp-button>
+  </ng-template>
+</abp-modal>
+```
+
+The header, body and footer are content‑projected via `contentChild(TemplateRef)`. The `abpClose` directive is `ModalCloseDirective` (in `modal-close.directive.ts`) — when applied to a button it calls `ModalRefService.dismiss()`.
+
+`ModalRefService` lives in `modal/modal-ref.service.ts` and exposes the active `NgbModalRef`, so utilities like `BlockUI`, the `ConfirmationService` or guards can act on the open modal without holding a reference.
+
+## `ConfirmationService`
+
+`services/confirmation.service.ts` lazily projects a single `ConfirmationComponent` into the DOM and returns a status `Observable`:
+
+```ts theme-shared/src/lib/services/confirmation.service.ts
+@Injectable({ providedIn: 'root' })
+export class ConfirmationService {
+  private contentProjectionService = inject(ContentProjectionService);
+  private document = inject(DOCUMENT);
+
+  status$!: Subject<Confirmation.Status>;
+  confirmation$ = new ReplaySubject<Confirmation.DialogData | null>(1);
+
+  info(message: LocalizationParam, title: LocalizationParam,
+       options?: Partial<Confirmation.Options>) {
+    return this.show(message, title, 'info', options);
+  }
+
+  success(message: LocalizationParam, title: LocalizationParam,
+          options?: Partial<Confirmation.Options>) {
+    return this.show(message, title, 'success', options);
+  }
+
+  warn(message: LocalizationParam, title: LocalizationParam,
+       options?: Partial<Confirmation.Options>) {
+    return this.show(message, title, 'warning', options);
+  }
+}
+```
+
+Typical confirmation flow inside the users component:
+
+```ts
+this.confirmation
+  .warn('AbpIdentity::UserDeletionConfirmationMessage', 'AbpUi::AreYouSure', {
+    messageLocalizationParams: [user.userName],
+  })
+  .pipe(filter(status => status === Confirmation.Status.confirm))
+  .subscribe(() => {
+    this.service.delete(user.id).subscribe(() => this.list.get());
+  });
+```
+
+`message` and `title` accept either a plain string or a `LocalizationParam` (`{ key: 'AbpIdentity::UserDeletionConfirmationMessage', defaultValue: '…' }`).
+
+## `ToasterService`
+
+`services/toaster.service.ts` projects one `ToastContainerComponent` into the DOM and pushes toasts through a `ReplaySubject`:
+
+```ts theme-shared/src/lib/services/toaster.service.ts
+@Injectable({ providedIn: 'root' })
+export class ToasterService implements ToasterContract {
+  private toasts$ = new ReplaySubject<Toaster.Toast[]>(1);
+  private lastId = -1;
+  private toasts = [] as Toaster.Toast[];
+
+  private containerComponentRef!: ComponentRef<ToastContainerComponent>;
+  private contentProjectionService: ContentProjectionService;
+
+  info(message: LocalizationParam, title?: LocalizationParam,
+       options?: Partial<Toaster.ToastOptions>): Toaster.ToasterId { /* … */ }
+  success(/* … */) { /* … */ }
+  warn(/* … */)    { /* … */ }
+  error(/* … */)   { /* … */ }
+  remove(id: Toaster.ToasterId): void { /* … */ }
+}
+```
+
+```ts
+this.toaster.success('AbpIdentity::UserCreated', 'AbpUi::Success', { life: 4000 });
+```
+
+The toast container is rendered once per page load. ABP's HTTP error pipeline calls `toaster.error(...)` for non‑validation 4xx responses; component code typically calls `toaster.success` after CRUD operations.
+
+## Global error pipeline
+
+A set of injectable handlers subscribe to `HttpErrorReporterService.reporter$` and decide what UI to show:
+
+| Handler | File | Responsibility |
+| --- | --- | --- |
+| `RouterErrorHandlerService` | `services/router-error-handler.service.ts` | Catches Angular routing errors. |
+| `StatusCodeErrorHandlerService` | `services/status-code-error-handler.service.ts` | Renders `HttpErrorWrapperComponent` for 401/403/404/500. |
+| `AuthenticationErrorHandlerService` | `services/authentication-error-handler.service.ts` | Detects expired tokens and redirects to login. |
+| `AbpFormatErrorHandlerService` | `services/abp-format-error-handler.service.ts` | Decodes ABP `IRemoteServiceErrorResponse` and feeds the toaster. |
+| `TenantResolveErrorHandlerService` | `services/tenant-resolve-error-handler.service.ts` | Shows the tenant‑not‑found message. |
+| `UnknownStatusCodeErrorHandlerService` | `services/unknown-status-code-error-handler.service.ts` | Generic fallback. |
+| `CreateErrorComponentService` | `services/create-error-component.service.ts` | Helper used by the others to render the full‑page wrapper. |
+
+`HttpErrorWrapperComponent` (`components/http-error-wrapper/http-error-wrapper.component.ts`) renders the centred 404/403/500 illustrations you see when a navigation fails.
+
+## Other building blocks
+
+- **`ButtonComponent`** (`components/button/`) — `<abp-button>` with `loading`, `icon`, `type` inputs. Used as the modal submit hook.
+- **`BreadcrumbComponent`** (`components/breadcrumb/`) — reads route data and renders a Bootstrap breadcrumb.
+- **`LoaderBarComponent`** (`components/loader-bar/`) — a top‑of‑page progress bar driven by `HttpWaitService` (from `@abp/ng.core`). Already rendered by `@abp/ng.theme.basic` layouts.
+- **`LoadingComponent`** (`components/loading/`) — full‑page spinner for SSR/lazy boot.
+- **`PageAlertService`** (`services/page-alert.service.ts`) — push transient alerts that render inside `PageAlertContainerComponent` (used by `theme.basic` layouts).
+- **`UserMenuService`** / **`NavItemsService`** — extension points that themes use to render the user dropdown and top toolbar; modules push contributors at boot time.
+
+## Animations
+
+`animations/` exports `slideFromBottom`, `slideFromRight`, `collapseWithMargin` and `expandWithMargin` — Angular animation triggers reused by the modal, side menu and confirmation components.
+
+```ts
+import { slideFromBottom, collapseWithMargin } from '@abp/ng.theme.shared';
+```
+
+## Wiring in `app.config.ts`
+
+```ts app.config.ts
+import { provideAbpThemeShared } from '@abp/ng.theme.shared';
+
+export const appConfig = {
+  providers: [
+    provideAbpCore(withOptions({ environment })),
+    provideAbpOAuth(),
+    provideAbpThemeShared(),
+    provideThemeBasicConfig(),
+  ],
+};
+```
+
+`provideAbpThemeShared()` wires the error handlers (they subscribe to `HttpErrorReporterService` from `@abp/ng.core`), registers the toast and confirmation hosts and contributes the `LoaderBarComponent` template token.
+
+## Replaceable templates
+
+`ReplaceableTemplateDirective` (re‑exported through `@abp/ng.core`) is the structural directive embedded above. It pairs the host template with `ReplaceableComponentsService`. The shape of the directive input:
+
+```ts
+@Input('abpReplaceableTemplate') context!: {
+  inputs?: Record<string, unknown>;
+  outputs?: Record<string, (event: any) => void>;
+  componentKey: string;
+};
+```
+
+If a replacement was registered for `componentKey`, the directive instantiates the replacement, applies `inputs` and subscribes to its outputs. Otherwise it renders the original template node.
+
+## Animations catalogue
+
+`animations/` exports the following triggers used by widgets in this package and in `@abp/ng.theme.basic`:
+
+| Trigger | Used by |
+| --- | --- |
+| `slideFromBottom` | Modal show animation. |
+| `slideFromRight` | Drawer open animation. |
+| `collapseWithMargin` | Sidebar collapse in `ApplicationLayoutComponent`. |
+| `expandWithMargin` | Tree node expand. |
+| `dropdownAnimation` | Toaster fade in/out. |
+
+Import them by name:
+
+```ts
+@Component({
+  animations: [slideFromBottom, collapseWithMargin],
+})
+export class FancyDrawerComponent {}
+```
+
+## `ToasterContract` interface
+
+`ToasterService` implements `ToasterContract` (declared in `models/toaster.ts`). The contract is what feature modules and tests rely on, so swapping in a custom implementation only requires implementing four methods (`info`, `success`, `warn`, `error`) plus a `remove(id)` method.
+
+```ts
+export interface ToasterContract {
+  info(message: LocalizationParam, title?: LocalizationParam,
+       options?: Partial<Toaster.ToastOptions>): Toaster.ToasterId;
+  success(/* … */): Toaster.ToasterId;
+  warn(/* … */):    Toaster.ToasterId;
+  error(/* … */):   Toaster.ToasterId;
+  remove(id: Toaster.ToasterId): void;
+}
+```
+
+`Toaster.ToastOptions` lets you control `life` (auto‑dismiss in ms), `sticky` (never auto‑dismiss), `severity`, `closable`, `tapToDismiss`, `yesText`/`noText` (for confirm‑style toasts) and `messageLocalizationParams`.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.theme.basic" href="/angular/theme-basic" icon="window">
+    Consumes every widget here to assemble the application, account and empty layouts.
+  </Card>
+  <Card title="@abp/ng.components" href="/angular/components" icon="grid-2">
+    `ExtensibleTableComponent` reuses `NgxDatatableDefaultDirective` and `BreadcrumbComponent` from this package.
+  </Card>
+  <Card title="@abp/ng.identity" href="/angular/identity" icon="users">
+    The CRUD flow demonstrates `ModalComponent`, `ConfirmationService` and `ToasterService` together.
+  </Card>
+  <Card title="@abp/ng.core" href="/angular/core" icon="cube">
+    `HttpErrorReporterService` and `HttpWaitService` (from core) feed the handlers and loader bar here.
+  </Card>
+</CardGroup>

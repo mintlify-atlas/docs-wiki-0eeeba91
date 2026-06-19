@@ -1,0 +1,318 @@
+---
+title: "Settings system: the bridge from IConfiguration to ISettingProvider"
+sidebarTitle: "Settings system"
+description: "How ConfigurationSettingValueProvider exposes appsettings.json values to ISettingProvider, where the runtime override store fits, and why the prefix is 'Settings:'."
+---
+
+The framework's setting system is documented in full on [`/security/settings`](/security/settings) (definitions, the five-step value-provider chain, encryption) and the persistence/UI side lives on [`/modules/setting-management/overview`](/modules/setting-management/overview). This page covers the **bridge** between the two: how a value you write in `appsettings.json` becomes an `ISettingProvider` answer, and what happens when an operator overrides it through the admin UI.
+
+## Where the bridge lives
+
+The bridge is a single 30-line class:
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/ConfigurationSettingValueProvider.cs
+public class ConfigurationSettingValueProvider : ISettingValueProvider, ITransientDependency
+{
+    public const string ConfigurationNamePrefix = "Settings:";
+    public const string ProviderName = "C";
+
+    public string Name => ProviderName;
+
+    protected IConfiguration Configuration { get; }
+
+    public ConfigurationSettingValueProvider(IConfiguration configuration)
+    {
+        Configuration = configuration;
+    }
+
+    public virtual Task<string?> GetOrNullAsync(SettingDefinition setting)
+    {
+        return Task.FromResult(Configuration[ConfigurationNamePrefix + setting.Name]);
+    }
+
+    public Task<List<SettingValue>> GetAllAsync(SettingDefinition[] settings)
+    {
+        return Task.FromResult(
+            settings.Select(x =>
+                new SettingValue(x.Name, Configuration[ConfigurationNamePrefix + x.Name])
+            ).ToList()
+        );
+    }
+}
+```
+
+Two constants do all the work:
+
+- **`ConfigurationNamePrefix = "Settings:"`** — every setting lookup is rewritten from `"Abp.Mailing.DefaultFromAddress"` to `"Settings:Abp.Mailing.DefaultFromAddress"` before being handed to `IConfiguration`. The single colon is the standard .NET section separator, so a JSON object literally named `Settings` is enough.
+- **`ProviderName = "C"`** — the single-character provider key used internally by `SettingValueProviderManager` to identify this provider in its chain.
+
+## How the chain calls it
+
+`Volo.Abp.Settings` registers a fixed chain of `ISettingValueProvider` implementations in the `AbpSettingOptions.ValueProviders` `ITypeList`. The order (from `AbpSettingsModule.cs` and friends) is:
+
+| # | Provider | Source | Provider name |
+| --- | --- | --- | --- |
+| 1 | `DefaultValueSettingValueProvider` | `SettingDefinition.DefaultValue` | `D` |
+| 2 | **`ConfigurationSettingValueProvider`** | **`IConfiguration["Settings:<Name>"]`** | **`C`** |
+| 3 | `GlobalSettingValueProvider` | host-wide override via `ISettingStore` (when Setting Management is on) | `G` |
+| 4 | `TenantSettingValueProvider` | per-tenant override | `T` |
+| 5 | `UserSettingValueProvider` | per-user override | `U` |
+
+`SettingProvider.GetOrNullAsync(name)` walks this chain from #5 down to #1 and returns the first non-null. That means:
+
+- A **per-user setting** beats an **`appsettings.json` default** beats the **hard-coded `SettingDefinition.DefaultValue`**.
+- But if no user/tenant/global override exists yet, `appsettings.json` wins.
+
+## Authoring a value in `appsettings.json`
+
+Concrete example: setting the default outbound from-address.
+
+```json
+// appsettings.json
+{
+  "Settings": {
+    "Abp.Mailing.DefaultFromAddress": "noreply@mycompany.com",
+    "Abp.Mailing.DefaultFromDisplayName": "MyCompany"
+  }
+}
+```
+
+The setting names match `EmailSettingNames.cs`:
+
+```csharp
+// framework/src/Volo.Abp.Emailing/Volo/Abp/Emailing/EmailSettingNames.cs
+public static class EmailSettingNames
+{
+    /// <summary> Abp.Net.Mail.DefaultFromAddress </summary>
+    public const string DefaultFromAddress     = "Abp.Mailing.DefaultFromAddress";
+
+    /// <summary> Abp.Net.Mail.DefaultFromDisplayName </summary>
+    public const string DefaultFromDisplayName = "Abp.Mailing.DefaultFromDisplayName";
+
+    public static class Smtp
+    {
+        /// <summary> Abp.Net.Mail.Smtp.Host </summary>
+        public const string Host = "Abp.Mailing.Smtp.Host";
+        // …
+    }
+}
+```
+
+A consumer service reads them through `ISettingProvider`:
+
+```csharp
+public class WelcomeEmailService : ITransientDependency
+{
+    private readonly ISettingProvider _settingProvider;
+
+    public WelcomeEmailService(ISettingProvider settingProvider)
+        => _settingProvider = settingProvider;
+
+    public async Task<string?> GetFromAsync()
+        => await _settingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromAddress);
+}
+```
+
+At runtime this hits the chain in order. If no operator has saved a global/tenant/user override, the lookup falls through to `ConfigurationSettingValueProvider`, which returns the value from `appsettings.json`. If the `SettingDefinition` declared a `DefaultValue` and `appsettings.json` is silent, the default-value provider fires.
+
+## What runtime updates change
+
+The [Setting Management module](/modules/setting-management/overview) introduces `ISettingManager`, the only API that **writes** new values:
+
+```csharp
+public interface ISettingManager
+{
+    Task<string?> GetOrNullAsync(string name, string providerName, string? providerKey, bool fallback = true);
+    Task SetAsync(string name, string? value, string providerName, string? providerKey, bool forceToSet = false);
+    Task<List<SettingValue>> GetAllAsync(string providerName, string? providerKey, bool fallback = true);
+}
+```
+
+`providerName` is one of the single-character keys above — `G`, `T`, or `U` (you cannot persist into `D` or `C`; those are read-only). A call like:
+
+```csharp
+await _settingManager.SetAsync(
+    EmailSettingNames.DefaultFromAddress,
+    "ops@mycompany.com",
+    providerName: "G",       // global
+    providerKey: null);
+```
+
+…writes a row into the persisted `AbpSettings` table. From that moment on, every `ISettingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromAddress)` returns `"ops@mycompany.com"` (because `G` is consulted before `C`), even though `appsettings.json` still says `noreply@mycompany.com`. Deleting the persisted row (`SetAsync` with a `null` value and `forceToSet: true`) restores the chain so that the configuration value wins again.
+
+This is the operational story:
+
+<CardGroup cols={2}>
+  <Card title="Set a default in appsettings.json" icon="file-code">
+    Wins on first run, before anyone touches the UI. Deploys with code, sits in source control, has no DB cost.
+  </Card>
+  <Card title="Override at runtime in the UI" icon="screwdriver-wrench">
+    `ISettingManager.SetAsync` writes a persisted row. The chain consults that row before falling through to the configuration value.
+  </Card>
+</CardGroup>
+
+## Two ways the prefix can bite
+
+<AccordionGroup>
+  <Accordion title="Don't confuse Settings:Foo with the Options pattern">
+    `Settings:Foo` is read by `ConfigurationSettingValueProvider`. `Foo` (a top-level section) bound via `Configure<FooOptions>(configuration.GetSection("Foo"))` is read by the [Options pattern](/core/options-and-configuration). They are entirely separate code paths and reach different consumers. See [`/config/overview`](/config/overview) for the three-layer model.
+  </Accordion>
+  <Accordion title="Environment-variable form needs double underscore">
+    Because the prefix uses a colon, the equivalent env-var override is `Settings__Abp.Mailing.DefaultFromAddress=...`. The colon stays, the double underscore replaces nothing here — it's just .NET's standard "no-colon-in-env-name" workaround. Dots in the setting name are fine; .NET environment-variable providers don't reinterpret them. See [`/config/environment-variables`](/config/environment-variables).
+  </Accordion>
+</AccordionGroup>
+
+## Encrypted settings
+
+If `SettingDefinition.IsEncrypted` is `true`, the value stored in `appsettings.json` is treated as ciphertext and is decrypted via `ISettingEncryptionService` before being returned. Two practical consequences:
+
+- You almost never want to set encrypted settings through `appsettings.json` directly — there is no nice way to produce the ciphertext at deploy time. Either set them through the admin UI (the Setting Management module encrypts before saving) or use environment variables / a secret manager and a custom value provider.
+- `AbpSettingOptions.ReturnOriginalValueIfDecryptFailed` (default `true`) means that when you *change* an existing plaintext setting's `IsEncrypted` flag to `true`, the framework returns the original plaintext on read failure instead of throwing. Useful during migrations.
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/AbpSettingOptions.cs
+public class AbpSettingOptions
+{
+    public ITypeList<ISettingDefinitionProvider> DefinitionProviders { get; }
+    public ITypeList<ISettingValueProvider> ValueProviders { get; }
+    public HashSet<string> DeletedSettings { get; }
+
+    public bool ReturnOriginalValueIfDecryptFailed { get; set; }
+}
+```
+
+## Read-time behaviour and caching
+
+`ConfigurationSettingValueProvider` does *not* cache. Every call reads through `IConfiguration[...]`, which itself is backed by the configuration providers and may serve from an in-memory snapshot. Three operational consequences:
+
+- **Reload-on-change works.** Every `appsettings.json` registered with `reloadOnChange: true` (the host default) hot-reloads the new value into `IConfiguration`. The next `ISettingProvider.GetOrNullAsync(...)` call sees it.
+- **No DB round-trip for `Settings:*` values that haven't been overridden.** When the chain falls through `U → T → G` (each of which only hits the persisted store if the Setting Management module is in the app), `C` is fast — it's just a dictionary lookup.
+- **The cache is one level up, in `ISettingProvider`.** The default `SettingProvider` does *not* cache either. The Setting Management module adds a `SettingCacheItem` distributed-cache layer over `SettingManagementStore`; see [`/modules/setting-management/domain`](/modules/setting-management/domain).
+
+In high-traffic paths where you read the same setting many times per request, inject `ISettingProvider` once and store the resolved value in a request-scoped object — not because the provider is slow, but because the *chain walk* itself (five providers, each with a check) is repeated work.
+
+## Definition discovery
+
+The other half of the system — *where setting names come from* — is `ISettingDefinitionProvider`. A module ships a provider:
+
+```csharp
+public class MyProjectNameSettingDefinitionProvider : SettingDefinitionProvider
+{
+    public override void Define(ISettingDefinitionContext context)
+    {
+        context.Add(
+            new SettingDefinition(
+                name: "MyProjectName.Theme.Primary",
+                defaultValue: "Default",
+                displayName: L("DisplayName:Theme.Primary"),
+                description: L("Description:Theme.Primary")
+            )
+        );
+    }
+}
+```
+
+…and registers it in `AbpSettingOptions.DefinitionProviders` (typically auto-discovered, but explicit registration also works):
+
+```csharp
+Configure<AbpSettingOptions>(options =>
+{
+    options.DefinitionProviders.Add<MyProjectNameSettingDefinitionProvider>();
+});
+```
+
+Once defined, the name `"MyProjectName.Theme.Primary"` becomes addressable in *all five* providers — including `ConfigurationSettingValueProvider`, which would pick up an entry at `Settings:MyProjectName.Theme.Primary` in `appsettings.json`. There is no extra wiring required to make your own settings configurable through `appsettings.json` — the bridge applies universally.
+
+## Adding a value provider
+
+Custom providers fit into the chain alongside the five built-ins. Two patterns:
+
+<Tabs>
+  <Tab title="Insert after Configuration">
+    Adds a layer that wins over the persisted store. Useful for env-var-only overrides that should beat the DB.
+
+    ```csharp
+    public class EnvOnlySettingValueProvider : SettingValueProvider
+    {
+        public override string Name => "Env";
+
+        public EnvOnlySettingValueProvider(ISettingStore store) : base(store) {}
+
+        public override Task<string?> GetOrNullAsync(SettingDefinition setting)
+        {
+            var name = "MYAPP_SETTING_" + setting.Name.Replace('.', '_');
+            return Task.FromResult(Environment.GetEnvironmentVariable(name));
+        }
+    }
+
+    public class MyModule : AbpModule
+    {
+        public override void ConfigureServices(ServiceConfigurationContext context)
+        {
+            Configure<AbpSettingOptions>(options =>
+            {
+                // Inserted *after* the Configuration provider, *before* Global.
+                options.ValueProviders.Add<EnvOnlySettingValueProvider>();
+            });
+        }
+    }
+    ```
+
+    The order of `Add<>` calls is the order of the chain; the runtime walks them in reverse so the last one added is consulted first.
+  </Tab>
+  <Tab title="Replace Configuration">
+    Sub-class `ConfigurationSettingValueProvider` to change the prefix or load from a different `IConfiguration` source.
+
+    ```csharp
+    public class TenantPrefixedConfigurationSettingValueProvider
+        : ConfigurationSettingValueProvider
+    {
+        private readonly ICurrentTenant _currentTenant;
+
+        public TenantPrefixedConfigurationSettingValueProvider(
+            IConfiguration configuration,
+            ICurrentTenant currentTenant) : base(configuration)
+        {
+            _currentTenant = currentTenant;
+        }
+
+        public override Task<string?> GetOrNullAsync(SettingDefinition setting)
+        {
+            var tenantKey = _currentTenant.Id?.ToString() ?? "host";
+            return Task.FromResult(
+                Configuration[$"Settings:{tenantKey}:{setting.Name}"]
+                ?? Configuration[$"Settings:{setting.Name}"]);
+        }
+    }
+
+    // wire it up
+    context.Services.Replace(
+        ServiceDescriptor.Transient<ConfigurationSettingValueProvider,
+            TenantPrefixedConfigurationSettingValueProvider>());
+    ```
+  </Tab>
+</Tabs>
+
+## What lives where
+
+<CardGroup cols={2}>
+  <Card title="Framework setting definitions" icon="book" href="/security/settings">
+    `SettingDefinition`, `ISettingDefinitionProvider`, encryption flag, the value-provider hierarchy in full.
+  </Card>
+  <Card title="Setting Management module" icon="screwdriver-wrench" href="/modules/setting-management/overview">
+    The persisted store, `ISettingManager`, the admin UI, the five `SettingManagementProvider` implementations.
+  </Card>
+  <Card title="Configuration overview" icon="map" href="/config/overview">
+    The three-layer mental model and where Settings sits.
+  </Card>
+  <Card title="appsettings.json catalogue" icon="file-code" href="/config/appsettings">
+    The shape of the JSON file each ABP template ships, including the `Settings:` section convention.
+  </Card>
+  <Card title="Environment variables" icon="terminal" href="/config/environment-variables">
+    Overriding `Settings:*` values via env vars in containerised deployments.
+  </Card>
+  <Card title="Options pattern internals" icon="gears" href="/core/options-and-configuration">
+    The sibling system (`IOptions<T>`) — note that `ISettingProvider` is *not* IOptions; it is a separate chain.
+  </Card>
+</CardGroup>

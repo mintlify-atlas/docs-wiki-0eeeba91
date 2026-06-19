@@ -1,0 +1,315 @@
+---
+title: "File System BLOB Provider: Local Disk Storage Backend"
+sidebarTitle: "File System"
+description: "Use FileSystemBlobProvider to persist ABP blobs on local disk or a mounted share with per-tenant directories under a configurable BasePath."
+---
+
+`Volo.Abp.BlobStoring.FileSystem` is the simplest production‑capable backend. It writes each blob as a file under a configured base directory, organizes those files by tenant id and container name, and uses [Polly](https://github.com/App-vNext/Polly) to retry transient I/O failures. It is the right choice when you run a single node (or a clustered app over a shared file system such as NFS, SMB, or Azure Files) and you do not need a real object store.
+
+The provider lives in `framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/` and is registered by `AbpBlobStoringFileSystemModule`. The first place to look is the path calculator, because the on‑disk layout is the entire contract that this provider gives you.
+
+## Module and configuration
+
+Add `AbpBlobStoringFileSystemModule` as a `[DependsOn]` of your application module. The default `AbpBlobStoringModule` is pulled in transitively. Then point any container at the file system through the `UseFileSystem` extension:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringModule),
+    typeof(AbpBlobStoringFileSystemModule)
+)]
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                container.UseFileSystem(fs =>
+                {
+                    fs.BasePath = "/var/myapp/blobs";
+                });
+            });
+
+            options.Containers.Configure<InvoiceContainer>(container =>
+            {
+                container.UseFileSystem(fs =>
+                {
+                    fs.BasePath = "/var/myapp/invoices";
+                    fs.AppendContainerNameToBasePath = false;
+                });
+            });
+        });
+    }
+}
+```
+
+`UseFileSystem` does three things:
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/FileSystemBlobContainerConfigurationExtensions.cs"
+public static BlobContainerConfiguration UseFileSystem(
+    this BlobContainerConfiguration containerConfiguration,
+    Action<FileSystemBlobProviderConfiguration> fileSystemConfigureAction)
+{
+    containerConfiguration.ProviderType = typeof(FileSystemBlobProvider);
+    containerConfiguration.NamingNormalizers.TryAdd<FileSystemBlobNamingNormalizer>();
+
+    fileSystemConfigureAction(new FileSystemBlobProviderConfiguration(containerConfiguration));
+
+    return containerConfiguration;
+}
+```
+
+It sets `ProviderType` (so `DefaultBlobProviderSelector` picks `FileSystemBlobProvider`), registers the file‑system naming normalizer, and exposes a typed view (`FileSystemBlobProviderConfiguration`) over the underlying configuration bag.
+
+## `FileSystemBlobProviderConfiguration`
+
+Two well‑known properties are stored under the keys defined in `FileSystemBlobProviderConfigurationNames`.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/FileSystemBlobProviderConfiguration.cs"
+public class FileSystemBlobProviderConfiguration
+{
+    public string BasePath {
+        get => _containerConfiguration.GetConfiguration<string>(FileSystemBlobProviderConfigurationNames.BasePath);
+        set => _containerConfiguration.SetConfiguration(
+            FileSystemBlobProviderConfigurationNames.BasePath,
+            Check.NotNullOrWhiteSpace(value, nameof(value)));
+    }
+
+    /// <summary>
+    /// Default value: true.
+    /// </summary>
+    public bool AppendContainerNameToBasePath {
+        get => _containerConfiguration.GetConfigurationOrDefault(
+            FileSystemBlobProviderConfigurationNames.AppendContainerNameToBasePath, true);
+        set => _containerConfiguration.SetConfiguration(
+            FileSystemBlobProviderConfigurationNames.AppendContainerNameToBasePath, value);
+    }
+
+    private readonly BlobContainerConfiguration _containerConfiguration;
+
+    public FileSystemBlobProviderConfiguration(BlobContainerConfiguration containerConfiguration)
+    {
+        _containerConfiguration = containerConfiguration;
+    }
+}
+```
+
+- **`BasePath`** — the directory root for all blobs in this container. Required (and validated as non‑empty).
+- **`AppendContainerNameToBasePath`** — when `true` (the default), the on‑disk layout includes a sub‑directory per container name; when `false`, the container's blobs go directly under `BasePath` (handy when each container already has its own dedicated `BasePath`, as in the `InvoiceContainer` example above).
+
+## `IBlobFilePathCalculator` — the on‑disk layout
+
+`DefaultBlobFilePathCalculator` translates a `BlobProviderArgs` into an absolute path. It is what gives the file system provider its multi‑tenant story.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/DefaultBlobFilePathCalculator.cs"
+public class DefaultBlobFilePathCalculator : IBlobFilePathCalculator, ITransientDependency
+{
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public DefaultBlobFilePathCalculator(ICurrentTenant currentTenant)
+    {
+        CurrentTenant = currentTenant;
+    }
+
+    public virtual string Calculate(BlobProviderArgs args)
+    {
+        var fileSystemConfiguration = args.Configuration.GetFileSystemConfiguration();
+        var blobPath = fileSystemConfiguration.BasePath;
+
+        if (CurrentTenant.Id == null)
+        {
+            blobPath = Path.Combine(blobPath, "host");
+        }
+        else
+        {
+            blobPath = Path.Combine(blobPath, "tenants", CurrentTenant.Id.Value.ToString("D"));
+        }
+
+        if (fileSystemConfiguration.AppendContainerNameToBasePath)
+        {
+            blobPath = Path.Combine(blobPath, args.ContainerName);
+        }
+
+        blobPath = Path.Combine(blobPath, args.BlobName);
+        return blobPath;
+    }
+}
+```
+
+The resulting layout for a multi‑tenant container `profile-pictures` with `BasePath = /var/myapp/blobs` is:
+
+```text
+/var/myapp/blobs/
+  host/
+    profile-pictures/
+      avatar-1.png
+  tenants/
+    11111111-1111-1111-1111-111111111111/
+      profile-pictures/
+        avatar-1.png
+    22222222-2222-2222-2222-222222222222/
+      profile-pictures/
+        avatar-1.png
+```
+
+For containers configured with `IsMultiTenant = false`, `BlobContainer.GetTenantIdOrNull()` returns `null`, so `CurrentTenant.Id` is also `null` inside the calculator and everything lands under the `host/` branch regardless of who called.
+
+You can replace the calculator by registering your own `IBlobFilePathCalculator` to support custom layouts (for example, sharding by hash prefix or grouping by date). The default implementation is registered as `ITransientDependency`, so a `[Dependency(ReplaceServices = true)]`‑attributed class wins.
+
+## `FileSystemBlobProvider`
+
+The provider itself is a thin shell around `File`/`Directory` plus a Polly retry policy for `IOException`.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/FileSystemBlobProvider.cs"
+public class FileSystemBlobProvider : BlobProviderBase, ITransientDependency
+{
+    protected IBlobFilePathCalculator FilePathCalculator { get; }
+
+    public FileSystemBlobProvider(IBlobFilePathCalculator filePathCalculator)
+    {
+        FilePathCalculator = filePathCalculator;
+    }
+
+    public override async Task SaveAsync(BlobProviderSaveArgs args)
+    {
+        var filePath = FilePathCalculator.Calculate(args);
+
+        if (!args.OverrideExisting && await ExistsAsync(filePath))
+        {
+            throw new BlobAlreadyExistsException(
+                $"Saving BLOB '{args.BlobName}' does already exists in the container '{args.ContainerName}'! " +
+                $"Set {nameof(args.OverrideExisting)} if it should be overwritten.");
+        }
+
+        DirectoryHelper.CreateIfNotExists(Path.GetDirectoryName(filePath)!);
+
+        var fileMode = args.OverrideExisting ? FileMode.Create : FileMode.CreateNew;
+
+        await Policy.Handle<IOException>()
+            .WaitAndRetryAsync(2, retryCount => TimeSpan.FromSeconds(retryCount))
+            .ExecuteAsync(async () =>
+            {
+                using (var fileStream = File.Open(filePath, fileMode, FileAccess.Write))
+                {
+                    await args.BlobStream.CopyToAsync(fileStream, args.CancellationToken);
+                    await fileStream.FlushAsync();
+                }
+            });
+    }
+    // …Delete / Exists / GetOrNull are equally direct…
+}
+```
+
+A few details worth knowing:
+
+- `DirectoryHelper.CreateIfNotExists(...)` ensures the host / tenant / container sub‑directories exist before the file is opened. You do not have to pre‑create folders.
+- `FileMode.Create` vs `FileMode.CreateNew` is selected from `OverrideExisting`. With `CreateNew`, .NET throws `IOException` if the file exists — the provider pre‑checks via `ExistsAsync` to throw a domain‑friendly `BlobAlreadyExistsException` instead.
+- The Polly policy retries on `IOException` twice with linear backoff (1s, 2s). It catches transient sharing‑violation errors common on Windows when antivirus scans the file between writes.
+- `GetOrNullAsync` returns `File.OpenRead(filePath)`. The caller owns the stream and must dispose it.
+
+## `FileSystemBlobNamingNormalizer`
+
+The provider registers `FileSystemBlobNamingNormalizer` automatically. By default it lets through any name that is valid on the underlying file system. If you need stricter rules (for example, to write blobs from an API that accepts user‑controlled names on Windows where `\:*?` are reserved), supply your own normalizer:
+
+```csharp
+options.Containers.Configure<MyContainer>(c =>
+{
+    c.UseFileSystem(fs => fs.BasePath = "/data/blobs");
+    c.NamingNormalizers.TryAdd<MySanitizingNormalizer>();
+});
+```
+
+## Multi‑tenancy
+
+The file system provider is multi‑tenant by default because `BlobContainerConfiguration.IsMultiTenant` defaults to `true`. With it on:
+
+1. `BlobContainer` switches `ICurrentTenant` to the calling tenant before each operation. See [/tenancy/multi-tenancy-core](/tenancy/multi-tenancy-core).
+2. `DefaultBlobFilePathCalculator` reads `CurrentTenant.Id` and inserts `tenants/{id}/` into the path.
+
+The host tenant (no tenant) gets a `host/` sub‑directory. This neatly mirrors the directory model many ABP modules use and keeps a per‑tenant cleanup as simple as deleting one directory.
+
+To make a container globally shared, set `IsMultiTenant = false`:
+
+```csharp
+options.Containers.Configure<PublicAssetContainer>(c =>
+{
+    c.IsMultiTenant = false;
+    c.UseFileSystem(fs => fs.BasePath = "/var/myapp/public");
+});
+```
+
+All tenants then write under `/var/myapp/public/host/public-assets/...`.
+
+## Operational guidance
+
+<AccordionGroup>
+  <Accordion title="Permissions" icon="lock">
+    The process must have read/write on `BasePath`. Use an explicit user account in production (not root) and make sure `BasePath` exists before the app first writes — `DirectoryHelper.CreateIfNotExists` will create children, but it cannot fix a missing or read‑only root.
+  </Accordion>
+  <Accordion title="Backups" icon="floppy-disk">
+    Snapshot or copy the whole `BasePath`. Because the per‑tenant directories are isolated, you can also rsync individual tenants, archive a tenant when they cancel, or restore a single tenant without affecting others.
+  </Accordion>
+  <Accordion title="Clustered hosting" icon="server">
+    The file system provider works across multiple app nodes only if all nodes mount the same path (NFS, SMB, Azure Files, EFS). If you cannot guarantee a shared mount, switch to an object‑store provider — [Azure](/blob/azure), [AWS](/blob/aws), [Google](/blob/google), [Aliyun](/blob/aliyun), [MinIO](/blob/minio) — or to the [database provider](/blob/blob-storing-database-module).
+  </Accordion>
+  <Accordion title="Large files" icon="file-zipper">
+    Writes use `Stream.CopyToAsync` with the caller's cancellation token, so very large uploads stream efficiently without buffering the whole blob in memory.
+  </Accordion>
+  <Accordion title="Antivirus / file lockers" icon="shield-virus">
+    The two‑retry Polly policy mitigates short‑lived `IOException`s caused by antivirus, but you should still exclude the `BasePath` from real‑time scanners in production for throughput.
+  </Accordion>
+</AccordionGroup>
+
+## Usage example
+
+```csharp
+[BlobContainerName("profile-pictures")]
+public class ProfilePictureContainer { }
+
+public class ProfilePictureAppService : ApplicationService
+{
+    private readonly IBlobContainer<ProfilePictureContainer> _blobs;
+
+    public ProfilePictureAppService(IBlobContainer<ProfilePictureContainer> blobs)
+    {
+        _blobs = blobs;
+    }
+
+    public async Task SetAsync(Guid userId, Stream content)
+    {
+        await _blobs.SaveAsync(
+            name: userId.ToString("N"),
+            stream: content,
+            overrideExisting: true
+        );
+    }
+
+    public Task<Stream?> GetOrNullAsync(Guid userId)
+        => _blobs.GetOrNullAsync(userId.ToString("N"));
+
+    public Task<bool> DeleteAsync(Guid userId)
+        => _blobs.DeleteAsync(userId.ToString("N"));
+}
+```
+
+With the configuration shown earlier (`BasePath = /var/myapp/blobs`), uploading an image for user `abc…` while logged in as tenant `tenant‑id` produces:
+
+```text
+/var/myapp/blobs/tenants/{tenant-id}/profile-pictures/{user-id}
+```
+
+The on‑disk file is the blob, byte for byte; there is no envelope, no metadata sidecar. Storage is exactly the size of your content.
+
+## When to pick another provider
+
+- You need geographic redundancy or content delivery — pick [Azure](/blob/azure), [AWS](/blob/aws), [Google](/blob/google), or [Bunny CDN](/blob/bunny).
+- You need versioning, lifecycle rules, server‑side encryption — pick a cloud object store.
+- You want blobs in the same transaction as their domain row — use the [database module](/blob/blob-storing-database-module).
+- You only need a backend for tests — use the [in‑memory provider](/blob/memory).
+
+## Related
+
+- [BLOB Storing abstractions](/blob/abstractions) — the common contracts every provider implements.
+- [Multi-tenancy core](/tenancy/multi-tenancy-core) — `ICurrentTenant` mechanics that drive the per‑tenant directory layout.
+- [Blob Storing Database module](/modules/blob-storing-database/overview) — application module that persists blobs in EF Core / MongoDB.

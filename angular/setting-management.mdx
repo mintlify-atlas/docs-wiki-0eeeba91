@@ -1,0 +1,272 @@
+---
+title: "@abp/ng.setting-management"
+description: "Setting management page that hosts a tab tree of contributed setting groups — email settings, time zone, feature management."
+---
+
+`@abp/ng.setting-management` (source: `npm/ng-packs/packages/setting-management/`) renders the **Settings** page of an ABP application. The screen is a tab container; each module that wants to expose its settings registers a tab contributor — there is no hard‑coded list of settings.
+
+```text
+npm/ng-packs/packages/setting-management/src/lib/
+├── components/
+│   ├── setting-management.component.{ts,html}
+│   └── …
+├── enums/                       eSettingManagementComponents
+├── setting-management.routes.ts
+├── setting-management-routing.module.ts
+└── setting-management.module.ts
+```
+
+The secondary entry point `@abp/ng.setting-management/config` (in `packages/setting-management/config/`) holds the **tab service**, the proxy for built‑in email settings, the default email settings group component and the public provider helpers.
+
+## Route
+
+```ts setting-management/src/lib/setting-management.routes.ts
+export const createRoutes = (): Routes => [
+  {
+    path: '',
+    component: RouterOutletComponent,
+    canActivate: [authGuard],
+    providers: provideSettingManagement(),
+    children: [
+      {
+        path: '',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpAccount.SettingManagement',
+          replaceableComponent: {
+            key: eSettingManagementComponents.SettingManagement,
+            defaultComponent: SettingManagementComponent,
+          } as ReplaceableComponents.RouteData,
+        },
+      },
+    ],
+  },
+];
+```
+
+Mount it under your shell:
+
+```ts app.routes.ts
+{
+  path: 'setting-management',
+  loadChildren: () => import('@abp/ng.setting-management').then(m => m.createRoutes()),
+}
+```
+
+The required policy `AbpAccount.SettingManagement` matches the matching backend permission group (see [Settings](/security/settings)).
+
+## `SettingManagementComponent`
+
+```ts setting-management/src/lib/components/setting-management.component.ts
+import { ABP, ForDirective, LocalizationPipe, PermissionDirective } from '@abp/ng.core';
+import { SettingTabsService } from '@abp/ng.setting-management/config';
+import { PageComponent } from '@abp/ng.components/page';
+
+@Component({
+  selector: 'abp-setting-management',
+  templateUrl: './setting-management.component.html',
+  imports: [NgComponentOutlet, PageComponent, LocalizationPipe, PermissionDirective, ForDirective],
+})
+export class SettingManagementComponent implements OnDestroy, OnInit {
+  private settingTabsService = inject(SettingTabsService);
+  private subscription = new Subscription();
+
+  settings: ABP.Tab[] = [];
+  selected!: ABP.Tab;
+
+  trackByFn: TrackByFunction<ABP.Tab> = (_, item) => item.name;
+
+  ngOnInit() {
+    this.subscription.add(
+      this.settingTabsService.visible$.subscribe(settings => {
+        this.settings = settings;
+        if (!this.selected) this.selected = this.settings[0];
+      }),
+    );
+  }
+
+  ngOnDestroy() { this.subscription.unsubscribe(); }
+}
+```
+
+It subscribes to `SettingTabsService.visible$` — an observable of `ABP.Tab[]` filtered to only the tabs whose `requiredPolicy` the current user has. The right‑hand side uses `<ng-container *ngComponentOutlet="selected.component">` so each tab can be any standalone component.
+
+## `SettingTabsService`
+
+`config/src/lib/services/settings-tabs.service.ts`:
+
+```ts setting-management/config/src/lib/services/settings-tabs.service.ts
+@Injectable({ providedIn: 'root' })
+export class SettingTabsService extends AbstractNavTreeService<ABP.Tab> {}
+```
+
+`AbstractNavTreeService<ABP.Tab>` (from `@abp/ng.core`) gives it the standard `add(items)`, `patch(name, item)`, `remove(name)`, `visible$` and `tree$` API used by every contributor service in ABP (routes, nav items, user menu, setting tabs).
+
+An `ABP.Tab` has the shape:
+
+```ts
+interface Tab {
+  name: string;                 // unique key
+  order?: number;
+  parentName?: string;          // nesting key (used for grouped settings)
+  requiredPolicy?: string;      // policy expression — same syntax as PermissionService
+  component?: Type<unknown>;    // standalone component rendered when active
+  layout?: eLayoutType;
+}
+```
+
+## Adding a tab from your application
+
+```ts app.providers.ts
+import { provideAppInitializer, inject } from '@angular/core';
+import { SettingTabsService } from '@abp/ng.setting-management/config';
+import { MyOrgSettingsComponent } from './my-org-settings.component';
+
+export const ADD_MY_SETTINGS = provideAppInitializer(() => {
+  const tabs = inject(SettingTabsService);
+  tabs.add([
+    {
+      name: 'MyOrg::Settings',
+      order: 100,
+      requiredPolicy: 'MyOrg.ManageSettings',
+      component: MyOrgSettingsComponent,
+    },
+  ]);
+});
+```
+
+Add `ADD_MY_SETTINGS` to your `app.config.ts` `providers` array. The tab appears in the Settings page whenever the user has the `MyOrg.ManageSettings` policy.
+
+## The default email settings tab
+
+The config entry point ships an out‑of‑the‑box "Email Settings" tab (mirrored from the backend `EmailSettingsAppService`).
+
+```text
+setting-management/config/src/lib/
+├── components/email-setting-group/
+│   ├── email-setting-group.component.html
+│   └── email-setting-group.component.ts
+├── proxy/email-settings.service.ts
+├── providers/
+│   ├── setting-tab.provider.ts
+│   ├── setting-management-config.provider.ts
+│   ├── route.provider.ts
+│   ├── visible.provider.ts
+│   └── features.token.ts
+└── enums/setting-tab-names.ts
+```
+
+`EmailSettingsService` (`proxy/email-settings.service.ts`) is the generated `RestService` consumer that calls the `IEmailSettingsAppService` endpoints. The default tab provider registers `EmailSettingGroupComponent` under the tab name from `enums/setting-tab-names.ts`.
+
+`setting-management-config.provider.ts` exposes the master `provideSettingManagementConfig(options?)` helper used by your `app.config.ts`:
+
+```ts app.config.ts
+import { provideSettingManagementConfig } from '@abp/ng.setting-management/config';
+
+providers: [
+  provideSettingManagementConfig(),
+]
+```
+
+This registers:
+
+- The default tabs (email settings).
+- The route provider so the Settings link appears in the side menu (controlled by `route.provider.ts`).
+- The `features.token.ts` value that the feature management package reads to register its tab.
+
+## Other consumers
+
+Several other ABP UI packages add tabs through the same provider:
+
+- `@abp/ng.feature-management` → "Features" tab (see [`/angular/feature-management`](/angular/feature-management)).
+- `@abp/ng.account` → "Account Settings" tab (when included).
+- Time zone, language and TOTP settings are contributed by Volo's commercial modules.
+
+Because `SettingTabsService` extends `AbstractNavTreeService`, the same `patch` and `remove` APIs let you reorder, rename or hide existing tabs:
+
+```ts
+tabs.patch('FeatureManagement::Features', { order: 1000 });
+tabs.remove('AbpAccount::EmailSettings'); // hide built-in tab
+```
+
+## `AbstractNavTreeService` API
+
+`SettingTabsService` inherits the full API used elsewhere in ABP UI:
+
+```ts core/src/lib/abstracts/nav-tree.service.ts (excerpt)
+export abstract class AbstractNavTreeService<T extends ABP.Nav> {
+  // Source of truth — flat array of nav items
+  add(items: T[] | T): void;
+  patch(name: string, update: Partial<T>): void;
+  remove(name: string): void;
+
+  // Selectors
+  flat$: Observable<T[]>;            // flat list
+  tree$: Observable<T[]>;            // tree built from parentName
+  visible$: Observable<T[]>;         // filtered by requiredPolicy and permission
+
+  find(name: string): T | undefined;
+  isExist(name: string): boolean;
+}
+```
+
+Calling `tabs.add(...)` from multiple feature modules is safe — duplicates with the same `name` are merged. The `visible$` stream re‑emits whenever `ConfigStateService.getAll$()` does, so toggling a permission on the server updates the visible tab list without a page refresh.
+
+## `EmailSettingsService`
+
+The default email settings tab uses the generated `EmailSettingsService`:
+
+```ts setting-management/config/src/lib/proxy/email-settings.service.ts
+@Injectable({ providedIn: 'root' })
+export class EmailSettingsService {
+  apiName = 'AbpSettingManagement';
+  protected restService = inject(RestService);
+
+  get = (config?: Partial<Rest.Config>) =>
+    this.restService.request<void, EmailSettingsDto>(
+      { method: 'GET', url: '/api/setting-management/emailing' },
+      { apiName: this.apiName, ...config },
+    );
+
+  update = (input: UpdateEmailSettingsDto, config?: Partial<Rest.Config>) =>
+    this.restService.request<UpdateEmailSettingsDto, void>(
+      { method: 'POST', url: '/api/setting-management/emailing', body: input },
+      { apiName: this.apiName, ...config },
+    );
+
+  sendTestEmail = (input: SendTestEmailInput, config?: Partial<Rest.Config>) =>
+    this.restService.request<SendTestEmailInput, void>(
+      { method: 'POST', url: '/api/setting-management/emailing/send-test-email', body: input },
+      { apiName: this.apiName, ...config },
+    );
+}
+```
+
+`EmailSettingsDto` mirrors `Abp.Mailing.*` settings (`SmtpHost`, `SmtpPort`, `SmtpUserName`, `SmtpDomain`, `SmtpEnableSsl`, `SmtpUseDefaultCredentials`, `DefaultFromAddress`, `DefaultFromDisplayName`).
+
+## Replaceable
+
+```ts setting-management/src/lib/enums/components.ts
+export enum eSettingManagementComponents {
+  SettingManagement = 'SettingManagement.SettingManagementComponent',
+}
+```
+
+Replace via `ReplaceableComponentsService.add({ key: eSettingManagementComponents.SettingManagement, component: MyCustomSettingsPage })`. Most teams keep the host page and replace individual tabs by registering a different `component` under the same tab `name`.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Settings" href="/security/settings" icon="gear">
+    The backend concept guide — setting definition providers and value providers.
+  </Card>
+  <Card title="@abp/ng.feature-management" href="/angular/feature-management" icon="toggle-on">
+    The most common producer of a setting management tab (the "Features" tab).
+  </Card>
+  <Card title="@abp/ng.components" href="/angular/components" icon="grid-2">
+    `PageComponent` hosts the tab list; `ExtensibleFormComponent` can render per‑tab forms.
+  </Card>
+  <Card title="@abp/ng.core" href="/angular/core" icon="cube">
+    `AbstractNavTreeService` (parent of `SettingTabsService`) and the `PermissionDirective` used inside the template.
+  </Card>
+</CardGroup>

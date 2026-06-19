@@ -1,0 +1,338 @@
+---
+title: "Volo.Abp.Ddd.Domain Package Deep Dive in ABP Framework"
+sidebarTitle: "Domain"
+description: "Server-side core: AbpDddDomainModule, entities, aggregate roots, repositories, domain services, change-tracking interceptor, and telemetry enricher."
+---
+
+The `Volo.Abp.Ddd.Domain` package, located at `framework/src/Volo.Abp.Ddd.Domain/`, is the heart of the ABP server-side DDD stack. It defines `Entity`, `AggregateRoot`, the full repository abstraction (`IRepository<TEntity, TKey>`), domain services, change tracking, telemetry enrichment, and the conventional registrar that wires repositories into the dependency container. Anything an application *does* at the domain layer is expressed through types from this package.
+
+This page is a guided tour of the source folders and a reference for the `AbpDddDomainModule` itself. Subfolder topics get their own deep-dives — follow the cross-links below.
+
+## Folder map
+
+`framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/`:
+
+```
+Domain/
+├── AbpDddDomainModule.cs
+├── ChangeTracking/
+│   ├── ChangeTrackingHelper.cs
+│   ├── ChangeTrackingInterceptor.cs
+│   ├── ChangeTrackingInterceptorRegistrar.cs
+│   ├── DisableEntityChangeTrackingAttribute.cs
+│   ├── EnableEntityChangeTrackingAttribute.cs
+│   └── EntityChangeTrackingAttribute.cs
+├── Entities/
+│   ├── AggregateRoot.cs
+│   ├── BasicAggregateRoot.cs
+│   ├── ConcurrencyStampConsts.cs
+│   ├── DisableIdGenerationAttribute.cs
+│   ├── DomainEventRecord.cs
+│   ├── Entity.cs
+│   ├── EntityHelper.cs
+│   ├── IAggregateRoot.cs
+│   ├── IEntity.cs
+│   ├── IGeneratesDomainEvents.cs
+│   ├── Auditing/   ← Audited/Creation/FullAudited variants
+│   ├── Caching/    ← IEntityCache, EntityCacheBase
+│   └── Events/     ← Domain-event data classes + distributed mapper
+├── Repositories/
+│   ├── IRepository.cs, IBasicRepository.cs, IReadOnlyRepository.cs, IReadOnlyBasicRepository.cs
+│   ├── RepositoryBase.cs, BasicRepositoryBase.cs
+│   ├── RepositoryAsyncExtensions.cs, RepositoryExtensions.cs
+│   ├── ISupportsExplicitLoading.cs
+│   ├── AbpRepositoryConventionalRegistrar.cs
+│   ├── EntityChangeTrackingProvider.cs
+│   └── ...
+├── Services/
+│   ├── DomainService.cs
+│   └── IDomainService.cs
+├── Values/
+│   └── ValueObject.cs
+└── Telemetry/
+    └── TelemetryDomainInfoEnricher.cs
+```
+
+Each major subfolder has its own deep dive:
+
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — the `Entities/` folder.
+- [Repositories](/ddd/repositories) — the `Repositories/` folder.
+- [Domain Services](/ddd/domain-services) — the `Services/` folder.
+- [Value Objects](/ddd/value-objects) — the `Values/` folder.
+
+## AbpDddDomainModule
+
+The module class glues everything together:
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/AbpDddDomainModule.cs
+using Microsoft.Extensions.DependencyInjection;
+using Volo.Abp.Auditing;
+using Volo.Abp.Caching;
+using Volo.Abp.Data;
+using Volo.Abp.Domain.ChangeTracking;
+using Volo.Abp.Domain.Repositories;
+using Volo.Abp.EventBus;
+using Volo.Abp.ExceptionHandling;
+using Volo.Abp.Guids;
+using Volo.Abp.Modularity;
+using Volo.Abp.ObjectMapping;
+using Volo.Abp.Specifications;
+using Volo.Abp.Timing;
+
+namespace Volo.Abp.Domain;
+
+[DependsOn(
+    typeof(AbpAuditingModule),
+    typeof(AbpDataModule),
+    typeof(AbpEventBusModule),
+    typeof(AbpGuidsModule),
+    typeof(AbpTimingModule),
+    typeof(AbpObjectMappingModule),
+    typeof(AbpExceptionHandlingModule),
+    typeof(AbpSpecificationsModule),
+    typeof(AbpCachingModule),
+    typeof(AbpDddDomainSharedModule)
+    )]
+public class AbpDddDomainModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpRepositoryConventionalRegistrar());
+        context.Services.OnRegistered(ChangeTrackingInterceptorRegistrar.RegisterIfNeeded);
+    }
+}
+```
+
+Two important wiring steps happen in `PreConfigureServices`:
+
+1. `AddConventionalRegistrar(new AbpRepositoryConventionalRegistrar())` — every concrete type that implements `IRepository` will be registered transiently, exposing only the interfaces (see [Repositories](/ddd/repositories#conventional-registration)).
+2. `OnRegistered(ChangeTrackingInterceptorRegistrar.RegisterIfNeeded)` — every type that opts into change tracking gets the dynamic-proxy interceptor described in the [ChangeTracking](#changetracking) section below.
+
+The `[DependsOn]` chain pulls in:
+
+| Module | Purpose |
+| --- | --- |
+| `AbpAuditingModule` | Auditing properties (`CreationTime`, `CreatorId`, etc.) used by [auditing entities](/ddd/entities-and-aggregates#auditing). |
+| `AbpDataModule` | `IDataFilter`, `IUnitOfWork` infrastructure — see [data/unit-of-work](/data/unit-of-work). |
+| `AbpEventBusModule` | Local/distributed event bus that publishes `EntityCreatedEventData<TEntity>`. |
+| `AbpGuidsModule` | `IGuidGenerator` injected into [`DomainService`](/ddd/domain-services). |
+| `AbpTimingModule` | `IClock.Now` for audit fields. |
+| `AbpObjectMappingModule` | `IObjectMapper` accessible through domain services and entity cache. |
+| `AbpExceptionHandlingModule` | Wraps domain-thrown `BusinessException` instances. |
+| `AbpSpecificationsModule` | The [Specification pattern](/ddd/specifications). |
+| `AbpCachingModule` | Used by `EntityCacheBase`. |
+| `AbpDddDomainSharedModule` | Reuses [Domain.Shared](/ddd/domain-shared) ETOs and consts. |
+
+## Entities folder summary
+
+The `Entities/` folder defines the inheritance chain that every aggregate roots into. The minimum viable hierarchy is:
+
+```
+IEntity ──▶ Entity ──▶ Entity<TKey>
+                            │
+                            ▼
+                  BasicAggregateRoot ──▶ BasicAggregateRoot<TKey>
+                            │                    │
+                            ▼                    ▼
+                  AggregateRoot ──▶ AggregateRoot<TKey>
+```
+
+`AggregateRoot` adds `ExtraProperties` (`IHasExtraProperties`) and `ConcurrencyStamp` (`IHasConcurrencyStamp`). `BasicAggregateRoot` adds domain event collections via `IGeneratesDomainEvents`. Quick snippet of the chain:
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/BasicAggregateRoot.cs
+public abstract class BasicAggregateRoot : Entity,
+    IAggregateRoot,
+    IGeneratesDomainEvents
+{
+    private readonly ICollection<DomainEventRecord> _distributedEvents = new Collection<DomainEventRecord>();
+    private readonly ICollection<DomainEventRecord> _localEvents = new Collection<DomainEventRecord>();
+
+    public virtual IEnumerable<DomainEventRecord> GetLocalEvents() => _localEvents;
+    public virtual IEnumerable<DomainEventRecord> GetDistributedEvents() => _distributedEvents;
+    public virtual void ClearLocalEvents() => _localEvents.Clear();
+    public virtual void ClearDistributedEvents() => _distributedEvents.Clear();
+
+    protected virtual void AddLocalEvent(object eventData)
+        => _localEvents.Add(new DomainEventRecord(eventData, EventOrderGenerator.GetNext()));
+
+    protected virtual void AddDistributedEvent(object eventData)
+        => _distributedEvents.Add(new DomainEventRecord(eventData, EventOrderGenerator.GetNext()));
+}
+```
+
+The auditing variants (`CreationAuditedAggregateRoot`, `AuditedAggregateRoot`, `FullAuditedAggregateRoot`) layer additional properties onto `AggregateRoot<TKey>`. The full diagram and behavior live in [Entities & Aggregates](/ddd/entities-and-aggregates).
+
+## Repositories folder summary
+
+`Repositories/` exposes:
+
+- `IRepository`, `IRepository<TEntity>`, `IRepository<TEntity, TKey>` — the queryable repository for any aggregate root.
+- `IBasicRepository`, `IBasicRepository<TEntity, TKey>` — write-only contract used when LINQ isn't an option (e.g. raw MongoDB).
+- `IReadOnlyRepository<TEntity>` and `IReadOnlyBasicRepository<TEntity>` — read-only counterparts injected into `ReadOnlyAppService`.
+- `RepositoryBase<TEntity, TKey>` and `BasicRepositoryBase<TEntity>` — abstract bases that concrete providers (EF Core / MongoDB / Memory) finish.
+- `RepositoryAsyncExtensions` and `RepositoryExtensions` — LINQ-like helpers (`AnyAsync`, `CountAsync`, `FirstOrDefaultAsync`, etc.).
+- `ISupportsExplicitLoading<TEntity>` — opt-in interface for `EnsurePropertyLoadedAsync`/`EnsureCollectionLoadedAsync`.
+- `AbpRepositoryConventionalRegistrar` — the registrar referenced by the module class above.
+- `EntityChangeTrackingProvider` — runtime helper used by repositories to decide whether to enable EF Core change tracking for the current scope.
+
+Full details — including how EF Core and MongoDB modules concretise these bases — are in [Repositories](/ddd/repositories).
+
+## Services folder summary
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/IDomainService.cs
+namespace Volo.Abp.Domain.Services;
+
+public interface IDomainService : ITransientDependency
+{
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/DomainService.cs
+public abstract class DomainService : IDomainService
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected IClock Clock => LazyServiceProvider.LazyGetRequiredService<IClock>();
+    protected IGuidGenerator GuidGenerator =>
+        LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+    protected ILoggerFactory LoggerFactory =>
+        LazyServiceProvider.LazyGetRequiredService<ILoggerFactory>();
+    protected ICurrentTenant CurrentTenant =>
+        LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    protected IAsyncQueryableExecuter AsyncExecuter =>
+        LazyServiceProvider.LazyGetRequiredService<IAsyncQueryableExecuter>();
+    protected ILogger Logger => LazyServiceProvider.LazyGetService<ILogger>(
+        provider => LoggerFactory?.CreateLogger(GetType().FullName!) ?? NullLogger.Instance);
+}
+```
+
+`DomainService` follows the same "property-injected via `IAbpLazyServiceProvider`" pattern as `ApplicationService` ([Application](/ddd/application)). See the dedicated [Domain Services](/ddd/domain-services) page for usage patterns.
+
+## Values folder summary
+
+The `Values/` folder hosts `ValueObject` only:
+
+```csharp
+public abstract class ValueObject
+{
+    protected abstract IEnumerable<object> GetAtomicValues();
+    public bool ValueEquals(object obj) { /* deep equality */ }
+}
+```
+
+The full implementation — including nested value-object handling — is covered on the [Value Objects](/ddd/value-objects) page.
+
+## ChangeTracking folder
+
+The change-tracking system lets aggregate roots (and child entities) participate in EF Core change detection only when needed. The folder defines three attributes and an interceptor that the module wires globally:
+
+- `EnableEntityChangeTrackingAttribute` / `DisableEntityChangeTrackingAttribute` / `EntityChangeTrackingAttribute` — control the default at the class or method level.
+- `ChangeTrackingInterceptor` — the dynamic-proxy interceptor that opens an `EntityChangeTrackingProvider` scope around method calls. See [core/dynamic-proxy-and-aspects](/core/dynamic-proxy-and-aspects) for the interceptor infrastructure.
+- `ChangeTrackingInterceptorRegistrar.RegisterIfNeeded` — referenced from `AbpDddDomainModule.PreConfigureServices`. It inspects each registered service and attaches the interceptor only when at least one method/class is annotated.
+
+`EntityChangeTrackingProvider` (in `Repositories/`) is the per-scope state object the interceptor flips. Repositories check it to decide whether to call `db.Entry(e).State = EntityState.Modified` or similar.
+
+```csharp
+// pseudo-usage in your domain service
+[EnableEntityChangeTracking]
+public class OrderManager : DomainService
+{
+    public async Task FulfillAsync(Order order)
+    {
+        // Within this method, repositories will track entity changes.
+    }
+}
+```
+
+## Telemetry folder
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Telemetry/TelemetryDomainInfoEnricher.cs
+```
+
+`TelemetryDomainInfoEnricher` plugs into the ABP telemetry pipeline to add `abp.entity_type`, `abp.aggregate_root` and similar tags to activities/spans created in the domain layer. It pairs with the broader timing/telemetry stack documented in [core/timing](/core/timing).
+
+## Conventional registrar in detail
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/AbpRepositoryConventionalRegistrar.cs
+public class AbpRepositoryConventionalRegistrar : DefaultConventionalRegistrar
+{
+    public static bool ExposeRepositoryClasses { get; set; }
+
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+        => !typeof(IRepository).IsAssignableFrom(type) || base.IsConventionalRegistrationDisabled(type);
+
+    protected override List<Type> GetExposedServiceTypes(Type type)
+    {
+        if (ExposeRepositoryClasses)
+        {
+            return base.GetExposedServiceTypes(type);
+        }
+
+        return base.GetExposedServiceTypes(type)
+            .Where(x => x.IsInterface)
+            .ToList();
+    }
+
+    protected override ServiceLifetime? GetDefaultLifeTimeOrNull(Type type)
+        => ServiceLifetime.Transient;
+}
+```
+
+Two things to internalise:
+
+1. **Only repositories are touched** — `IsConventionalRegistrationDisabled` short-circuits everything else. Other types still use ABP's standard `[Dependency]`/`I*Dependency` rules.
+2. **Interfaces are exposed by default** — if you want to inject a concrete repository class, flip `ExposeRepositoryClasses = true` early in `PreConfigureServices`.
+
+## EntityHelper
+
+`EntityHelper` exposes static utilities used across the framework:
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/EntityHelper.cs
+public static class EntityHelper
+{
+    public static bool IsMultiTenant<TEntity>() where TEntity : IEntity;
+    public static bool IsMultiTenant(Type type);
+    public static bool EntityEquals(IEntity? entity1, IEntity? entity2);
+    public static bool HasDefaultKeys(IEntity entity);
+    public static void TrySetTenantId(IEntity entity);
+    // ... and Expression<Func<TEntity, bool>> builders for FindByKeys etc.
+}
+```
+
+Two highlights:
+
+- `EntityEquals` is the canonical comparison used by `Entity.EntityEquals`. It checks reference equality first, then class compatibility, then composite keys, and respects `IMultiTenant` — two records with the same Id but different `TenantId` are not equal.
+- `TrySetTenantId` is called from `Entity`'s constructor: when the entity implements `IMultiTenant`, ABP automatically stamps the current tenant. This is why your aggregate code rarely sets `TenantId` manually.
+
+## ConcurrencyStampConsts
+
+```csharp
+public static class ConcurrencyStampConsts
+{
+    public const int MaxLength = 40;
+}
+```
+
+EF Core mappings for any `AggregateRoot.ConcurrencyStamp` column use this constant for `HasMaxLength`. See [data/entityframeworkcore](/data/entityframeworkcore) for the conventions module.
+
+## Cross-references
+
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — full class hierarchy, auditing variants, domain events, entity caching.
+- [Repositories](/ddd/repositories) — interfaces, base classes, async extensions, change tracking integration.
+- [Domain Services](/ddd/domain-services) — the `DomainService` base class.
+- [Value Objects](/ddd/value-objects) — `ValueObject` deep dive.
+- [Specifications](/ddd/specifications) — used through `IRepository.GetListAsync(Specification.ToExpression())`.
+- [Application](/ddd/application) — how `ApplicationService` consumes `IDomainService` and `IRepository`.
+- Persistence providers complete the repository bases: [data/entityframeworkcore](/data/entityframeworkcore), [data/mongodb](/data/mongodb).
+- [data/unit-of-work](/data/unit-of-work) — the unit-of-work scope wrapping every repository call.
+
+<Tip>
+Whenever you build a new aggregate in your own module, the typical references you need from this package are `Volo.Abp.Domain.Entities`, `Volo.Abp.Domain.Repositories`, and `Volo.Abp.Domain.Services`. Everything else (`Caching`, `ChangeTracking`, `Telemetry`, `Values`) is opt-in.
+</Tip>

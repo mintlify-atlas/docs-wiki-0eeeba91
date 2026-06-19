@@ -1,0 +1,501 @@
+---
+title: "Application Layer"
+description: "EmailSettingsAppService, TimeZoneSettingsAppService, the DTOs they exchange, permission / feature definitions, and the user-deleted event handler."
+---
+
+The application layer turns `ISettingManager` into something a UI can call. It lives in two assemblies:
+
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.Application/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Application) — implementations
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts) — interfaces, DTOs, permission and feature definitions
+
+There are exactly **two** app services in the box:
+
+| App service | Permission | Settings it edits |
+| --- | --- | --- |
+| `EmailSettingsAppService` | `SettingManagement.Emailing` (+ `.Test`) | The `Abp.Mailing.*` group — see [Emailing](/misc/emailing). |
+| `TimeZoneSettingsAppService` | `SettingManagement.TimeZone` | `Abp.Timing.Timezone`. |
+
+Everything else (locale, theme, password complexity, lockout, etc.) is added by *other* modules through the [Web/Blazor contributor system](/modules/setting-management/web-and-blazor#extending-with-contributors) — they just call `ISettingManager` directly without going through an app service.
+
+## Module wiring
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application/
+//   Volo/Abp/SettingManagement/AbpSettingManagementApplicationModule.cs
+[DependsOn(
+    typeof(AbpDddApplicationModule),
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpEmailingModule),
+    typeof(AbpTimingModule),
+    typeof(AbpUsersAbstractionModule)
+)]
+public class AbpSettingManagementApplicationModule : AbpModule
+{
+}
+```
+
+The contracts module pulls in `AbpAuthorizationModule`, `AbpFeaturesModule`, and `AbpValidationModule`, and registers `SettingManagementPermissionDefinitionProvider` plus the remote-service constants.
+
+## SettingManagementAppServiceBase
+
+All app services derive from a common base:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application/
+//   Volo/Abp/SettingManagement/SettingManagementAppServiceBase.cs
+public abstract class SettingManagementAppServiceBase : ApplicationService
+{
+    protected SettingManagementAppServiceBase()
+    {
+        ObjectMapperContext = typeof(AbpSettingManagementApplicationModule);
+        LocalizationResource = typeof(AbpSettingManagementResource);
+    }
+}
+```
+
+This sets `LocalizationResource` so the inherited `L["..."]` lookup hits `AbpSettingManagementResource` (the JSON files under `Localization/`).
+
+## EmailSettingsAppService
+
+The interface is the thinnest possible:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/IEmailSettingsAppService.cs
+public interface IEmailSettingsAppService : IApplicationService
+{
+    Task<EmailSettingsDto> GetAsync();
+
+    Task UpdateAsync(UpdateEmailSettingsDto input);
+
+    Task SendTestEmailAsync(SendTestEmailInput input);
+}
+```
+
+And the implementation maps each property to a setting name defined in `EmailSettingNames` (declared in [`Volo.Abp.Emailing`](/misc/emailing)):
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application/
+//   Volo/Abp/SettingManagement/EmailSettingsAppService.cs
+[Authorize(SettingManagementPermissions.Emailing)]
+public class EmailSettingsAppService : SettingManagementAppServiceBase, IEmailSettingsAppService
+{
+    protected ISettingManager SettingManager { get; }
+    protected IEmailSender EmailSender { get; }
+
+    public EmailSettingsAppService(ISettingManager settingManager, IEmailSender emailSender)
+    {
+        SettingManager = settingManager;
+        EmailSender = emailSender;
+    }
+
+    public virtual async Task<EmailSettingsDto> GetAsync()
+    {
+        await CheckFeatureAsync();
+
+        var settingsDto = new EmailSettingsDto
+        {
+            SmtpHost = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Host),
+            SmtpPort = Convert.ToInt32(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Port)),
+            SmtpUserName = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.UserName),
+            SmtpDomain = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Domain),
+            SmtpEnableSsl = Convert.ToBoolean(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.EnableSsl)),
+            SmtpUseDefaultCredentials = Convert.ToBoolean(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.UseDefaultCredentials)),
+            DefaultFromAddress = await SettingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromAddress),
+            DefaultFromDisplayName = await SettingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromDisplayName),
+        };
+
+        if (CurrentTenant.IsAvailable)
+        {
+            settingsDto.SmtpHost = await SettingManager.GetOrNullForTenantAsync(
+                EmailSettingNames.Smtp.Host, CurrentTenant.GetId(), false);
+            settingsDto.SmtpUserName = await SettingManager.GetOrNullForTenantAsync(
+                EmailSettingNames.Smtp.UserName, CurrentTenant.GetId(), false);
+            settingsDto.SmtpDomain = await SettingManager.GetOrNullForTenantAsync(
+                EmailSettingNames.Smtp.Domain, CurrentTenant.GetId(), false);
+        }
+
+        return settingsDto;
+    }
+```
+
+Three details:
+
+1. **`SettingProvider`** (inherited from `ApplicationService`) is the *framework* `ISettingProvider` — it walks the full chain U → T → G → C → D. That's what the host UI should see.
+2. **`SettingManager.GetOrNullForTenantAsync(..., fallback: false)`** is used for the tenant UI. The `false` is critical — it stops the read at the tenant scope, so the form shows what is *stored for this tenant*, not the inherited host default. A blank field means "use the host default".
+3. The **password** is never sent to the client. `EmailSettingsDto.SmtpPassword` is left null on `GetAsync`.
+
+### UpdateAsync
+
+```csharp
+public virtual async Task UpdateAsync(UpdateEmailSettingsDto input)
+{
+    await CheckFeatureAsync();
+
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Host, input.SmtpHost);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Port, input.SmtpPort.ToString());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.UserName, input.SmtpUserName);
+    if (!input.SmtpPassword.IsNullOrWhiteSpace())
+    {
+        await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Password, input.SmtpPassword);
+    }
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Domain, input.SmtpDomain);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.EnableSsl, input.SmtpEnableSsl.ToString());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.UseDefaultCredentials,
+        input.SmtpUseDefaultCredentials.ToString().ToLowerInvariant());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.DefaultFromAddress, input.DefaultFromAddress);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.DefaultFromDisplayName, input.DefaultFromDisplayName);
+}
+```
+
+`SetForTenantOrGlobalAsync(tenantId, name, value)` is an extension over `ISettingManager`: when `tenantId` is null it writes to `"G"`, otherwise to `"T"`. The password write is **guarded by `IsNullOrWhiteSpace`** so leaving the field blank in the UI preserves the previous (encrypted) value — there is no "clear password" path through this API.
+
+### SendTestEmailAsync
+
+The third method validates the just-saved SMTP settings by actually sending an email through `IEmailSender`:
+
+```csharp
+[Authorize(SettingManagementPermissions.EmailingTest)]
+public virtual async Task SendTestEmailAsync(SendTestEmailInput input)
+{
+    await CheckFeatureAsync();
+
+    try
+    {
+        await EmailSender.SendAsync(
+            input.SenderEmailAddress,
+            input.TargetEmailAddress,
+            input.Subject,
+            input.Body);
+    }
+    catch (Exception e)
+    {
+        Logger.LogError("Error sending test email: " + e);
+        throw new UserFriendlyException(L["MailSendingFailed"]);
+    }
+}
+```
+
+The exception is wrapped in `UserFriendlyException` so the UI shows a localized "MailSendingFailed" message instead of an unhandled exception. The SMTP exception is logged via `Logger` for diagnosis.
+
+### CheckFeatureAsync — multi-tenant gating
+
+```csharp
+protected virtual async Task CheckFeatureAsync()
+{
+    await FeatureChecker.CheckEnabledAsync(SettingManagementFeatures.Enable);
+    if (CurrentTenant.IsAvailable)
+    {
+        await FeatureChecker.CheckEnabledAsync(SettingManagementFeatures.AllowChangingEmailSettings);
+    }
+}
+```
+
+Two feature gates:
+
+- **`SettingManagement.Enable`** is *always* required — it lets a host disable the entire module per-tenant via the [Feature Management](/modules/feature-management/overview) UI.
+- **`SettingManagement.AllowChangingEmailSettings`** kicks in only inside a tenant. It defaults to `false`, so tenants cannot point their own SMTP at a different server unless the host opts them in. See the feature definition below.
+
+## DTOs
+
+### EmailSettingsDto
+
+The shape the UI binds to:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/EmailSettingsDto.cs
+public class EmailSettingsDto
+{
+    public string SmtpHost { get; set; }
+    public int SmtpPort { get; set; }
+    public string SmtpUserName { get; set; }
+    public string SmtpPassword { get; set; }
+    public string SmtpDomain { get; set; }
+    public bool SmtpEnableSsl { get; set; }
+    public bool SmtpUseDefaultCredentials { get; set; }
+    public string DefaultFromAddress { get; set; }
+    public string DefaultFromDisplayName { get; set; }
+}
+```
+
+### UpdateEmailSettingsDto
+
+The input DTO adds validation attributes:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/UpdateEmailSettingsDto.cs
+public class UpdateEmailSettingsDto
+{
+    [MaxLength(256)]
+    public string SmtpHost { get; set; }
+
+    [Range(1, 65535)]
+    public int SmtpPort { get; set; }
+
+    [MaxLength(1024)]
+    public string SmtpUserName { get; set; }
+
+    [MaxLength(1024)]
+    [DataType(DataType.Password)]
+    [DisableAuditing]
+    public string SmtpPassword { get; set; }
+
+    [MaxLength(1024)]
+    public string SmtpDomain { get; set; }
+
+    public bool SmtpEnableSsl { get; set; }
+    public bool SmtpUseDefaultCredentials { get; set; }
+
+    [MaxLength(1024)]
+    [Required]
+    public string DefaultFromAddress { get; set; }
+
+    [MaxLength(1024)]
+    [Required]
+    public string DefaultFromDisplayName { get; set; }
+}
+```
+
+`[DisableAuditing]` on `SmtpPassword` prevents the audit log from capturing the plaintext password sent over the wire. `[DataType(DataType.Password)]` causes the Web layer to render the field as `<input type="password">`.
+
+### SendTestEmailInput
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/SendTestEmailInput.cs
+public class SendTestEmailInput
+{
+    [Required]
+    public string SenderEmailAddress { get; set; }
+
+    [Required]
+    public string TargetEmailAddress { get; set; }
+
+    [Required]
+    public string Subject { get; set; }
+
+    public string Body { get; set; }
+}
+```
+
+## TimeZoneSettingsAppService
+
+The TZ service is smaller but illustrates the host-vs-tenant split nicely:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application/
+//   Volo/Abp/SettingManagement/TimeZoneSettingsAppService.cs
+[Authorize(SettingManagementPermissions.TimeZone)]
+public class TimeZoneSettingsAppService : SettingManagementAppServiceBase, ITimeZoneSettingsAppService
+{
+    protected ISettingManager SettingManager { get; }
+    protected ITimezoneProvider TimezoneProvider { get; }
+
+    private const string UnspecifiedTimeZone = "Unspecified";
+
+    public TimeZoneSettingsAppService(ISettingManager settingManager, ITimezoneProvider timezoneProvider)
+    {
+        SettingManager = settingManager;
+        TimezoneProvider = timezoneProvider;
+    }
+
+    public virtual async Task<string> GetAsync()
+    {
+        var timezone = CurrentTenant.GetMultiTenancySide() == MultiTenancySides.Host
+            ? await SettingManager.GetOrNullGlobalAsync(TimingSettingNames.TimeZone)
+            : await SettingManager.GetOrNullForCurrentTenantAsync(TimingSettingNames.TimeZone);
+
+        if (timezone.IsNullOrWhiteSpace())
+        {
+            timezone = UnspecifiedTimeZone;
+        }
+
+        return timezone;
+    }
+
+    public virtual Task<List<NameValue>> GetTimezonesAsync()
+    {
+        var timezones = TimeZoneHelper.GetTimezones(TimezoneProvider.GetIanaTimezones());
+        timezones.Insert(0, new NameValue
+        {
+            Name = L["DefaultTimeZone"],
+            Value = UnspecifiedTimeZone
+        });
+        return Task.FromResult(timezones);
+    }
+
+    public virtual async Task UpdateAsync(string timezone)
+    {
+        if (timezone.Equals(UnspecifiedTimeZone, StringComparison.OrdinalIgnoreCase))
+        {
+            timezone = null;
+        }
+
+        if (CurrentTenant.GetMultiTenancySide() == MultiTenancySides.Host)
+        {
+            await SettingManager.SetGlobalAsync(TimingSettingNames.TimeZone, timezone);
+        }
+        else
+        {
+            await SettingManager.SetForCurrentTenantAsync(TimingSettingNames.TimeZone, timezone);
+        }
+    }
+}
+```
+
+Key patterns:
+
+- **Read path uses `SettingManager`, not `SettingProvider`**, because the UI needs to know whether the *specific* scope has a value — `"Unspecified"` shows when this scope has nothing, regardless of what the chain would resolve to.
+- The `"Unspecified"` sentinel maps to `null` on the way in and a synthetic top-of-list item on the way out (`GetTimezonesAsync` injects it at index 0 with the localized `"DefaultTimeZone"` label).
+- The IANA list comes from `ITimezoneProvider`, which is registered by `AbpTimingModule`.
+
+## Permissions
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/SettingManagementPermissions.cs
+public class SettingManagementPermissions
+{
+    public const string GroupName = "SettingManagement";
+    public const string Emailing = GroupName + ".Emailing";
+    public const string EmailingTest = Emailing + ".Test";
+    public const string TimeZone = GroupName + ".TimeZone";
+
+    public static string[] GetAll()
+    {
+        return ReflectionHelper.GetPublicConstantsRecursively(typeof(SettingManagementPermissions));
+    }
+}
+```
+
+The definition provider also attaches the `AllowChangingEmailSettings` feature checker so the Emailing permission is *automatically* hidden from tenants that don't have the feature enabled:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/SettingManagementPermissionDefinitionProvider.cs
+public class SettingManagementPermissionDefinitionProvider : PermissionDefinitionProvider
+{
+    public override void Define(IPermissionDefinitionContext context)
+    {
+        var moduleGroup = context.AddGroup(
+            SettingManagementPermissions.GroupName, L("Permission:SettingManagement"));
+
+        var emailPermission = moduleGroup
+            .AddPermission(SettingManagementPermissions.Emailing, L("Permission:Emailing"));
+        emailPermission.StateCheckers.Add(new AllowChangingEmailSettingsFeatureSimpleStateChecker());
+
+        emailPermission.AddChild(SettingManagementPermissions.EmailingTest, L("Permission:EmailingTest"));
+
+        moduleGroup.AddPermission(SettingManagementPermissions.TimeZone, L("Permission:TimeZone"));
+    }
+}
+```
+
+`AllowChangingEmailSettingsFeatureSimpleStateChecker` is the bridge between the permission system and the feature system:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/AllowChangingEmailSettingsFeatureSimpleStateChecker.cs
+public class AllowChangingEmailSettingsFeatureSimpleStateChecker : ISimpleStateChecker<PermissionDefinition>
+{
+    public async Task<bool> IsEnabledAsync(SimpleStateCheckerContext<PermissionDefinition> context)
+    {
+        var currentTenant = context.ServiceProvider.GetRequiredService<ICurrentTenant>();
+
+        if (!currentTenant.IsAvailable)
+        {
+            return true;
+        }
+
+        var featureChecker = context.ServiceProvider.GetRequiredService<IFeatureChecker>();
+        return await featureChecker.IsEnabledAsync(SettingManagementFeatures.AllowChangingEmailSettings);
+    }
+}
+```
+
+Hosts always see the permission; a tenant only sees it when the `AllowChangingEmailSettings` feature is on for that tenant.
+
+## Feature definitions
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain.Shared/
+//   Volo/Abp/SettingManagement/SettingManagementFeatureDefinitionProvider.cs
+public class SettingManagementFeatureDefinitionProvider : FeatureDefinitionProvider
+{
+    public override void Define(IFeatureDefinitionContext context)
+    {
+        var group = context.AddGroup(SettingManagementFeatures.GroupName,
+            L("Feature:SettingManagementGroup"));
+
+        var settingEnableFeature = group.AddFeature(
+            SettingManagementFeatures.Enable,
+            "true",
+            L("Feature:SettingManagementEnable"),
+            L("Feature:SettingManagementEnableDescription"),
+            new ToggleStringValueType(),
+            isAvailableToHost: false);
+
+        settingEnableFeature.CreateChild(
+            SettingManagementFeatures.AllowChangingEmailSettings,
+            "false",
+            L("Feature:AllowChangingEmailSettings"),
+            null,
+            new ToggleStringValueType(),
+            isAvailableToHost: false);
+    }
+}
+```
+
+Both features are `isAvailableToHost: false` — they only make sense for tenants. The constants live in `.Domain.Shared` because the domain module's `EmailSettingsAppService.CheckFeatureAsync` also references them.
+
+## UserDeletedEventHandler
+
+When a user is deleted (the [Identity module](/modules/identity/overview) raises `EntityDeletedEto<UserEto>` on the distributed bus), all of that user's settings should be removed too — otherwise the row count grows without bound:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application/
+//   Volo/Abp/SettingManagement/UserDeletedEventHandler.cs
+public class UserDeletedEventHandler :
+    IDistributedEventHandler<EntityDeletedEto<UserEto>>,
+    ITransientDependency
+{
+    protected ISettingManager SettingManager { get; }
+
+    public UserDeletedEventHandler(ISettingManager settingManager)
+    {
+        SettingManager = settingManager;
+    }
+
+    [UnitOfWork]
+    public virtual async Task HandleEventAsync(EntityDeletedEto<UserEto> eventData)
+    {
+        await SettingManager.DeleteAsync(
+            UserSettingValueProvider.ProviderName,
+            eventData.Entity.Id.ToString());
+    }
+}
+```
+
+`ISettingManager.DeleteAsync(providerName, providerKey)` iterates `SettingManagementStore.GetListAsync("U", userId)` and deletes each one. The handler is wrapped in `[UnitOfWork]` because each delete writes a row.
+
+There is **no equivalent for tenants** — when a tenant is deleted, the `AbpSettings` rows keyed by that tenant remain until you write a cleanup script. The host-side database is shared, and the Tenant Management module does not raise a guaranteed `EntityDeletedEto<TenantEto>` on the same bus configuration.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="HTTP API + client" icon="cloud" href="/modules/setting-management/http-api">
+    The REST routes that expose these app services, and the generated client proxies.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-restore" href="/modules/setting-management/web-and-blazor">
+    How `EmailSettingGroupViewComponent` and `EmailSettingGroup.razor` bind to these app services.
+  </Card>
+  <Card title="Emailing" icon="envelope" href="/misc/emailing">
+    `EmailSettingNames`, `IEmailSender`, the consumer of every value this app service writes.
+  </Card>
+  <Card title="Domain layer" icon="database" href="/modules/setting-management/domain">
+    `ISettingManager`, the `SetForTenantOrGlobalAsync` extension, encrypted-value handling.
+  </Card>
+</CardGroup>

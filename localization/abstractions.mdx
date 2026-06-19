@@ -1,0 +1,397 @@
+---
+title: "Localization abstractions: deferred strings, language info"
+sidebarTitle: "Abstractions"
+description: "ILocalizableString, LocalizableString, FixedLocalizableString, the IAbpStringLocalizerFactory extension, ILanguageProvider, and LanguageInfo metadata."
+---
+
+`Volo.Abp.Localization.Abstractions` is the package every ABP library can take a dependency on without pulling in the JSON loader, the virtual file system, or the `AbpStringLocalizerFactory` replacement. It defines three things:
+
+1. The `ILocalizableString` family — a deferred, factory-resolvable text key plus the value-typed wrappers that carry one around.
+2. The `IAbpStringLocalizerFactory` interface that extends `IStringLocalizerFactory` from `Microsoft.Extensions.Localization` with two ABP-specific lookups: "by resource name" and "the default resource".
+3. `LanguageInfo` / `ILanguageProvider` — the shape of "a language the application supports", used by language switchers, RTL detection, and `IExternalLocalizationStore`.
+
+Because nothing in this package allocates a dictionary or reads a file, it is safe to reference from `Volo.Abp.Authorization`, `Volo.Abp.Features`, `Volo.Abp.TextTemplating.Core`, and similar low-level packages that only need to **describe** a string, not resolve one.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.Localization.Abstractions/
+├── Microsoft/Extensions/Localization/
+│   ├── IAbpStringLocalizerFactory.cs
+│   └── AbpStringLocalizerFactoryExtensions.cs
+└── Volo/Abp/Localization/
+    ├── AbpLocalizationAbstractionsModule.cs
+    ├── ILocalizableString.cs
+    ├── IAsyncLocalizableString.cs
+    ├── LocalizableString.cs
+    ├── LocalizableStringExtensions.cs
+    ├── FixedLocalizableString.cs
+    ├── LocalizationResourceNameAttribute.cs
+    ├── IHasNameWithLocalizableDisplayName.cs
+    └── HasNameWithLocalizableDisplayNameExtensions.cs
+```
+
+The module itself is empty — it exists so other modules can express the dependency:
+
+```csharp
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpSettingsModule),
+    typeof(AbpLocalizationAbstractionsModule),
+    typeof(AbpThreadingModule)
+)]
+public class AbpLocalizationModule : AbpModule
+```
+
+## `ILocalizableString` — a deferred translation key
+
+`ILocalizableString` is the smallest contract in the package. It carries enough information to produce a `LocalizedString` **later**, once an `IStringLocalizerFactory` is available:
+
+```csharp
+// framework/src/Volo.Abp.Localization.Abstractions/Volo/Abp/Localization/ILocalizableString.cs
+public interface ILocalizableString
+{
+    LocalizedString Localize(IStringLocalizerFactory stringLocalizerFactory);
+}
+```
+
+The async sibling adds a `LocalizeAsync` overload that can pull from `IExternalLocalizationStore` (database-backed translations, used by the LeptonX language manager and similar):
+
+```csharp
+// IAsyncLocalizableString.cs
+public interface IAsyncLocalizableString
+{
+    Task<LocalizedString> LocalizeAsync(IStringLocalizerFactory stringLocalizerFactory);
+}
+```
+
+`LocalizedString` itself is the standard type from `Microsoft.Extensions.Localization` — `Name`, `Value`, `ResourceNotFound`, `SearchedLocation`. ABP does not reinvent it.
+
+### Why deferred?
+
+A menu item, a permission display name, a `TemplateDefinition.DisplayName`, an exception's message — all of these are declared in `Configure<TOptions>` callbacks that run during module initialization, **before** the request pipeline exists and therefore before any culture has been set. Storing an `ILocalizableString` lets the framework call `Localize(factory)` on the response side, when culture is known.
+
+## `LocalizableString` — typed/named keys
+
+`LocalizableString` is the concrete value object you usually construct. It can carry **either** a resource `Type` **or** a resource name string, plus the key:
+
+```csharp
+// framework/src/Volo.Abp.Localization.Abstractions/Volo/Abp/Localization/LocalizableString.cs
+public class LocalizableString : ILocalizableString, IAsyncLocalizableString
+{
+    public string? ResourceName { get; }
+    public Type? ResourceType { get; }
+
+    [NotNull]
+    public string Name { get; }
+
+    public LocalizableString(Type? resourceType, [NotNull] string name)
+    {
+        Name = Check.NotNullOrEmpty(name, nameof(name));
+        ResourceType = resourceType;
+
+        if (resourceType != null)
+        {
+            ResourceName = LocalizationResourceNameAttribute.GetName(resourceType);
+        }
+    }
+
+    public LocalizableString([NotNull] string name, string? resourceName = null)
+    {
+        Name = Check.NotNullOrEmpty(name, nameof(name));
+        ResourceName = resourceName;
+    }
+    // ...
+}
+```
+
+The `Localize(...)` walk is the heart of the file. Read it once and the whole stack makes sense:
+
+```csharp
+public LocalizedString Localize(IStringLocalizerFactory stringLocalizerFactory)
+{
+    var localizer = CreateStringLocalizerOrNull(stringLocalizerFactory);
+    if (localizer == null)
+    {
+        return new LocalizedString(Name, Name, resourceNotFound: true);
+    }
+
+    var result = localizer[Name];
+
+    if (result.ResourceNotFound && ResourceName != null)
+    {
+        /* Search in the default resource if not found in the provided resource */
+        localizer = stringLocalizerFactory.CreateDefaultOrNull();
+        if (localizer != null)
+        {
+            result = localizer[Name];
+        }
+    }
+
+    return result;
+}
+```
+
+The lookup priority in `CreateStringLocalizerOrNull`:
+
+1. `ResourceType` set → `factory.Create(resourceType)` (the standard generic path).
+2. `ResourceName` set → `factory.CreateByResourceNameOrNull(resourceName)` (the ABP extension).
+3. Otherwise → `factory.CreateDefaultOrNull()` — the resource configured as `AbpLocalizationOptions.DefaultResourceType`.
+
+The static helpers are how you'll usually construct one:
+
+```csharp
+LocalizableString.Create<BookStoreResource>("BookCount");
+LocalizableString.Create("BookCount", resourceName: "BookStore");
+```
+
+## `FixedLocalizableString` — when there is nothing to look up
+
+Some strings are not keys — they are literal text the user already typed, or a name that exists only in a database row (a tenant name, a custom role label). `FixedLocalizableString` lets that value live in any API typed as `ILocalizableString` without going through a localizer:
+
+```csharp
+// framework/src/Volo.Abp.Localization.Abstractions/Volo/Abp/Localization/FixedLocalizableString.cs
+public class FixedLocalizableString : ILocalizableString
+{
+    public string Value { get; }
+
+    public FixedLocalizableString(string value)
+    {
+        Check.NotNull(value, nameof(value));
+        Value = value;
+    }
+
+    public LocalizedString Localize(IStringLocalizerFactory stringLocalizerFactory)
+    {
+        return new LocalizedString(Value, Value);
+    }
+}
+```
+
+`TemplateDefinition` uses this as the default for `DisplayName` when none is provided — see [text-templating](/localization/text-templating).
+
+## `LocalizationResourceNameAttribute`
+
+The bridge from a CLR `Type` to the string that identifies a resource at the dictionary level:
+
+```csharp
+// LocalizationResourceNameAttribute.cs
+public class LocalizationResourceNameAttribute : Attribute
+{
+    public string Name { get; }
+
+    public LocalizationResourceNameAttribute(string name)
+    {
+        Name = name;
+    }
+
+    public static LocalizationResourceNameAttribute? GetOrNull(Type resourceType)
+    {
+        return resourceType
+            .GetCustomAttributes(true)
+            .OfType<LocalizationResourceNameAttribute>()
+            .FirstOrDefault();
+    }
+
+    public static string GetName(Type resourceType)
+    {
+        return (GetOrNull(resourceType)?.Name ?? resourceType.FullName)!;
+    }
+}
+```
+
+This is what makes the cache keys stable across renames of the namespace — every module that publishes a resource type to consumers should put `[LocalizationResourceName("...")]` on it.
+
+```csharp
+[LocalizationResourceName("BookStore")]
+public class BookStoreResource { }
+```
+
+## `IAbpStringLocalizerFactory`
+
+`Microsoft.Extensions.Localization.IStringLocalizerFactory` only knows how to `Create(Type)` or `Create(string baseName, string location)`. ABP needs two more:
+
+- "Give me a localizer for a resource I only know by **name** (no type)."
+- "Give me the localizer for the **default** resource, if one is configured."
+
+That contract lives in the abstractions package so a module that defines deferred strings doesn't need to depend on the full localization runtime:
+
+```csharp
+// framework/src/Volo.Abp.Localization.Abstractions/Microsoft/Extensions/Localization/IAbpStringLocalizerFactory.cs
+public interface IAbpStringLocalizerFactory
+{
+    IStringLocalizer? CreateDefaultOrNull();
+
+    IStringLocalizer? CreateByResourceNameOrNull([NotNull] string resourceName);
+
+    Task<IStringLocalizer?> CreateByResourceNameOrNullAsync([NotNull] string resourceName);
+}
+```
+
+The extensions class smoothly upgrades any `IStringLocalizerFactory` into one of these:
+
+```csharp
+public static IStringLocalizer? CreateByResourceNameOrNull(
+    this IStringLocalizerFactory localizerFactory,
+    string resourceName)
+{
+    return (localizerFactory as IAbpStringLocalizerFactory)
+        ?.CreateByResourceNameOrNull(resourceName);
+}
+```
+
+If the factory is the stock framework one (not the ABP replacement), the cast yields `null` and you get back `null`, which `LocalizableString` then handles by returning a `ResourceNotFound = true` result.
+
+`CreateByResourceName` (no `OrNull`) throws `AbpException("Couldn't find a localizer with given resource name: ...")` when the lookup misses — use it from code paths where the resource is statically known to exist.
+
+## `LanguageInfo` and `ILanguageProvider`
+
+A `LanguageInfo` describes one supported language. It is **not** a translation — it is the metadata you put behind a language switcher and use to drive `ICultureInfoProvider`:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/LanguageInfo.cs
+[Serializable]
+public class LanguageInfo : ILanguageInfo
+{
+    public virtual string CultureName { get; protected set; }       // "tr-TR"
+    public virtual string UiCultureName { get; protected set; }     // "tr-TR"
+    public virtual string DisplayName { get; protected set; }       // "Türkçe"
+    public virtual string TwoLetterISOLanguageName { get; protected set; } // "tr"
+
+    public LanguageInfo(
+        string cultureName,
+        string? uiCultureName = null,
+        string? displayName = null)
+    {
+        ChangeCultureInternal(cultureName, uiCultureName, displayName);
+    }
+
+    public virtual void ChangeCulture(string cultureName, string? uiCultureName = null, string? displayName = null)
+    {
+        ChangeCultureInternal(cultureName, uiCultureName, displayName);
+    }
+
+    private void ChangeCultureInternal(string cultureName, string? uiCultureName, string? displayName)
+    {
+        CultureName = Check.NotNullOrWhiteSpace(cultureName, nameof(cultureName));
+        UiCultureName = (!uiCultureName.IsNullOrWhiteSpace() ? uiCultureName : cultureName)!;
+        DisplayName = (!displayName.IsNullOrWhiteSpace() ? displayName : cultureName)!;
+        TwoLetterISOLanguageName = new CultureInfo(cultureName).TwoLetterISOLanguageName;
+    }
+}
+```
+
+`UiCultureName` exists so an application can present `tr-TR` content with an `en-US` formatter (or any combination); when omitted it mirrors `CultureName`.
+
+`ILanguageProvider` is the runtime read of "what languages does this app support **right now**?". The framework supplies a default that just returns `AbpLocalizationOptions.Languages`:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/ILanguageProvider.cs
+public interface ILanguageProvider
+{
+    Task<IReadOnlyList<LanguageInfo>> GetLanguagesAsync();
+}
+
+// DefaultLanguageProvider.cs
+public class DefaultLanguageProvider : ILanguageProvider, ITransientDependency
+{
+    protected AbpLocalizationOptions Options { get; }
+
+    public DefaultLanguageProvider(IOptions<AbpLocalizationOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public Task<IReadOnlyList<LanguageInfo>> GetLanguagesAsync()
+    {
+        return Task.FromResult((IReadOnlyList<LanguageInfo>)Options.Languages);
+    }
+}
+```
+
+The Language Management module replaces `DefaultLanguageProvider` with a database-backed implementation so admins can toggle languages without redeploying.
+
+### Adding a language
+
+Languages are configured the same way resources are — in `Configure<AbpLocalizationOptions>`, which follows the standard [options pattern](/core/options-and-configuration):
+
+```csharp
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Languages.Add(new LanguageInfo("en", "en", "English"));
+    options.Languages.Add(new LanguageInfo("tr", "tr", "Türkçe"));
+    options.Languages.Add(new LanguageInfo("zh-Hans", "zh-Hans", "简体中文"));
+});
+```
+
+## `IHasNameWithLocalizableDisplayName`
+
+A small mixin contract used by metadata types (`PermissionDefinition`, `FeatureDefinition`, `SettingDefinition`, `TemplateDefinition`) so generic UI code can iterate them and render their display names:
+
+```csharp
+public interface IHasNameWithLocalizableDisplayName
+{
+    string Name { get; }
+    ILocalizableString DisplayName { get; }
+}
+```
+
+The companion extension method short-circuits to `Name` when the localized lookup returns `ResourceNotFound`:
+
+```csharp
+public static string GetLocalizedDisplayName(
+    this IHasNameWithLocalizableDisplayName item,
+    IStringLocalizerFactory stringLocalizerFactory)
+{
+    var localized = item.DisplayName.Localize(stringLocalizerFactory);
+    return localized.ResourceNotFound ? item.Name : localized.Value;
+}
+```
+
+## Putting it together
+
+Most modules touch this package in exactly two places:
+
+```csharp
+// 1. Declaring a deferred name on a definition object.
+context.Add(
+    new PermissionDefinition(
+        "BookStore.Books.Delete",
+        displayName: LocalizableString.Create<BookStoreResource>("Permission:Books.Delete")
+    )
+);
+
+// 2. Reading "what languages do we offer?" to render a switcher.
+public class CultureMenuViewComponent : AbpViewComponent
+{
+    private readonly ILanguageProvider _languageProvider;
+
+    public CultureMenuViewComponent(ILanguageProvider languageProvider) =>
+        _languageProvider = languageProvider;
+
+    public async Task<IViewComponentResult> InvokeAsync()
+    {
+        var languages = await _languageProvider.GetLanguagesAsync();
+        return View(languages);
+    }
+}
+```
+
+Everything else — actually loading JSON files, building dictionaries, switching cultures, falling back — lives in [`Volo.Abp.Localization`](/localization/multi-lingual-objects).
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Resources and JSON loading" icon="database" href="/localization/multi-lingual-objects">
+    `AbpLocalizationOptions.Resources`, `JsonLocalizationDictionaryBuilder`, `AbpStringLocalizerFactory`, `IMultiLingualObject`.
+  </Card>
+  <Card title="Options & configuration" icon="sliders" href="/core/options-and-configuration">
+    How `Configure<AbpLocalizationOptions>` is wired through the modular options pattern.
+  </Card>
+  <Card title="Virtual file system" icon="folder-tree" href="/ui/virtual-file-system">
+    Where the JSON dictionaries live on disk and how `AddVirtualJson` resolves them.
+  </Card>
+  <Card title="Templates" icon="file-lines" href="/localization/text-templating">
+    `TemplateDefinition.DisplayName` is an `ILocalizableString` — the same deferred type covered here.
+  </Card>
+</CardGroup>

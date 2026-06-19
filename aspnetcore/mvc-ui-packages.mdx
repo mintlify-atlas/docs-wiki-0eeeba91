@@ -1,0 +1,183 @@
+---
+title: "MVC UI Packages — Bundle Contributors And install-libs"
+sidebarTitle: "UI Packages"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Packages — embedded bundle contributors for Bootstrap, jQuery, DataTables, plus AbpMvcLibsService and the install-libs CLI."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.Packages` is a thin packaging module: one `IBundleContributor` per popular front‑end library, plus the resource‑mapping data that tells the ABP CLI where to copy the files at build time. Combined with `AbpMvcLibsService` (in `Volo.Abp.AspNetCore.Mvc`) and the `abp install-libs` CLI command (in `Volo.Abp.Cli.Core`), it provides a complete "BYO npm package" experience for the MVC UI.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages/Volo/Abp/AspNetCore/Mvc/UI/Packages/`.
+
+## `AbpAspNetCoreMvcUiPackagesModule`
+
+The module ships under a `[DependsOn(typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule))]` declaration and registers an embedded virtual file set so all the contributor classes can resolve their pre‑shipped JS shims (small adapter files) without copying anything to `wwwroot` at build time.
+
+## Subfolders — one library each
+
+Each subfolder under the package's namespace contains a contributor pair (`<Name>ScriptContributor.cs` and `<Name>StyleContributor.cs` when both are needed) plus any pre‑shipped JS/CSS shim files declared as embedded resources:
+
+| Subfolder | Library | Typical use |
+| --- | --- | --- |
+| `Anchor/` | anchor.js | Smooth in‑page anchors. |
+| `Bootstrap/` | Bootstrap 5 | The default UI framework. |
+| `BootstrapDatepicker/` | bootstrap-datepicker | Date inputs in MVC UI. |
+| `BootstrapDaterangepicker/` | bootstrap-daterangepicker | Range pickers. |
+| `ChartJs/` | Chart.js | Dashboard charts. |
+| `Clipboard/` | clipboard.js | Copy‑to‑clipboard buttons. |
+| `CmsKit/` | CMS Kit module assets | Embedded JS for CMS Kit pages. |
+| `Codemirror/` | CodeMirror 5 | Source editor. |
+| `Core/` | `CoreScriptContributor`, `CoreStyleContributor` | The framework's `abp.js`, `abp.css`, `abp.utils` shim. Imported by every page bundle. |
+| `CropperJs/` | Cropper.js | Image cropping in profile pages. |
+| `DatatablesNet/` / `DatatablesNetBs4/` / `DatatablesNetBs5/` | DataTables + theme adapters | Default table component in MVC UI. |
+| `FlagIconCss/` | flag-icon-css | Language switcher flags. |
+| `FontAwesome/` | Font Awesome 6 | Icon set. |
+| `HighlightJs/` | highlight.js | Docs / blog code blocks. |
+| `JQuery/` | jQuery 3 | Base of all MVC UI scripts. |
+| `JQueryForm/`, `JQueryValidation/`, `JQueryValidationUnobtrusive/` | jQuery plugins | MVC validation. |
+| `JsTree/` | jsTree | Tree controls in tenant management etc. |
+| `Lodash/` | Lodash | Utility helpers used by `abp.utils`. |
+| `Luxon/`, `Moment/` | Luxon, Moment | Date utilities. |
+| `MalihuCustomScrollbar/` | jQuery.mCustomScrollbar | Custom scrollbars in side menus. |
+| `MarkdownIt/` | markdown-it | CMS Kit, blogs. |
+| `OwlCarousel/` | OwlCarousel2 | Carousel widget. |
+| `Popper/` | Popper.js | Bootstrap dropdowns / tooltips. |
+| `Prismjs/` | Prism.js | Alternative syntax highlighter. |
+| `QRCode/` | qrcode.js | Two‑factor enrollment QR. |
+| `Select2/` | Select2 | Searchable selects. |
+| `SignalR/` | `@microsoft/signalr` client | Browser bundle for SignalR hubs. |
+| `Slugify/` | slugify | Slug generation in admin forms. |
+| `StarRatingSvg/` | star-rating-svg | Rating widget. |
+| `SweetAlert2/` | SweetAlert2 | Confirmation modals — used by `abp.message`. |
+| `Timeago/` | timeago.js | Relative timestamps. |
+| `TuiEditor/` | Toast UI Editor | Rich text editor. |
+| `Uppy/` | Uppy | File upload UI. |
+| `Utils/` | `UtilsScriptContributor` | Generic `abp.utils.*` helpers. |
+| `VeeValidate/` | VeeValidate | For Vue‑based pages. |
+| `Vue/` | Vue 3 | Vue‑based widgets in admin pages. |
+| `Zxcvbn/` | zxcvbn | Password strength meter. |
+
+Every contributor class extends `BundleContributor` (from `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions`) and adds files under `/libs/<library>/...` to the bundle context. For example `JQueryScriptContributor.ConfigureBundle` adds `/libs/jquery/jquery.js`. Other contributors `AddDependency<JQueryScriptContributor>()` so the bundler emits jQuery first.
+
+## Where the files come from — `libs.config`
+
+ABP does not ship the upstream `.js` / `.css` files inside the NuGet package. Instead each library has a mapping entry that tells the CLI to copy from `node_modules` to `wwwroot/libs`. The mappings live in two places:
+
+| File | Where |
+| --- | --- |
+| `abp.resourcemapping.js` | At the root of any MVC UI host project — e.g. `modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/abp.resourcemapping.js`. |
+| Resource mapping inside each `Volo.Abp.AspNetCore.Mvc.UI.Packages.*` NuGet | Aggregated by the CLI at install time. |
+
+Example file:
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    aliases: {
+        "@node_modules": "./node_modules",
+        "@libs": "./wwwroot/libs"
+    },
+    clean: [
+        "@libs"
+    ],
+    mappings: {
+        "@node_modules/highlight.js/**/*.*": "@libs/highlight.js/"
+    }
+}
+```
+
+The CLI reads this file, plus mappings contributed by every depended ABP package, and copies the matching files into `wwwroot/libs/` — replacing the historical "Bower restore" step.
+
+## `AbpInstallLibsService` (CLI side)
+
+The CLI command lives at `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/InstallLibsCommand.cs`. It delegates to `IInstallLibsService` (interface in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/IInstallLibsService.cs`) whose default implementation is `InstallLibsService` (`framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs`).
+
+The flow is:
+
+<Steps>
+  <Step title="Discover MVC UI projects">
+    `InstallLibsService` scans the solution for projects that reference any `Volo.Abp.AspNetCore.Mvc.UI.*` package.
+  </Step>
+  <Step title="Run yarn / npm install">
+    For each such project the CLI runs `yarn` (preferred) or `npm install` against the project's `package.json` to populate `node_modules/`.
+  </Step>
+  <Step title="Execute the mapper">
+    The CLI then invokes `gulp` against `abp.resourcemapping.js`, which copies files according to the `mappings` dictionary.
+  </Step>
+  <Step title="Result">
+    `wwwroot/libs/` is repopulated. The MVC bundle contributors expect files at `/libs/<name>/<file>`, which now exist on disk and can be served by `UseStaticFiles()`.
+  </Step>
+</Steps>
+
+Invocation:
+
+```bash
+abp install-libs
+```
+
+This is part of every solution's first run instructions — without it, the bundle contributors point at missing files.
+
+## `AbpMvcLibsService` — the "missing libs" error page
+
+When the MVC UI starts up with `AbpMvcLibsOptions.CheckLibs = true`, the framework wires a startup middleware that probes for the existence of a few well‑known files (e.g. `wwwroot/libs/jquery/jquery.js`). If they are missing, browsers get a friendly error page instead of an HTTP 500.
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Libs/AbpMvcLibsService.cs
+public class AbpMvcLibsService : IAbpMvcLibsService, ITransientDependency
+{
+    private Task<bool>? _checkLibsTask;
+
+    public virtual void CheckLibs(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider.GetRequiredService<IOptions<AbpMvcLibsOptions>>().Value;
+        if (options.CheckLibs)
+        {
+            var app = context.GetApplicationBuilderOrNull();
+            if (app == null)
+            {
+                var logger = context.ServiceProvider.GetRequiredService<ILogger<AbpMvcLibsService>>();
+                logger.LogWarning($"The {nameof(IApplicationBuilder)} is not available. The 'CheckLibs' feature is disabled!");
+                return;
+            }
+
+            app.Use(async (httpContext, next) =>
+            {
+                if (!httpContext.Request.IsAjax() && !await CheckLibsAsyncOnceAsync(httpContext))
+                {
+                    var errorPage = new AbpMvcLibsErrorPage();
+                    await errorPage.ExecuteAsync(httpContext);
+                    return;
+                }
+                await next(httpContext);
+            });
+        }
+    }
+}
+```
+
+`AbpMvcLibsOptions`:
+
+```csharp
+public class AbpMvcLibsOptions
+{
+    public bool CheckLibs { get; set; }
+}
+```
+
+`AbpMvcLibsErrorPage.cshtml` (sitting next to the service) renders a styled page that says "Client‑side libraries are not installed yet. Run `abp install-libs` to install them."
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="UI Bundling" icon="boxes-stacked" href="/aspnetcore/mvc-ui-bundling">
+    The contributors registered by this package are consumed by `IBundleManager` and the `<abp-script-bundle>` / `<abp-style-bundle>` tag helpers.
+  </Card>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    `AbpMvcLibsService.CheckLibs` is invoked from `AbpAspNetCoreMvcModule.OnApplicationInitialization`.
+  </Card>
+  <Card title="UI Widgets" icon="grip" href="/aspnetcore/mvc-ui-widgets">
+    Widgets reuse the same contributor types via `WidgetAttribute.ScriptTypes` / `StyleTypes`.
+  </Card>
+  <Card title="Modularity" icon="diagram-project" href="/core/modularity">
+    Each library is its own package the host depends on; the `[DependsOn]` graph propagates contributors and resource mappings.
+  </Card>
+</CardGroup>

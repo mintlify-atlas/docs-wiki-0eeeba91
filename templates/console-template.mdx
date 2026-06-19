@@ -1,0 +1,332 @@
+---
+title: "Console Template"
+description: "Tour of templates/console/ — the minimal console host that bootstraps an ABP application and runs a hosted service."
+---
+
+The `console` template under [`templates/console/`](https://github.com/abpframework/abp/tree/dev/templates/console) is the **smallest viable ABP host**. It demonstrates how to bring up the ABP runtime (modularity, DI, configuration, Serilog, Autofac) inside a generic .NET console application — no web server, no UI. It's the right starting point for:
+
+- Batch jobs and ETL workers.
+- Background processors that consume distributed events.
+- CLI tools that need ABP's DI and module composition.
+- Smoke tests for an ABP module's wiring.
+
+Generate it with:
+
+```bash
+abp new Acme.Worker -t console
+```
+
+## Solution layout
+
+```
+templates/console/
+├── MyCompanyName.MyProjectName.slnx     # Solution
+├── common.props                         # MSBuild base
+└── src/
+    └── MyCompanyName.MyProjectName/
+        ├── HelloWorldService.cs         # Sample transient service
+        ├── MyCompanyName.MyProjectName.csproj
+        ├── MyProjectNameHostedService.cs # IHostedService that calls the service
+        ├── MyProjectNameModule.cs       # The ABP module
+        ├── Program.cs                   # Bootstrap
+        ├── Properties/
+        └── appsettings.json
+```
+
+One project, six files, no test project. Add your own as the worker grows.
+
+## `Program.cs` — the bootstrap
+
+The console template is the only host that uses `Host.CreateApplicationBuilder` (the new .NET generic-host builder) instead of `WebApplication.CreateBuilder`. The five steps are still the same as every other ABP host: configuration, Autofac, Serilog, application module, run.
+
+```csharp templates/console/src/MyCompanyName.MyProjectName/Program.cs
+public async static Task<int> Main(string[] args)
+{
+    Log.Logger = new LoggerConfiguration()
+#if DEBUG
+        .MinimumLevel.Debug()
+#else
+        .MinimumLevel.Information()
+#endif
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+        .Enrich.FromLogContext()
+        .WriteTo.Async(c => c.File("Logs/logs.txt"))
+        .WriteTo.Async(c => c.Console())
+        .CreateLogger();
+
+    try
+    {
+        Log.Information("Starting console host.");
+
+        var builder = Host.CreateApplicationBuilder(args);
+
+        builder.Configuration.AddAppSettingsSecretsJson();
+        builder.Logging.ClearProviders().AddSerilog();
+
+        builder.ConfigureContainer(builder.Services.AddAutofacServiceProviderFactory());
+
+        builder.Services.AddHostedService<MyProjectNameHostedService>();
+
+        await builder.Services.AddApplicationAsync<MyProjectNameModule>();
+
+        var host = builder.Build();
+
+        await host.InitializeAsync();
+
+        await host.RunAsync();
+
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        if (ex is HostAbortedException)
+        {
+            throw;
+        }
+
+        Log.Fatal(ex, "Host terminated unexpectedly!");
+        return 1;
+    }
+    finally
+    {
+        Log.CloseAndFlush();
+    }
+}
+```
+
+Step by step:
+
+<Steps>
+  <Step title="Serilog">
+    Same Serilog configuration the layered app template uses, minus the `Microsoft.EntityFrameworkCore` override (this template has no EF). Logs go to `Logs/logs.txt` and the console.
+  </Step>
+  <Step title="Generic host builder">
+    `Host.CreateApplicationBuilder(args)` returns an `IHostApplicationBuilder` — the unified builder API shared with Web hosts.
+  </Step>
+  <Step title="appsettings.secrets.json">
+    `AddAppSettingsSecretsJson()` is an ABP extension that conditionally loads `appsettings.secrets.json` (gitignored). Convenient for local secrets without needing user-secrets.
+  </Step>
+  <Step title="Logging">
+    `ClearProviders().AddSerilog()` removes the default console logger and replaces it with Serilog so module logs go to the same sinks.
+  </Step>
+  <Step title="Autofac">
+    `ConfigureContainer(builder.Services.AddAutofacServiceProviderFactory())` swaps the DI container. ABP needs Autofac for module composition, property injection, and certain advanced lifecycles.
+  </Step>
+  <Step title="Hosted service">
+    `AddHostedService<MyProjectNameHostedService>()` — the work loop. You can register more `IHostedService`s for parallel work.
+  </Step>
+  <Step title="Application module">
+    `await builder.Services.AddApplicationAsync<MyProjectNameModule>()` — loads the dependency graph rooted at `MyProjectNameModule` and runs `ConfigureServicesAsync` on every module.
+  </Step>
+  <Step title="Initialize + Run">
+    `host.InitializeAsync()` runs `OnApplicationInitializationAsync` on every module. `host.RunAsync()` enters the standard generic-host wait loop — hosted services run until SIGINT/SIGTERM.
+  </Step>
+</Steps>
+
+<Info>
+Compare with `WebApplication.CreateBuilder(args)` + `builder.AddApplicationAsync<TModule>()` in the layered template. The console version is a few lines longer because there's no `IHostApplicationBuilder` extension that bundles Autofac + Serilog + AppSettingsSecrets in one call — the framework's web-host extension is `WebApplicationBuilderExtensions.AddApplicationAsync`.
+</Info>
+
+## `MyProjectNameHostedService.cs` — the work loop
+
+The template ships a `BackgroundService`-style class that runs once and exits:
+
+```csharp templates/console/src/MyCompanyName.MyProjectName/MyProjectNameHostedService.cs
+public class MyProjectNameHostedService : IHostedService
+{
+    private readonly HelloWorldService _helloWorldService;
+
+    public MyProjectNameHostedService(HelloWorldService helloWorldService)
+    {
+        _helloWorldService = helloWorldService;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await _helloWorldService.SayHelloAsync();
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+Because it implements `IHostedService` (not `BackgroundService`), the host returns from `StartAsync` and then stays alive in `host.RunAsync()` until something signals it to stop. For a long-running worker, swap to `BackgroundService` and override `ExecuteAsync`:
+
+```csharp
+public class WorkerService : BackgroundService
+{
+    private readonly HelloWorldService _service;
+    public WorkerService(HelloWorldService service) => _service = service;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await _service.SayHelloAsync();
+            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+        }
+    }
+}
+```
+
+## `HelloWorldService.cs` — a transient ABP service
+
+The dependency-injected service the hosted service consumes:
+
+```csharp templates/console/src/MyCompanyName.MyProjectName/HelloWorldService.cs
+public class HelloWorldService : ITransientDependency
+{
+    public ILogger<HelloWorldService> Logger { get; set; }
+
+    public HelloWorldService()
+    {
+        Logger = NullLogger<HelloWorldService>.Instance;
+    }
+
+    public Task SayHelloAsync()
+    {
+        Logger.LogInformation("Hello World!");
+        return Task.CompletedTask;
+    }
+}
+```
+
+Two ABP idioms in three lines:
+
+1. **`ITransientDependency`** — implementing this marker interface auto-registers the class as transient. No `services.AddTransient<HelloWorldService>()` needed.
+2. **Property injection of `ILogger<T>`** — `public ILogger<HelloWorldService> Logger { get; set; }` is filled in by Autofac after construction. The `NullLogger<T>.Instance` default lets you `new` the class up in tests without DI.
+
+## `MyProjectNameModule.cs` — the ABP module
+
+The console template's module is intentionally tiny — it shows logging from `OnApplicationInitializationAsync` and reads a setting from `appsettings.json`:
+
+```csharp templates/console/src/MyCompanyName.MyProjectName/MyProjectNameModule.cs
+[DependsOn(
+    typeof(AbpAutofacModule)
+)]
+public class MyProjectNameModule : AbpModule
+{
+    public override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        var logger = context.ServiceProvider.GetRequiredService<ILogger<MyProjectNameModule>>();
+        var configuration = context.ServiceProvider.GetRequiredService<IConfiguration>();
+        logger.LogInformation($"MySettingName => {configuration["MySettingName"]}");
+
+        var hostEnvironment = context.ServiceProvider.GetRequiredService<IHostEnvironment>();
+        logger.LogInformation($"EnvironmentName => {hostEnvironment.EnvironmentName}");
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+The single `[DependsOn(typeof(AbpAutofacModule))]` is what lets `Host.CreateApplicationBuilder` participate in the ABP module pipeline. Add more `[DependsOn]` entries as you bring in features:
+
+```csharp
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpEntityFrameworkCoreSqlServerModule),
+    typeof(AbpBackgroundJobsHangfireModule),
+    typeof(AbpEventBusRabbitMqModule)
+)]
+public class MyProjectNameModule : AbpModule { … }
+```
+
+## `appsettings.json`
+
+Just one key out of the box — the setting the module reads:
+
+```json templates/console/src/MyCompanyName.MyProjectName/appsettings.json
+{
+  "MySettingName": "MySettingValue"
+}
+```
+
+## `MyCompanyName.MyProjectName.csproj`
+
+The csproj is also minimal — it references `Volo.Abp.Autofac` and the Serilog sinks:
+
+```xml templates/console/src/MyCompanyName.MyProjectName/MyCompanyName.MyProjectName.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <Import Project="..\..\common.props" />
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\..\framework\src\Volo.Abp.Autofac\Volo.Abp.Autofac.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+      <PackageReference Include="Serilog.Extensions.Hosting" Version="9.0.0" />
+      <PackageReference Include="Serilog.Extensions.Logging" Version="9.0.2" />
+      <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
+      <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+      <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    </ItemGroup>
+    /* … appsettings copy rules … */
+</Project>
+```
+
+<Info>
+In the framework repo the csproj uses `<ProjectReference>` to point at `Volo.Abp.Autofac` — the *generated* solution gets a `<PackageReference Include="Volo.Abp.Autofac" Version="…" />` instead. Same library, different binding.
+</Info>
+
+## Running it
+
+```bash
+dotnet run --project src/Acme.Worker
+```
+
+Expected output:
+
+```text
+[12:34:56 INF] Starting console host.
+[12:34:57 INF] MySettingName => MySettingValue
+[12:34:57 INF] EnvironmentName => Production
+[12:34:57 INF] Hello World!
+```
+
+Press `Ctrl+C` to exit; `host.RunAsync` honours the cancellation, modules run their shutdown hooks, Serilog flushes, and `Main` returns `0`.
+
+## Extending the template
+
+<CardGroup cols={2}>
+  <Card title="Add EF Core" icon="database">
+    `[DependsOn(typeof(AbpEntityFrameworkCoreSqlServerModule))]`, add a `DbContext`, configure the connection string, and the rest of ABP's EF infrastructure is yours.
+  </Card>
+  <Card title="Add the distributed event bus" icon="bell">
+    `[DependsOn(typeof(AbpEventBusRabbitMqModule))]` + connection settings — instant subscriber for distributed events from other ABP apps.
+  </Card>
+  <Card title="Add background jobs" icon="clock">
+    Pull in `Volo.Abp.BackgroundJobs.Hangfire` (or Quartz, RabbitMQ) and run scheduled work without bringing up a web host.
+  </Card>
+  <Card title="Depend on a module" icon="puzzle-piece">
+    Reference a [module template](/templates/module-template) build, add its module to `[DependsOn]`, and your worker can call its application services directly.
+  </Card>
+</CardGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    `-t console` flags and combinations.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    `dotnet build`, publish, container packaging.
+  </Card>
+  <Card title="Module template" icon="puzzle-piece" href="/templates/module-template">
+    Build a reusable module this worker can consume.
+  </Card>
+  <Card title="Layered app" icon="layer-group" href="/templates/app-template-aspnet-core">
+    Compare with a full multi-host application.
+  </Card>
+</CardGroup>

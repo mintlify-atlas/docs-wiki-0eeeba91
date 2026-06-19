@@ -1,0 +1,302 @@
+---
+title: "@abp/ng.oauth"
+description: "Plugs angular-oauth2-oidc into ABP's AuthService — chooses between authorization code flow and password grant based on environment.oAuthConfig."
+---
+
+`@abp/ng.oauth` (source: `npm/ng-packs/packages/oauth/`) is ABP's OpenID Connect integration. It wires **[`angular-oauth2-oidc`](https://github.com/manfredsteyer/angular-oauth2-oidc)** into the abstract `AuthService` declared by `@abp/ng.core`, decides at runtime whether to use the **authorization code flow** or the **resource‑owner password flow**, and ships an HTTP interceptor that attaches a Bearer token, the tenant header and the current culture to every API call.
+
+```text
+npm/ng-packs/packages/oauth/src/lib/
+├── guards/                    AbpOAuthGuard, abpOAuthGuard
+├── handlers/                  OAuthConfigurationHandler (refresh tokens, listen to events)
+├── interceptors/              OAuthApiInterceptor
+├── providers/                 provideAbpOAuth, NavigateToManageProfileProvider
+├── services/
+│   ├── oauth.service.ts                AbpOAuthService (implements IAuthService)
+│   ├── browser-token-storage.service.ts
+│   ├── server-token-storage.service.ts (SSR)
+│   ├── remember-me.service.ts
+│   └── oauth-error-filter.service.ts
+├── strategies/
+│   ├── auth-flow-strategy.ts            AuthFlowStrategy (base)
+│   ├── auth-code-flow-strategy.ts       AuthCodeFlowStrategy
+│   └── auth-password-flow-strategy.ts   AuthPasswordFlowStrategy
+├── tokens/                              AUTH_FLOW_STRATEGY
+├── utils/                               isTokenExpired, clearOAuthStorage, pipeToLogin
+└── oauth.module.ts
+```
+
+It depends on `@abp/ng.core` and `angular-oauth2-oidc`.
+
+## `provideAbpOAuth`
+
+The single setup call — added once to `app.config.ts`:
+
+```ts oauth/src/lib/providers/oauth-module-config.provider.ts
+export function provideAbpOAuth() {
+  const providers = [
+    { provide: AuthService, useClass: AbpOAuthService },
+    { provide: AuthGuard, useClass: AbpOAuthGuard },
+    { provide: authGuard, useValue: abpOAuthGuard },
+    { provide: asyncAuthGuard, useValue: asyncAbpOAuthGuard },
+    { provide: ApiInterceptor, useClass: OAuthApiInterceptor },
+    { provide: PIPE_TO_LOGIN_FN_KEY, useValue: pipeToLogin },
+    { provide: CHECK_AUTHENTICATION_STATE_FN_KEY, useValue: checkAccessToken },
+    { provide: HTTP_INTERCEPTORS, useExisting: ApiInterceptor, multi: true },
+    NavigateToManageProfileProvider,
+    provideAppInitializer(() => { inject(OAuthConfigurationHandler); }),
+    // …
+  ];
+  return makeEnvironmentProviders(providers);
+}
+```
+
+It replaces five providers from `@abp/ng.core`:
+
+| `@abp/ng.core` default | Replacement | Purpose |
+| --- | --- | --- |
+| `AuthService` (stub) | `AbpOAuthService` | Implements `IAuthService` on top of `angular-oauth2-oidc`. |
+| `AuthGuard` / `authGuard` / `asyncAuthGuard` | `AbpOAuthGuard` / `abpOAuthGuard` / `asyncAbpOAuthGuard` | Activate routes only with a valid access token. |
+| `ApiInterceptor` | `OAuthApiInterceptor` | Adds Bearer / tenant / language headers. |
+| `PIPE_TO_LOGIN_FN_KEY` | `pipeToLogin` | Function used by `@abp/ng.account` to chain login navigation. |
+| `CHECK_AUTHENTICATION_STATE_FN_KEY` | `checkAccessToken` | Resolves whether the user is authenticated. |
+
+`NavigateToManageProfileProvider` registers the "Manage your profile" entry that the theme renders under the user menu — when clicked it triggers `oAuthService.initLoginFlowInPopup()` against the IDS `account/manage` page (or routes to `/account/manage` for the local Account module).
+
+## `AbpOAuthService` — strategy router
+
+```ts oauth/src/lib/services/oauth.service.ts
+@Injectable({ providedIn: 'root' })
+export class AbpOAuthService implements IAuthService {
+  protected injector = inject(Injector);
+  private strategy!: AuthFlowStrategy;
+  private readonly oAuthService: OAuthService;
+
+  constructor() {
+    this.oAuthService = this.injector.get(OAuthService);
+  }
+
+  async init() {
+    const environmentService = this.injector.get(EnvironmentService);
+
+    const result$ = environmentService.getEnvironment$().pipe(
+      map(env => env?.oAuthConfig),
+      filter(Boolean),
+      tap(oAuthConfig => {
+        this.strategy =
+          oAuthConfig.responseType === 'code'
+            ? AUTH_FLOW_STRATEGY.Code(this.injector)
+            : AUTH_FLOW_STRATEGY.Password(this.injector);
+      }),
+      switchMap(() => from(this.strategy.init())),
+      take(1),
+    );
+
+    return await lastValueFrom(result$);
+  }
+
+  logout(queryParams?: Params): Observable<any> {
+    if (!this.strategy) return EMPTY;
+    return this.strategy.logout(queryParams);
+  }
+
+  navigateToLogin(queryParams?: Params) { this.strategy.navigateToLogin(queryParams); }
+  login(params: LoginParams) { return this.strategy.login(params); }
+
+  get isAuthenticated(): boolean {
+    return this.oAuthService.hasValidAccessToken();
+  }
+}
+```
+
+Notice the key decision: `responseType === 'code'` ⇒ authorization code flow, otherwise password grant. The environment from your `environment.ts` controls which strategy is in play (see [`/angular/core`](/angular/core#environmentservice)).
+
+## `AuthCodeFlowStrategy`
+
+```ts oauth/src/lib/strategies/auth-code-flow-strategy.ts
+export class AuthCodeFlowStrategy extends AuthFlowStrategy {
+  readonly isInternalAuth = false;
+  private platformId: object;
+  protected appStartedWithSSR: boolean;
+  protected document: Document;
+
+  constructor(protected injector: Injector) {
+    super(injector);
+    this.platformId = injector.get(PLATFORM_ID);
+    this.appStartedWithSSR = injector.get(APP_STARTED_WITH_SSR);
+    this.document = injector.get(DOCUMENT);
+  }
+
+  async init() {
+    this.checkRememberMeOption();
+    this.listenToTokenReceived();
+    if (!this.appStartedWithSSR && isPlatformBrowser(this.platformId)) {
+      return super.init()
+        .then(() => this.oAuthService.tryLogin().catch(noop))
+        .then(() => { this.oAuthService.setupAutomaticSilentRefresh(); });
+    }
+  }
+
+  navigateToLogin(queryParams?: Params) {
+    if (isPlatformBrowser(this.platformId)) {
+      if (this.appStartedWithSSR) {
+        this.document.defaultView?.location.replace('/authorize');
+      } else {
+        let additionalState = '';
+        if (queryParams?.returnUrl) { additionalState = queryParams.returnUrl; }
+        const cultureParams = this.getCultureParams(queryParams);
+        this.oAuthService.initCodeFlow(additionalState, cultureParams);
+      }
+    }
+  }
+
+  logout(queryParams?: Params) {
+    this.rememberMeService.remove();
+    if (this.appStartedWithSSR) {
+      this.document.defaultView?.location.replace('/logout');
+    } else {
+      if (queryParams?.noRedirectToLogoutUrl) {
+        this.router.navigate(['/']);
+        return from(this.oAuthService.revokeTokenAndLogout(true));
+      }
+      return from(this.oAuthService.revokeTokenAndLogout(this.getCultureParams(queryParams)));
+    }
+  }
+
+  login(queryParams?: Params) {
+    if (isPlatformBrowser(this.platformId)) {
+      this.oAuthService.initCodeFlow('', this.getCultureParams(queryParams));
+      return of(null);
+    }
+  }
+}
+```
+
+What it does:
+
+- `init()` calls `oAuthService.tryLogin()` to consume an `?code=` redirect, then arms automatic silent refresh via the hidden iframe trick.
+- `listenToTokenReceived()` reacts to the first `token_received` event by extracting `ui-culture` from the URL and clearing it from the address bar.
+- `navigateToLogin()` is what `AuthGuard` and `LoginComponent` call when a user without a valid token tries to enter a protected route. It bootstraps the OIDC code‑flow redirect.
+- `logout()` calls `oAuthService.revokeTokenAndLogout(...)` which both revokes the refresh token and signs the user out on the IDS.
+
+The matching backend setup is documented in [Authenticating with OpenID Connect](/aspnetcore/auth-openidconnect) — the issuer, allowed scopes, redirect URIs and PKCE settings must match what's in `environment.oAuthConfig`.
+
+`AuthFlowStrategy` base class (`strategies/auth-flow-strategy.ts`) holds the shared infrastructure:
+
+```ts oauth/src/lib/strategies/auth-flow-strategy.ts
+export abstract class AuthFlowStrategy {
+  abstract readonly isInternalAuth: boolean;
+  protected httpErrorReporter: HttpErrorReporterService;
+  protected environment: EnvironmentService;
+  protected configState: ConfigStateService;
+  protected oAuthService: OAuthService2;
+  protected oAuthConfig!: AuthConfig;
+  protected sessionState: SessionStateService;
+  protected localStorageService: AbpLocalStorageService;
+  protected rememberMeService: RememberMeService;
+  protected windowService: AbpWindowService;
+  protected tenantKey: string;
+  protected router: Router;
+
+  abstract checkIfInternalAuth(queryParams?: Params): boolean;
+  abstract navigateToLogin(queryParams?: Params): void;
+  abstract logout(queryParams?: Params): Observable<any>;
+  abstract login(params?: LoginParams | Params): Observable<any>;
+}
+```
+
+## `AuthPasswordFlowStrategy`
+
+The password‑grant variant — `isInternalAuth = true`. `LoginComponent` from `@abp/ng.account` renders a username/password form and calls `AbpOAuthService.login({ username, password, rememberMe, redirectUrl })`. That delegates to `AuthPasswordFlowStrategy.login(...)` which POSTs to the IDS token endpoint with `grant_type=password`.
+
+While it's still supported, the password grant is being deprecated by the OAuth 2.1 working group — prefer the code flow for new deployments.
+
+## `OAuthApiInterceptor`
+
+```ts oauth/src/lib/interceptors/oauth-api.interceptor.ts
+@Injectable({ providedIn: 'root' })
+export class OAuthApiInterceptor implements IApiInterceptor {
+  private oAuthService = inject(OAuthService);
+  private sessionState = inject(SessionStateService);
+  private httpWaitService = inject(HttpWaitService);
+  private tenantKey = inject(TENANT_KEY);
+
+  intercept(request: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    this.httpWaitService.addRequest(request);
+    const isExternalRequest = request.context?.get(IS_EXTERNAL_REQUEST);
+    const newRequest = isExternalRequest
+      ? request
+      : request.clone({ setHeaders: this.getAdditionalHeaders(request.headers) });
+
+    return next
+      .handle(newRequest)
+      .pipe(finalize(() => this.httpWaitService.deleteRequest(request)));
+  }
+
+  getAdditionalHeaders(existingHeaders?: HttpHeaders) {
+    const headers = {} as any;
+    const token = this.oAuthService.getAccessToken();
+    // Authorization, __tenant, culture headers are added here
+  }
+}
+```
+
+Behaviour:
+
+- Skips header injection when the caller set `IS_EXTERNAL_REQUEST` context (used by `ExternalHttpClient`).
+- Adds `Authorization: Bearer <token>` from `OAuthService.getAccessToken()`.
+- Adds the multi‑tenant header (`__tenant` by default, configurable via the `TENANT_KEY` token).
+- Tracks every in‑flight request in `HttpWaitService`, so the loader bar from `@abp/ng.theme.shared` shows during ABP calls.
+
+## Wiring it up
+
+```ts app.config.ts
+import { provideAbpCore, withOptions } from '@abp/ng.core';
+import { provideAbpOAuth } from '@abp/ng.oauth';
+import { provideAbpThemeShared } from '@abp/ng.theme.shared';
+import { provideThemeBasicConfig } from '@abp/ng.theme.basic/config';
+import { environment } from '../environments/environment';
+
+export const appConfig = {
+  providers: [
+    provideAbpCore(withOptions({ environment })),
+    provideAbpOAuth(),
+    provideAbpThemeShared(),
+    provideThemeBasicConfig(),
+  ],
+};
+```
+
+`environment.oAuthConfig`:
+
+```ts environments/environment.ts
+export const environment = {
+  oAuthConfig: {
+    issuer: 'https://localhost:44305/',
+    clientId: 'MyApp_App',
+    redirectUri: 'http://localhost:4200',
+    responseType: 'code',
+    scope: 'offline_access MyApp',
+  },
+  // …
+};
+```
+
+`responseType: 'code'` ⇒ code flow with PKCE. Switching to `responseType: 'password'` selects the password grant strategy.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Authenticating with OpenID Connect" href="/aspnetcore/auth-openidconnect" icon="lock">
+    Backend setup — IdentityServer / OpenIddict configuration, allowed scopes, redirect URIs.
+  </Card>
+  <Card title="@abp/ng.core" href="/angular/core" icon="cube">
+    Defines `AuthService`, `ApiInterceptor`, `EnvironmentService` and `SessionStateService` that this package builds on.
+  </Card>
+  <Card title="@abp/ng.account" href="/angular/account" icon="user">
+    `LoginComponent` calls `AuthService.login` — which is `AbpOAuthService.login` after this package is added.
+  </Card>
+  <Card title="@abp/ng.account.core" href="/angular/account-core" icon="user-gear">
+    Headless services that complement the UI when you build a custom login experience.
+  </Card>
+</CardGroup>

@@ -1,0 +1,681 @@
+---
+title: "abp switch-to-*, update, suite, prompt, help, get-source, list-*, generate-razor-page, create-migration-and-run-migrator, clear-download-cache"
+description: "The smaller commands in framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/. Channel switchers (preview/stable/nightly/prerc/local), version updates, Suite installer, the REPL, help, source download, listings, hidden internals."
+---
+
+This page catalogues the commands that don't have a dedicated page. Each subsection links the `Name` constant, the file path, the dependencies it pulls in, and the exact `ExecuteAsync` body so you can see what the command does without leaving the docs.
+
+<Info>
+All sources live in [`framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands). The channel switchers also depend on [`Volo/Abp/Cli/ProjectModification/PackagePreviewSwitcher.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectModification/PackagePreviewSwitcher.cs). Version metadata uses [`Volo/Abp/Cli/Version/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version).
+</Info>
+
+## Channel switchers
+
+All four switchers are 40-line wrappers around `PackagePreviewSwitcher`. They differ only in the method they call.
+
+### `SwitchToPreviewCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SwitchToPreviewCommand.cs
+public class SwitchToPreviewCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "switch-to-preview";
+
+    private readonly PackagePreviewSwitcher _packagePreviewSwitcher;
+
+    public SwitchToPreviewCommand(PackagePreviewSwitcher packagePreviewSwitcher)
+    {
+        _packagePreviewSwitcher = packagePreviewSwitcher;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        await _packagePreviewSwitcher.SwitchToPreview(commandLineArgs);
+    }
+    // ... usage + GetShortDescription "Switches packages to preview ABP version." ...
+}
+```
+
+### `SwitchToStableCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SwitchToStableCommand.cs
+public class SwitchToStableCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "switch-to-stable";
+
+    private readonly PackagePreviewSwitcher _packagePreviewSwitcher;
+
+    public SwitchToStableCommand(PackagePreviewSwitcher packagePreviewSwitcher)
+    {
+        _packagePreviewSwitcher = packagePreviewSwitcher;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        await _packagePreviewSwitcher.SwitchToStable(commandLineArgs);
+    }
+    // ... GetShortDescription "Switches packages to stable ABP version from preview version." ...
+}
+```
+
+### `SwitchToNightlyCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SwitchToNightlyCommand.cs
+public class SwitchToNightlyCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "switch-to-nightly";
+
+    private readonly PackagePreviewSwitcher _packagePreviewSwitcher;
+
+    public SwitchToNightlyCommand(PackagePreviewSwitcher packagePreviewSwitcher)
+    {
+        _packagePreviewSwitcher = packagePreviewSwitcher;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        await _packagePreviewSwitcher.SwitchToNightlyPreview(commandLineArgs);
+    }
+    // ... GetShortDescription "Switches packages to nightly preview ABP version." ...
+}
+```
+
+### `SwitchToPreRcCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SwitchToPreRcCommand.cs
+public class SwitchToPreRcCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "switch-to-prerc";
+
+    private readonly PackagePreviewSwitcher _packagePreviewSwitcher;
+    // ...
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        await _packagePreviewSwitcher.SwitchToPreRc(commandLineArgs);
+    }
+    // ... GetShortDescription "Switches npm packages to pre-rc ABP version." ...
+}
+```
+
+What `PackagePreviewSwitcher` actually does: walks every `*.csproj` / `package.json` under `-d|--directory` (defaults to current directory), finds the version tags of every `Volo.Abp.*` reference, and rewrites them to the target channel's latest version. It also updates `NuGet.Config` to point at the right feed (myget for nightly, nuget.abp.io for stable). See [project-modification](/cli/project-modification#packagepreviewswitcher).
+
+| Channel | Target version | NuGet source |
+| --- | --- | --- |
+| `stable` | latest released (no prerelease tag) | `nuget.abp.io` |
+| `preview` | latest including `-rc.*` | `nuget.abp.io` |
+| `prerc` | latest `-preview` (NPM only — the npm packages publish under `next` tag) | npmjs |
+| `nightly` | latest from the `abp-nightly` MyGet feed | `myget.org/F/abp-nightly` |
+
+### `SwitchToLocal`
+
+This one is different. It rewrites `<PackageReference>` entries to `<ProjectReference>`s pointing at a local checkout of the abp repo:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SwitchToLocalCommand.cs
+public class SwitchToLocal : IConsoleCommand, ITransientDependency
+{
+    private readonly LocalReferenceConverter _localReferenceConverter;
+    public const string Name = "switch-to-local";
+
+    public ILogger<SwitchToLocal> Logger { get; set; }
+
+    public SwitchToLocal(LocalReferenceConverter localReferenceConverter)
+    {
+        _localReferenceConverter = localReferenceConverter;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var workingDirectory = GetWorkingDirectory(commandLineArgs) ?? Directory.GetCurrentDirectory();
+
+        if (!Directory.Exists(workingDirectory))
+        {
+            throw new CliUsageException(
+                "Specified directory does not exist." +
+                Environment.NewLine + Environment.NewLine +
+                GetUsageInfo()
+            );
+        }
+
+        await _localReferenceConverter.ConvertAsync(workingDirectory, GetPaths(commandLineArgs));
+    }
+
+    private List<string> GetPaths(CommandLineArgs commandLineArgs)
+    {
+        var paths = commandLineArgs.Options.GetOrNull(
+            Options.LocalPaths.Short,
+            Options.LocalPaths.Long
+        );
+
+        if (paths == null)
+        {
+            throw new CliUsageException(
+                "Local paths are not specified!" +
+                Environment.NewLine + Environment.NewLine +
+                GetUsageInfo()
+            );
+        }
+
+        return paths.Split("|").Select(x=> x.Trim()).ToList();
+    }
+    // ...
+}
+```
+
+`-p|--paths` is **required** and supports a pipe-separated list (`"D:\Github\abp|D:\Github\volo"`) so you can target both the open-source `abp` repo and the commercial `volo` repo at once. See [project-modification — LocalReferenceConverter](/cli/project-modification#localreferenceconverter).
+
+## `abp update` — `UpdateCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/UpdateCommand.cs
+public class UpdateCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "update";
+
+    public ILogger<UpdateCommand> Logger { get; set; }
+
+    private readonly VoloNugetPackagesVersionUpdater _nugetPackagesVersionUpdater;
+    private readonly NpmPackagesUpdater _npmPackagesUpdater;
+
+    public UpdateCommand(VoloNugetPackagesVersionUpdater nugetPackagesVersionUpdater,
+        NpmPackagesUpdater npmPackagesUpdater)
+    {
+        _nugetPackagesVersionUpdater = nugetPackagesVersionUpdater;
+        _npmPackagesUpdater = npmPackagesUpdater;
+
+        Logger = NullLogger<UpdateCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var updateNpm = commandLineArgs.Options.ContainsKey(Options.Packages.Npm);
+        var updateNuget = commandLineArgs.Options.ContainsKey(Options.Packages.NuGet);
+
+        var directory = commandLineArgs.Options.GetOrNull(Options.SolutionPath.Short, Options.SolutionPath.Long) ??
+                        Directory.GetCurrentDirectory();
+        var version = commandLineArgs.Options.GetOrNull(Options.Version.Short, Options.Version.Long);
+        var leptonXVersion = commandLineArgs.Options.GetOrNull(Options.LeptonXVersion.Short, Options.LeptonXVersion.Long);
+
+        if (updateNuget || !updateNpm)
+        {
+            await UpdateNugetPackages(commandLineArgs, directory, version, leptonXVersion);
+        }
+
+        if (updateNpm || !updateNuget)
+        {
+            await UpdateNpmPackages(directory, version, leptonXVersion);
+        }
+    }
+    // ...
+}
+```
+
+The defaults are "update both"; pass `--nuget` to skip NPM, or `--npm` to skip NuGet. The actual updaters are in [project-modification](/cli/project-modification):
+
+- `VoloNugetPackagesVersionUpdater.UpdateSolutionAsync` — walks every `*.csproj` referenced by the solution, rewrites `Version="x"` attributes of `Volo.Abp.*` / `Volo.*` package references.
+- `NpmPackagesUpdater.Update` — walks every `package.json`, rewrites `@abp/*` and `@volo/*` versions.
+
+The full options block:
+
+```text
+Usage:
+  abp update [options]
+
+Options:
+-p|--include-previews                       (if supported by the template)
+--npm                                       (Only updates NPM packages)
+--nuget                                     (Only updates Nuget packages)
+-sp|--solution-path                         (Specify the solution path)
+-sn|--solution-name                         (Specify the solution name)
+--check-all                                 (Check the new version of each package separately)
+-v|--version <version>                      (default: latest version)
+-lv|--leptonx-version <version>             (default: latest LeptonX version)
+```
+
+`--check-all` is the slow but accurate path; it asks NuGet for each package independently. Without it, the updater picks the highest version it saw in any `*.csproj` and applies that uniformly.
+
+## `abp suite` — `SuiteCommand`
+
+`abp suite` is the **only** command that manages another tool. It installs, updates, removes or starts ABP Suite (a pro UI for generating CRUD code).
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SuiteCommand.cs
+public class SuiteCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "suite";
+
+    public ICmdHelper CmdHelper { get; }
+    private readonly AbpNuGetIndexUrlService _nuGetIndexUrlService;
+    private readonly PackageVersionCheckerService _packageVersionCheckerService;
+    private readonly AuthService _authService;
+    private readonly CliHttpClientFactory _cliHttpClientFactory;
+    private readonly SuiteAppSettingsService _suiteAppSettingsService;
+    private const string SuitePackageName = "Volo.Abp.Suite";
+    public ILogger<SuiteCommand> Logger { get; set; }
+
+    private int _abpSuitePort = 3000;
+    // ...
+}
+```
+
+Sub-commands are encoded as the **target** (`abp suite install`, `abp suite update`, `abp suite remove`, `abp suite` or `abp suite start`). The internal dispatch reads `commandLineArgs.Target` and switches on it. Operations:
+
+| Target | What runs |
+| --- | --- |
+| `install` | `dotnet tool install -g Volo.Abp.Suite --add-source <pro feed>` after `--version` resolution. Requires `abp login` first. |
+| `update` | `dotnet tool update -g Volo.Abp.Suite --version <X>`. |
+| `remove` | `dotnet tool uninstall -g Volo.Abp.Suite`. |
+| (none) / `start` | `abp-suite` (the tool binary), opening `http://localhost:3000`. |
+
+`SuiteAppSettingsService` reads/writes Suite's own `appsettings.json` (Suite stores port and auto-update preferences there).
+
+## `abp prompt` — `PromptCommand`
+
+The command itself is a no-op placeholder. The actual REPL loop lives in `CliService.RunPromptAsync` (see [architecture](/cli/architecture#cliserviceasync---the-entry-method)). `PromptCommand` exists solely so `abp prompt` parses into a known command name (otherwise the dispatcher would fall back to `HelpCommand`).
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/PromptCommand.cs
+public class PromptCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "prompt";
+
+    public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        return Task.CompletedTask;
+    }
+
+    public string GetUsageInfo()
+    {
+        var sb = new StringBuilder();
+
+        sb.AppendLine("");
+        sb.AppendLine("Usage:");
+        sb.AppendLine("  abp prompt");
+        sb.AppendLine("");
+        sb.AppendLine("See the documentation for more info: https://abp.io/docs/latest/cli");
+
+        return sb.ToString();
+    }
+
+    public static string GetShortDescription()
+    {
+        return "Starts with prompt mode.";
+    }
+}
+```
+
+`CliService` intercepts the command **before** `CommandSelector.Select`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliService.cs
+if (commandLineArgs.IsCommand("prompt"))
+{
+    await RunPromptAsync();
+}
+```
+
+So even though `PromptCommand` is registered, its `ExecuteAsync` is never called via `RunInternalAsync`.
+
+## `abp help` — `HelpCommand`
+
+`HelpCommand` is both the explicit `abp help <name>` entry and the fallback for empty/unknown commands.
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/HelpCommand.cs
+public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    if (string.IsNullOrWhiteSpace(commandLineArgs.Target))
+    {
+        Logger.LogInformation(GetUsageInfo());
+        return Task.CompletedTask;
+    }
+
+    if (!AbpCliOptions.Commands.ContainsKey(commandLineArgs.Target))
+    {
+        Logger.LogWarning($"There is no command named {commandLineArgs.Target}.");
+        Logger.LogInformation(GetUsageInfo());
+        return Task.CompletedTask;
+    }
+
+    var commandType = AbpCliOptions.Commands[commandLineArgs.Target];
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var command = (IConsoleCommand)scope.ServiceProvider.GetRequiredService(commandType);
+        Logger.LogInformation(command.GetUsageInfo());
+    }
+
+    return Task.CompletedTask;
+}
+```
+
+The global banner reflects every command type:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/HelpCommand.cs
+foreach (var command in AbpCliOptions.Commands.ToArray().Where(NotHiddenFromCommandList).OrderBy(x => x.Key))
+{
+    var method = command.Value.GetMethod("GetShortDescription", BindingFlags.Static | BindingFlags.Public);
+    if (method == null)
+    {
+        continue;
+    }
+
+    var shortDescription = (string) method.Invoke(null, null);
+
+    sb.Append("    > ");
+    sb.Append(command.Key);
+    sb.Append(string.IsNullOrWhiteSpace(shortDescription) ? "" : ":");
+    sb.Append(" ");
+    sb.AppendLine(shortDescription);
+}
+```
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/HelpCommand.cs
+private bool NotHiddenFromCommandList(KeyValuePair<string, Type> command)
+{
+    return command.Value.GetCustomAttribute(typeof(HideFromCommandList)) == null;
+}
+```
+
+`[HideFromCommandList]` skips `RecreateInitialMigrationCommand` and `CreateMigrationAndRunMigratorCommand`.
+
+## `abp get-source` — `GetSourceCommand` {#getsourcecommand}
+
+Downloads the source code of a module (e.g. `Volo.Blogging`, `Volo.Forms` for pro). Requires `abp login` for pro modules.
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/GetSourceCommand.cs
+public class GetSourceCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "get-source";
+
+    private readonly SourceCodeDownloadService _sourceCodeDownloadService;
+    public ModuleProjectBuilder ModuleProjectBuilder { get; }
+    // ...
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Target == null)
+        {
+            throw new CliUsageException(
+                "Module name is missing!" +
+                Environment.NewLine + Environment.NewLine +
+                GetUsageInfo()
+            );
+        }
+
+        var version = commandLineArgs.Options.GetOrNull(Options.Version.Short, Options.Version.Long);
+
+        var outputFolder = GetOutPutFolder(commandLineArgs);
+
+        var gitHubAbpLocalRepositoryPath = commandLineArgs.Options.GetOrNull(Options.GitHubAbpLocalRepositoryPath.Long);
+        if (gitHubAbpLocalRepositoryPath != null)
+        {
+            Logger.LogInformation("GitHub Abp Local Repository Path: " + gitHubAbpLocalRepositoryPath);
+        }
+
+        var gitHubVoloLocalRepositoryPath = commandLineArgs.Options.GetOrNull(Options.GitHubVoloLocalRepositoryPath.Long);
+        if (gitHubVoloLocalRepositoryPath != null)
+        {
+            Logger.LogInformation("GitHub Volo Local Repository Path: " + gitHubVoloLocalRepositoryPath);
+        }
+
+        commandLineArgs.Options.Add(CliConsts.Command, commandLineArgs.Command);
+
+        await _sourceCodeDownloadService.DownloadModuleAsync(
+            commandLineArgs.Target, outputFolder, version, gitHubAbpLocalRepositoryPath, gitHubVoloLocalRepositoryPath, commandLineArgs.Options);
+    }
+    // ...
+}
+```
+
+Output folder defaults to `Directory.GetCurrentDirectory()`. `--abp-path` and `--volo-path` allow a local checkout to be used as the source instead of downloading.
+
+## `abp list-templates` — `ListTemplatesCommand` {#listtemplatescommand}
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ListTemplatesCommand.cs
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    var templateNameSpaceLength = 26;
+    var templateDisplayNameSpaceLength = 32;
+
+    var templates = await GetTemplatesAsync();
+
+    var output = new StringBuilder(Environment.NewLine + Environment.NewLine);
+
+    output.AppendLine(
+        $"{"Template".PadRight(templateNameSpaceLength)}" +
+        $"{"Template Name".PadRight(templateDisplayNameSpaceLength)}" +
+        "Document Url");
+
+    output.AppendLine(
+        $"{"--------".PadRight(templateNameSpaceLength)}" +
+        $"{"-------------".PadRight(templateDisplayNameSpaceLength)}" +
+        "------------");
+
+    output.AppendLine();
+
+    foreach (var template in templates)
+    {
+        output.AppendLine(
+            $"{template.Name?.PadRight(templateNameSpaceLength)}" +
+            $"{template.DisplayName?.PadRight(templateDisplayNameSpaceLength)}" +
+            $"{template.DocumentUrl}");
+    }
+
+    Logger.LogInformation(output.ToString());
+}
+
+private async Task<List<TemplateInfo>> GetTemplatesAsync()
+{
+    var client = _cliHttpClientFactory.CreateClient();
+
+    using (var responseMessage = await client.GetAsync(
+               $"{CliUrls.WwwAbpIo}api/download/templates/",
+               _cancellationTokenProvider.Token
+           ))
+    {
+        await _remoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync(responseMessage);
+        var result = await responseMessage.Content.ReadAsStringAsync();
+        return _jsonSerializer.Deserialize<List<TemplateInfo>>(result);
+    }
+}
+```
+
+Hits `https://abp.io/api/download/templates/` and prints the list. Pro-only templates appear when the request carries a valid access token (the `CliHttpClient` adds it automatically).
+
+## `abp list-modules` — `ListModulesCommand` {#listmodulescommand}
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ListModulesCommand.cs
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    var modules = await ModuleInfoProvider.GetModuleListAsync();
+    var freeModules = modules.Where(m => !m.IsPro).ToList();
+    var proModules = modules.Where(m => m.IsPro).ToList();
+
+    var output = new StringBuilder(Environment.NewLine);
+    output.AppendLine("Open Source Application Modules");
+    output.AppendLine();
+
+    foreach (var module in freeModules)
+    {
+        output.AppendLine($"> {module.DisplayName.PadRight(50)} ({module.Name})");
+    }
+
+    if (commandLineArgs.Options.ContainsKey("include-pro-modules"))
+    {
+        output.AppendLine();
+        output.AppendLine("Commercial (Pro) Application Modules");
+        output.AppendLine();
+        foreach (var module in proModules)
+        {
+            output.AppendLine($"> {module.DisplayName.PadRight(50)} ({module.Name})");
+        }
+    }
+
+    Logger.LogInformation(output.ToString());
+}
+```
+
+`ModuleInfoProvider.GetModuleListAsync` reads a JSON list from abp.io. Pro modules are listed only when `--include-pro-modules` is passed.
+
+## `abp generate-razor-page` — `GenerateRazorPage` {#generaterazorpage}
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/GenerateRazorPage.cs
+public class GenerateRazorPage : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "generate-razor-page";
+
+    public ILogger<GenerateRazorPage> Logger { get; set; }
+    // ...
+
+    public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var targetProjectDirectory = Directory.GetCurrentDirectory();
+        var projectEngine = CreateProjectEngine(targetProjectDirectory);
+
+        var results = MainCore(projectEngine, targetProjectDirectory);
+
+        foreach (var result in results)
+        {
+            File.WriteAllText(result.FilePath, result.GeneratedCode);
+        }
+
+        Logger.LogInformation($"{results.Count} files successfully generated.");
+        // ...
+    }
+}
+```
+
+Internally uses `Microsoft.AspNetCore.Razor.Language` to ahead-of-time compile every `*.cshtml` in the working project to its `.cshtml.g.cs` equivalent. Used by Studio when generating Razor pages outside of `dotnet build`.
+
+## `abp create-migration-and-run-migrator` — `CreateMigrationAndRunMigratorCommand` {#createmigrationandrunmigratorcommand}
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CreateMigrationAndRunMigratorCommand.cs
+[HideFromCommandList]
+public class CreateMigrationAndRunMigratorCommand : IConsoleCommand, ITransientDependency
+{
+    private readonly InitialMigrationCreator _initialMigrationCreator;
+    public const string Name = "create-migration-and-run-migrator";
+
+    public ICmdHelper CmdHelper { get; }
+    public DotnetEfToolManager DotnetEfToolManager { get; }
+    public ILogger<CreateMigrationAndRunMigratorCommand> Logger { get; set; }
+    // ...
+    public virtual async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Target.IsNullOrEmpty())
+        {
+            throw new CliUsageException("DbMigrations folder path is missing!");
+        }
+
+        var dbMigrationsFolder = commandLineArgs.Target;
+        // ... ensure dotnet-ef installed, run `dotnet ef migrations add Initial`, then `dotnet run` against migrator ...
+    }
+}
+```
+
+Hidden from `abp` help because it is intended to be called by `NewCommand` after solution generation. Direct invocation is supported but not advertised.
+
+## `abp cli` — `CliCommand`
+
+A self-update helper. `abp cli update`, `abp cli remove`, etc.:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CliCommand.cs
+public class CliCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "cli";
+
+    private const string CliPackageName = "Volo.Abp.Cli";
+    // ...
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var operationType = NamespaceHelper.NormalizeNamespace(commandLineArgs.Target);
+
+        var preview = commandLineArgs.Options.ContainsKey(Options.Preview.Short) ||
+                      commandLineArgs.Options.ContainsKey(Options.Preview.Long);
+        // ... switch on operationType: install / update / remove ...
+    }
+}
+```
+
+Calls `dotnet tool install/update/uninstall -g Volo.Abp.Cli` with the right `--add-source` argument based on the channel.
+
+## `abp clear-download-cache` — `ClearDownloadCacheCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ClearDownloadCacheCommand.cs
+public class ClearDownloadCacheCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "clear-download-cache";
+
+    public ILogger<ClearDownloadCacheCommand> Logger { get; set; }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        Logger.LogInformation("Clearing the templates download cache...");
+        foreach (var cacheFile in Directory.GetFiles(CliPaths.TemplateCache, "*.zip"))
+        {
+            Logger.LogInformation($"Deleting {cacheFile}");
+            try
+            {
+                File.Delete(cacheFile);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError(e, $"Could not delete {cacheFile}");
+            }
+        }
+        Logger.LogInformation("Done.");
+        await Task.CompletedTask;
+    }
+    // ...
+}
+```
+
+Wipes every `*.zip` in `CliPaths.TemplateCache` (`~/.abp/templates`). Run when a template download is corrupted or after a major version upgrade.
+
+## Version services (consumed by switchers + updaters)
+
+`Volo/Abp/Cli/Version/` contains the version metadata used across these commands:
+
+- [`CliVersionService.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version/CliVersionService.cs) — `GetCurrentCliVersionAsync()` parses `dotnet tool list -g` output to discover the installed CLI version. Falls back to assembly version + `-dev` if not installed as a tool.
+- [`PackageVersionCheckerService.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version/PackageVersionCheckerService.cs) — `GetLatestVersionOrNullAsync(packageId, includeReleaseCandidates, includeNightly)` polls the right NuGet feed.
+- [`LatestVersionInfo.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version/LatestVersionInfo.cs) — `{ SemanticVersion Version, string Message }` DTO returned by the checker.
+- [`CommercialPackages.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version/CommercialPackages.cs) — whitelist of `Volo.*` package IDs known to require the pro feed.
+
+### `CliVersionService.GetCurrentCliVersionAsync`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Version/CliVersionService.cs
+public async Task<SemanticVersion> GetCurrentCliVersionAsync()
+{
+    SemanticVersion currentCliVersion = default;
+
+    var consoleOutput = new StringReader(CmdHelper.RunCmdAndGetOutput($"dotnet tool list -g", out int exitCode));
+    string line;
+    while ((line = await consoleOutput.ReadLineAsync()) != null)
+    {
+        if (line.StartsWith("volo.abp.cli", StringComparison.InvariantCultureIgnoreCase))
+        {
+            var version = line.Split(new char[0], StringSplitOptions.RemoveEmptyEntries)[1];
+
+            SemanticVersion.TryParse(version, out currentCliVersion);
+
+            break;
+        }
+        if (line.StartsWith("volo.abp.studio.cli", StringComparison.InvariantCultureIgnoreCase))
+        {
+            var assemblyVersion = string.Join(".", Assembly.GetExecutingAssembly().GetFileVersion().Split('.').Take(3));
+            return SemanticVersion.Parse(assemblyVersion + "-studio");
+        }
+    }
+
+    if (currentCliVersion == null)
+    {
+        var assemblyVersion = string.Join(".", Assembly.GetExecutingAssembly().GetFileVersion().Split('.').Take(3));
+        return SemanticVersion.Parse(assemblyVersion + "-dev");
+    }
+    // ...
+}
+```
+
+The two fallback suffixes (`-studio`, `-dev`) feed into `CliService.GetUpdateChannel` (see [architecture](/cli/architecture#cliservicerunasync--the-entry-method)) so studio installations never see "your CLI is outdated" prompts from this code path.
+
+## Related
+
+- [Architecture](/cli/architecture) — where these commands plug into the bootstrap.
+- [Command selector](/cli/command-selector) — the dictionary that holds each `Name` constant.
+- [Project modification](/cli/project-modification) — `PackagePreviewSwitcher`, `VoloNugetPackagesVersionUpdater`, `LocalReferenceConverter`, `NpmPackagesUpdater`.
+- [Templates](/templates/overview) — what `abp list-templates` enumerates.

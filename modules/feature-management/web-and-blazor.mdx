@@ -1,0 +1,562 @@
+---
+title: "Feature Management Web and Blazor: FeatureManagementModal"
+sidebarTitle: "Web & Blazor"
+description: "FeatureManagementModal in MVC Razor Pages and Blazorise, the toggle and selection inputs, and the cache reset wired through CurrentApplication."
+---
+
+The UI for editing features is a tabbed dialog whose left rail lists feature *groups* and whose right pane renders one input per feature — a toggle, a number box, a free‑text field, or a drop‑down. ABP ships three variants of this dialog that all consume the same `IFeatureAppService`:
+
+- **`FeatureManagementModal.cshtml`** — Razor Pages partial loaded into the MVC theme via `feature-management-modal.js`.
+- **`FeatureManagementModal.razor`** — Blazorise component used by Blazor Server, Blazor WebAssembly, and the Blazor‑hosted MAUI templates.
+- **`@abp/ng.feature-management`** — Angular module (not in this repo) that calls the same `/api/feature-management/features` endpoints.
+
+This page covers the first two. The Angular component is documented in the Angular module pages — its API surface is identical.
+
+## Project files
+
+```
+modules/feature-management/src/
+├── Volo.Abp.FeatureManagement.Web/
+│   ├── AbpFeatureManagementWebModule.cs
+│   ├── Pages/FeatureManagement/
+│   │   ├── FeatureManagementModal.cshtml
+│   │   ├── FeatureManagementModal.cshtml.cs
+│   │   ├── feature-management-modal.js
+│   │   ├── feature-management-modal.css
+│   │   ├── Components/                      ← feature-setting-group cards
+│   │   └── _ViewImports.cshtml
+│   ├── Settings/                            ← feature-driven setting page contributors
+│   └── wwwroot/
+├── Volo.Abp.FeatureManagement.Blazor/
+│   ├── AbpFeatureManagementBlazorModule.cs
+│   ├── AbpFeatureManagementComponentBase.cs
+│   ├── Components/
+│   │   ├── FeatureManagementModal.razor
+│   │   └── FeatureManagementModal.razor.cs
+│   └── Settings/
+├── Volo.Abp.FeatureManagement.Blazor.Server/
+└── Volo.Abp.FeatureManagement.Blazor.WebAssembly/
+```
+
+The `.Blazor.Server` and `.Blazor.WebAssembly` projects only contain module classes that fold the shared `.Blazor` assembly into the correct host. The interesting code is in `.Web` (MVC) and `.Blazor` (Blazorise).
+
+## MVC (Razor Pages)
+
+### Module wiring
+
+```csharp
+// AbpFeatureManagementWebModule.cs (essence)
+[DependsOn(
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpSettingManagementWebModule)
+)]
+public class AbpFeatureManagementWebModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(AbpFeatureManagementResource),
+                typeof(AbpFeatureManagementWebModule).Assembly,
+                typeof(AbpFeatureManagementApplicationContractsModule).Assembly);
+        });
+
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpFeatureManagementWebModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpFeatureManagementWebModule>();
+        });
+
+        Configure<RazorPagesOptions>(options =>
+        {
+            //Configure authorization.
+        });
+
+        Configure<DynamicJavaScriptProxyOptions>(options =>
+        {
+            options.DisableModule(FeatureManagementRemoteServiceConsts.ModuleName);
+        });
+
+        Configure<SettingManagementPageOptions>(options =>
+        {
+            options.Contributors.Add(new FeatureSettingManagementPageContributor());
+        });
+    }
+}
+```
+
+Four important things happen:
+
+1. The `Pages/` razor pages are embedded as an MVC Application Part.
+2. The dynamic JS proxy for the feature‑management module is disabled — the hand‑written `feature-management-modal.js` replaces it.
+3. `FeatureSettingManagementPageContributor` registers a tab on the Settings page that links to the feature modal. This is why operators can reach features from the settings UI without an extra menu item.
+4. The CSS / JS assets in `wwwroot/` are mounted into the virtual file system so the theme bundler picks them up.
+
+### `FeatureManagementModal.cshtml.cs`
+
+```csharp
+// FeatureManagementModal.cshtml.cs (essence)
+public class FeatureManagementModal : AbpPageModel
+{
+    [Required, HiddenInput, BindProperty(SupportsGet = true)]
+    public string ProviderName { get; set; }
+
+    [HiddenInput, BindProperty(SupportsGet = true)]
+    public string ProviderKey { get; set; }
+
+    [HiddenInput, BindProperty(SupportsGet = true)]
+    public string ProviderKeyDisplayName { get; set; }
+
+    [BindProperty]
+    public List<FeatureGroupViewModel> FeatureGroups { get; set; }
+
+    public GetFeatureListResultDto FeatureListResultDto { get; set; }
+
+    protected IFeatureAppService FeatureAppService { get; }
+    protected ILocalEventBus LocalEventBus { get; }
+    public AbpLocalizationOptions LocalizationOptions { get; }
+
+    public FeatureManagementModal(
+        IFeatureAppService featureAppService,
+        ILocalEventBus localEventBus,
+        IOptions<AbpLocalizationOptions> localizationOptions)
+    {
+        ObjectMapperContext = typeof(AbpFeatureManagementWebModule);
+        FeatureAppService = featureAppService;
+        LocalEventBus = localEventBus;
+        LocalizationOptions = localizationOptions.Value;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        ValidateModel();
+
+        if (!ProviderKeyDisplayName.IsNullOrWhiteSpace())
+        {
+            ProviderKeyDisplayName = " - " + HttpUtility.HtmlEncode(ProviderKeyDisplayName);
+        }
+
+        FeatureListResultDto = await FeatureAppService.GetAsync(ProviderName, ProviderKey);
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        var features = new UpdateFeaturesDto
+        {
+            Features = FeatureGroups
+                .SelectMany(g => g.Features)
+                .Where(x => !x.IsDisabled)
+                .Select(f => new UpdateFeatureDto
+                {
+                    Name = f.Name,
+                    Value = f.Type == nameof(ToggleStringValueType) ? f.BoolValue.ToString() : f.Value
+                })
+                .ToList()
+        };
+
+        await FeatureAppService.UpdateAsync(ProviderName, ProviderKey, features);
+
+        await LocalEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData());
+
+        return NoContent();
+    }
+}
+```
+
+Three behaviours worth committing to memory:
+
+- **`ProviderKeyDisplayName` is HTML‑encoded** before being rendered into the modal title. This is the tenant name shown after `Features — `. Don't bypass the encode.
+- **Disabled rows are excluded** from the PUT — features whose value comes from a higher provider (`IsDisabled(feature)` returns `true`) are read‑only in the UI and not submitted, so saving doesn't overwrite the inherited value with itself.
+- **`CurrentApplicationConfigurationCacheResetEventData`** is published *after* `UpdateAsync` returns. The local event bus tells the current process (and, via the distributed bus, sibling processes) to flush their per‑user/per‑tenant application configuration so the next request reflects the new feature set without a restart.
+
+### `IsDisabled` and `GetShownName`
+
+The Razor page model duplicates the same disable rule the Blazor component uses:
+
+```csharp
+// FeatureManagementModal.cshtml.cs (UI helpers)
+public virtual bool IsDisabled(FeatureDto feature)
+{
+    return feature.Value != null &&
+           feature.Provider.Name != null &&
+           feature.Provider.Name != ProviderName &&
+           feature.Provider.Name != DefaultValueFeatureValueProvider.ProviderName;
+}
+
+public virtual string GetShownName(FeatureDto featureDto)
+{
+    return !IsDisabled(featureDto)
+        ? featureDto.DisplayName
+        : $"{featureDto.DisplayName} ({featureDto.Provider.Name})";
+}
+```
+
+A feature is disabled when its value came from a provider *higher* than the one being edited (e.g. you're editing a tenant and the value resolved from the edition). The default‑value provider is treated as a normal source so editing the host still lets you override defaults.
+
+### JavaScript glue
+
+`feature-management-modal.js` (under `Pages/FeatureManagement/`) opens the modal via the standard ABP partial‑views pattern:
+
+```javascript
+// Pages/FeatureManagement/feature-management-modal.js (essence)
+abp.modals.featureManagement = abp.modals.featureManagement || function () {
+    var modalManager = new abp.ModalManager({
+        viewUrl: abp.appPath +
+            "FeatureManagement/FeatureManagementModal"
+    });
+
+    return modalManager;
+};
+```
+
+In a tenant list page you instantiate the modal and open it with the providerName/key:
+
+```javascript
+var featureModal = new abp.ModalManager(abp.appPath + 'FeatureManagement/FeatureManagementModal');
+featureModal.open({
+    providerName: 'T',
+    providerKey: data.record.id,
+    providerKeyDisplayName: data.record.name
+});
+```
+
+`abp.ModalManager` handles the `GET` (to render the partial) and the `POST` (to call `OnPostAsync`) — your code doesn't touch the `/api/feature-management/features` endpoints directly.
+
+## Blazor (Blazorise)
+
+### Module wiring
+
+```csharp
+// AbpFeatureManagementBlazorModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpFeaturesModule),
+    typeof(AbpSettingManagementBlazorModule)
+)]
+public class AbpFeatureManagementBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<SettingManagementComponentOptions>(options =>
+        {
+            options.Contributors.Add(new FeatureSettingManagementComponentContributor());
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpFeatureManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+The pattern mirrors the MVC module — settings contributor + localization. The Blazor module depends on `AbpAspNetCoreComponentsWebThemingModule` (the LeptonX/LeptonX‑Lite theming abstraction) but **does not** depend on a specific theme — your host project picks `…Bootstrap` or `…LeptonX`.
+
+### `FeatureManagementModal.razor.cs`
+
+The bulk of the modal lives in the code‑behind. The full body is reproduced and dissected below.
+
+```csharp
+// FeatureManagementModal.razor.cs (open + load)
+public virtual async Task OpenAsync(
+    [NotNull] string providerName,
+    string providerKey = null,
+    string providerKeyDisplayName = null)
+{
+    try
+    {
+        ProviderName = providerName;
+        ProviderKey = providerKey;
+
+        ToggleValues = new Dictionary<string, bool>();
+        SelectionStringValues = new Dictionary<string, string>();
+
+        if (!providerKeyDisplayName.IsNullOrWhiteSpace())
+        {
+            ProviderKeyDisplayName = $" - {providerKeyDisplayName}";
+        }
+
+        var result = await FeatureAppService.GetAsync(ProviderName, ProviderKey);
+
+        Groups = result?.Groups ?? new List<FeatureGroupDto>();
+
+        if (Groups.Any())
+        {
+            SelectedTabName = GetNormalizedGroupName(Groups.First().Name);
+        }
+
+        foreach (var featureGroupDto in Groups)
+        {
+            foreach (var featureDto in featureGroupDto.Features)
+            {
+                if (featureDto.ValueType is ToggleStringValueType)
+                {
+                    ToggleValues.Add(featureDto.Name, bool.Parse(featureDto.Value));
+                }
+
+                if (featureDto.ValueType is SelectionStringValueType)
+                {
+                    SelectionStringValues.Add(featureDto.Name, featureDto.Value);
+                }
+            }
+        }
+
+        await InvokeAsync(Modal.Show);
+    }
+    catch (Exception ex)
+    {
+        await HandleErrorAsync(ex);
+    }
+}
+```
+
+The two dictionaries — `ToggleValues` and `SelectionStringValues` — exist because Blazorise's `Check` / `Select` components bind to strongly typed values. Strings (free‑text, numeric) are bound directly to `feature.Value`; booleans and selections need the side dictionaries because we cannot mutate `FeatureDto.Value` in place without a string round trip.
+
+### Save
+
+```csharp
+// FeatureManagementModal.razor.cs (save)
+protected virtual async Task SaveAsync()
+{
+    try
+    {
+        var features = new UpdateFeaturesDto
+        {
+            Features = Groups.SelectMany(g => g.Features).Select(f => new UpdateFeatureDto
+            {
+                Name = f.Name,
+                Value = f.ValueType is ToggleStringValueType
+                    ? ToggleValues[f.Name].ToString()
+                    : f.ValueType is SelectionStringValueType
+                        ? SelectionStringValues[f.Name]
+                        : f.Value
+            }).ToList()
+        };
+
+        await FeatureAppService.UpdateAsync(ProviderName, ProviderKey, features);
+
+        await CurrentApplicationConfigurationCacheResetService.ResetAsync();
+
+        await InvokeAsync(Modal.Hide);
+        await Notify.Success(L["SavedSuccessfully"]);
+    }
+    catch (Exception ex)
+    {
+        await HandleErrorAsync(ex);
+    }
+}
+```
+
+Unlike the MVC version (which raises a local event), the Blazor modal calls `ICurrentApplicationConfigurationCacheResetService` directly. That service is the Blazor‑aware abstraction that invalidates the per‑user cache locally and on the server before pushing a fresh `IApplicationConfigurationData` to the client.
+
+### Delete (`Reset to default`)
+
+```csharp
+// FeatureManagementModal.razor.cs (delete)
+public virtual async Task DeleteAsync([NotNull] string providerName, string providerKey = null)
+{
+    try
+    {
+        if (!await Message.Confirm(L["AreYouSureToResetToDefault"]))
+        {
+            return;
+        }
+        await FeatureAppService.DeleteAsync(ProviderName, ProviderKey);
+        await Message.Success(L["ResetedToDefault"]);
+
+        await CloseModal();
+    }
+    catch (Exception ex)
+    {
+        await HandleErrorAsync(ex);
+    }
+}
+```
+
+A confirm dialog (Blazorise `Message.Confirm`), then a `DELETE` to the API, then close the modal. Note the *outer* `providerName`/`providerKey` parameters are ignored — the modal uses its current `ProviderName`/`ProviderKey` state. The signature exists so the call site reads naturally.
+
+### Parent / child cascade
+
+The modal mirrors the relational rule "checking a child implies checking the parent; unchecking a parent unchecks every child":
+
+```csharp
+// FeatureManagementModal.razor.cs (cascade)
+protected virtual Task OnSelectedValueChangedAsync(bool value, FeatureDto feature)
+{
+    ToggleValues[feature.Name] = value;
+
+    if (value)
+    {
+        CheckParents(feature.ParentName);
+    }
+    else
+    {
+        UncheckChildren(feature.Name);
+    }
+
+    return Task.CompletedTask;
+}
+
+protected virtual void CheckParents(string parentName)
+{
+    if (parentName.IsNullOrWhiteSpace()) return;
+
+    foreach (var featureGroupDto in Groups)
+    {
+        foreach (var featureDto in featureGroupDto.Features)
+        {
+            if (featureDto.Name == parentName && ToggleValues.ContainsKey(featureDto.Name))
+            {
+                ToggleValues[featureDto.Name] = true;
+                CheckParents(featureDto.ParentName);
+            }
+        }
+    }
+}
+
+protected virtual void UncheckChildren(string featureName)
+{
+    foreach (var featureGroupDto in Groups)
+    {
+        foreach (var featureDto in featureGroupDto.Features)
+        {
+            if (featureDto.ParentName == featureName && ToggleValues.ContainsKey(featureDto.Name))
+            {
+                ToggleValues[featureDto.Name] = false;
+                UncheckChildren(featureDto.Name);
+            }
+        }
+    }
+}
+```
+
+The recursion only touches `ToggleStringValueType` features (because `ToggleValues` only contains those). Selection or free‑text children are left alone — the server‑side `forceToSet` logic on the app service handles non‑boolean children.
+
+### Razor markup
+
+The view itself is a Blazorise `Modal` containing a `Tabs` with vertical pills:
+
+```razor
+@* FeatureManagementModal.razor (top) *@
+@inherits AbpFeatureManagementComponentBase
+
+<Modal @ref="Modal" Closing="@ClosingModal">
+    <ModalContent Size="ModalSize.Large">
+        <ModalHeader>
+            <ModalTitle>@L["Features"]@ProviderKeyDisplayName</ModalTitle>
+            <CloseButton Clicked="CloseModal" />
+        </ModalHeader>
+        @if (Groups == null || !Groups.Any())
+        {
+            <span class="m-3">@L["NoFeatureFoundMessage"]</span>
+        }
+        else
+        {
+            <ModalBody>
+                <Tabs TabPosition="TabPosition.Start" Pills="true" @bind-SelectedTab="@SelectedTabName">
+                    @* groups + features rendered here *@
+                </Tabs>
+            </ModalBody>
+        }
+    </ModalContent>
+</Modal>
+```
+
+Inside each tab the modal pattern‑matches on `feature.ValueType` to pick the right input:
+
+- **`FreeTextStringValueType`** → `<TextEdit>` bound to `feature.Value` via `OnFeatureValueChangedAsync` (which re‑runs the validator before assigning).
+- **`SelectionStringValueType`** → `<Select TValue="string">` listing `((SelectionStringValueType)feature.ValueType).ItemSource.Items` and bound to `SelectionStringValues[feature.Name]`.
+- **`ToggleStringValueType`** → `<Check TValue="bool">` bound to `ToggleValues[feature.Name]` via `OnSelectedValueChangedAsync`.
+
+Each row sets `Style="@GetFeatureStyles(feature)"` so children indent (`margin-left: {Depth * 20}px`). Disabled rows render with `Disabled="@disabled"` and append the provider name to the label (`GetShownName`).
+
+### `ClosingModal` — guard against focus loss
+
+```csharp
+// FeatureManagementModal.razor.cs
+protected virtual Task ClosingModal(ModalClosingEventArgs eventArgs)
+{
+    eventArgs.Cancel = eventArgs.CloseReason == CloseReason.FocusLostClosing;
+    return Task.CompletedTask;
+}
+```
+
+Without this, clicking outside the modal during a long save would close it and drop the form. The cancel prevents focus‑loss closes; the user must use the explicit Cancel or Save button.
+
+## Opening the modal in your app
+
+The modal is meant to be embedded once per page and opened from a row‑level callback. A tenant list page:
+
+```razor
+<button class="btn btn-secondary"
+        @onclick="() => FeatureManagementModal.OpenAsync(
+            TenantFeatureValueProvider.ProviderName,
+            tenant.Id.ToString(),
+            tenant.Name)">
+    @L["Features"]
+</button>
+
+<FeatureManagementModal @ref="FeatureManagementModal" />
+
+@code {
+    private FeatureManagementModal FeatureManagementModal;
+}
+```
+
+For the host record, omit the key:
+
+```razor
+<button class="btn btn-outline-primary"
+        @onclick="() => FeatureManagementModal.OpenAsync(
+            TenantFeatureValueProvider.ProviderName)">
+    @L["Manage Host Features"]
+</button>
+```
+
+## Settings page integration
+
+Both web and Blazor modules add a contributor to the Settings page so operators can reach features without leaving the settings flow:
+
+| Module | Contributor type |
+| --- | --- |
+| `Volo.Abp.FeatureManagement.Web` | `FeatureSettingManagementPageContributor` |
+| `Volo.Abp.FeatureManagement.Blazor` | `FeatureSettingManagementComponentContributor` |
+
+Both contributors render a *Features* tab that opens the same modal — no extra wiring required in your host.
+
+## What the modal does **not** do
+
+<CardGroup cols={2}>
+  <Card title="Edition CRUD" icon="ban">
+    The modal edits values; it doesn't create editions. SaaS edition management is in a different module.
+  </Card>
+  <Card title="Tenant CRUD" icon="building">
+    The "open features" button typically lives on a row in the [Tenant Management](/modules/tenant-management/overview) UI — the feature modal itself never lists tenants.
+  </Card>
+  <Card title="Definition CRUD" icon="pen-ruler">
+    `FeatureDefinition`s are code (`IFeatureDefinitionProvider`); the modal cannot create or rename them. See [Features framework](/security/features) for the static side.
+  </Card>
+  <Card title="Cross-provider edits" icon="route">
+    One modal session targets one (provider, key). Switching between "host" and "tenant X" closes and re-opens the dialog with new parameters.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+- [EF Core & MongoDB](/modules/feature-management/efcore-mongodb) — where the saved values land.
+- [Application layer](/modules/feature-management/application) — the DTOs the modal binds to.
+- [Tenant Management](/modules/tenant-management/overview) — the host of the "Features" button on tenant rows.
+- [Features framework](/security/features) — `FeatureDefinition`, value types, `IFeatureChecker`.

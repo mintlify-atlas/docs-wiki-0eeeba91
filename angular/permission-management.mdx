@@ -1,0 +1,272 @@
+---
+title: "@abp/ng.permission-management"
+description: "PermissionManagementComponent — the modal that assigns granted permissions to a role, user, organization unit or client."
+---
+
+`@abp/ng.permission-management` (source: `npm/ng-packs/packages/permission-management/`) ships a single, reusable modal — `PermissionManagementComponent` — that any feature module can open to assign granted permissions to a provider/key pair. Identity opens it for users and roles; tenant management opens it for tenants; client management modules open it for OAuth clients.
+
+```text
+npm/ng-packs/packages/permission-management/src/lib/
+├── components/
+│   ├── permission-management.component.{ts,html}
+│   └── index.ts
+├── enums/                       ePermissionManagementComponents
+├── models/                      PermissionManagement.*
+└── permission-management.module.ts
+```
+
+Generated proxies live in the secondary entry point `@abp/ng.permission-management/proxy` and target the backend's `PermissionAppService` (`/api/permission-management/permissions`).
+
+## The module
+
+`permission-management.module.ts` is a thin shell that re‑exports the standalone component:
+
+```ts permission-management/src/lib/permission-management.module.ts
+@NgModule({
+  declarations: [],
+  imports: [PermissionManagementComponent],
+  exports: [PermissionManagementComponent],
+})
+export class PermissionManagementModule {}
+```
+
+There are no routes — applications never navigate to a "permission management" page. Instead the component is dropped inside another page (a users list, a roles list, a tenants list, …) and bound to a `[(visible)]` toggle and a `providerName` / `providerKey` pair.
+
+## `PermissionManagementComponent`
+
+The component lives in `components/permission-management.component.ts`:
+
+```ts permission-management/src/lib/components/permission-management.component.ts
+import { ConfigStateService, CurrentUserDto, LocalizationPipe } from '@abp/ng.core';
+import {
+  ButtonComponent, LocaleDirection, ModalCloseDirective, ModalComponent, ToasterService,
+} from '@abp/ng.theme.shared';
+import {
+  GetPermissionListResultDto, PermissionGrantInfoDto, PermissionGroupDto,
+  PermissionsService, ProviderInfoDto, UpdatePermissionDto,
+} from '@abp/ng.permission-management/proxy';
+
+@Component({
+  selector: 'abp-permission-management',
+  templateUrl: './permission-management.component.html',
+  exportAs: 'abpPermissionManagement',
+  imports: [
+    FormsModule, NgStyle, ModalComponent, LocalizationPipe,
+    ButtonComponent, ModalCloseDirective,
+  ],
+})
+export class PermissionManagementComponent
+  implements
+    PermissionManagement.PermissionManagementComponentInputs,
+    PermissionManagement.PermissionManagementComponentOutputs
+{
+  protected readonly service = inject(PermissionsService);
+  protected readonly configState = inject(ConfigStateService);
+  protected readonly toasterService = inject(ToasterService);
+
+  @Input() readonly providerName!: string;
+  @Input() readonly providerKey!: string;
+  @Input() readonly hideBadges = false;
+  @Input() entityDisplayName: string | undefined;
+
+  @Output() readonly visibleChange = new EventEmitter<boolean>();
+}
+```
+
+### Inputs
+
+| Input | Purpose |
+| --- | --- |
+| `providerName` | Permission provider id — typically `'R'` (role), `'U'` (user), `'T'` (tenant), or `'C'` (client). |
+| `providerKey` | The identifier inside the provider — a user id, a role name, a tenant id, … |
+| `entityDisplayName` | Optional title — shown in the modal header. |
+| `hideBadges` | Hide the "Granted/Prohibited" badges next to each permission. |
+| `visible` (two‑way) | Bind to a `boolean` to open and close the modal. |
+
+### Outputs
+
+`visibleChange` fires when the modal opens or closes — usually used to clear the host's `providerKey` after dismissal.
+
+### Visibility logic
+
+Opening the modal lazily fetches the permission tree:
+
+```ts
+@Input()
+get visible(): boolean { return this._visible; }
+set visible(value: boolean) {
+  if (value === this._visible) { return; }
+  if (value) {
+    this.openModal().subscribe(() => {
+      this._visible = true;
+      this.visibleChange.emit(true);
+      concat(this.selectAllInAllTabsRef.changes, this.selectAllInThisTabsRef.changes)
+        .pipe(take(1))
+        .subscribe(() => { this.initModal(); });
+    });
+  } else {
+    this.setSelectedGroup(null);
+    this._visible = false;
+    this.visibleChange.emit(false);
+    this.filter.set('');
+  }
+}
+```
+
+`openModal()` calls `PermissionsService.get(providerName, providerKey)` which targets the backend endpoint described in [Authorization → Permissions](/security/permissions). The response contains every `PermissionGroupDto` defined by the application, the granted state per permission, and the provider info (so the modal can show "Granted from role X" badges).
+
+`UpdatePermissionDto[]` is built from the user's toggles and sent through `PermissionsService.update(providerName, providerKey, { permissions })` on save.
+
+## Consuming the component
+
+Identity's `UsersComponent` is the canonical consumer. The host page declares a `providerKey` signal that points to the selected user, then renders the modal in its template:
+
+```html
+<abp-permission-management
+  *abpReplaceableTemplate="{
+    inputs: { providerName: 'U', providerKey, entityDisplayName },
+    outputs: { visibleChange: onVisiblePermissionManagementModal.bind(this) },
+    componentKey: permissionManagementKey
+  }"
+  [(visible)]="isPermissionManagementVisible"
+  [providerName]="'U'"
+  [providerKey]="providerKey"
+  [entityDisplayName]="entityDisplayName">
+</abp-permission-management>
+```
+
+```ts
+// Inside the host component
+permissionManagementKey = ePermissionManagementComponents.PermissionManagement;
+
+openPermissionsModal(providerKey: string, entityDisplayName: string) {
+  this.providerKey = providerKey;
+  this.entityDisplayName = entityDisplayName;
+  this.isPermissionManagementVisible = true;
+}
+```
+
+The `ePermissionManagementComponents.PermissionManagement` token lets applications swap the component for a custom permission UI via `ReplaceableComponentsService.add({ key, component })`.
+
+## Provider names used across ABP
+
+| Provider | Used by |
+| --- | --- |
+| `R` (Role) | `@abp/ng.identity` — opens the modal from the role action menu. |
+| `U` (User) | `@abp/ng.identity` — opens the modal from the user action menu. |
+| `T` (Tenant) | `@abp/ng.tenant-management` — manage permissions inherited by every user inside a tenant. |
+| `C` (Client) | OAuth client management UIs (Volo's "OpenIddict" modules). |
+
+Behind the scenes ASP.NET Core's permission management module ([`/security/permissions`](/security/permissions)) registers a `IPermissionManagementProvider` per character — `RolePermissionManagementProvider`, `UserPermissionManagementProvider`, … — that decides whether a grant is allowed to be applied.
+
+## Reused theme building blocks
+
+Inside the template `permission-management.component.html` uses:
+
+- `abp-modal` from `@abp/ng.theme.shared` (see [`/angular/theme-shared#modalcomponent`](/angular/theme-shared#modalcomponent)).
+- `abp-button` for the Save button (`abpSubmit` directive sets the `busy` state).
+- A vertical Bootstrap pill nav (`.lpx-scroll-pills-container ul`) for the permission groups.
+- A search box backed by a `signal()`‑based filter (visible in the import list as `signal`).
+
+The `LocalizationPipe` translates every permission name and group name — the keys come from the resource defined by the backend module ([Localization Overview](/localization/overview)).
+
+## DTOs and proxies
+
+The secondary entry point `@abp/ng.permission-management/proxy` exposes the strongly typed contracts used by the modal:
+
+```ts permission-management/proxy/.../permissions.service.ts (generated)
+@Injectable({ providedIn: 'root' })
+export class PermissionsService {
+  apiName = 'AbpPermissionManagement';
+  protected restService = inject(RestService);
+
+  get = (providerName: string, providerKey: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<void, GetPermissionListResultDto>(
+      {
+        method: 'GET',
+        url: '/api/permission-management/permissions',
+        params: { providerName, providerKey },
+      },
+      { apiName: this.apiName, ...config },
+    );
+
+  update = (
+    providerName: string,
+    providerKey: string,
+    input: UpdatePermissionsDto,
+    config?: Partial<Rest.Config>,
+  ) =>
+    this.restService.request<UpdatePermissionsDto, void>(
+      {
+        method: 'PUT',
+        url: '/api/permission-management/permissions',
+        params: { providerName, providerKey },
+        body: input,
+      },
+      { apiName: this.apiName, ...config },
+    );
+}
+```
+
+And the DTO shapes:
+
+```ts
+interface GetPermissionListResultDto {
+  entityDisplayName: string;
+  groups: PermissionGroupDto[];
+}
+
+interface PermissionGroupDto {
+  name: string;
+  displayName: string;
+  displayNameKey?: string;
+  permissions: PermissionGrantInfoDto[];
+}
+
+interface PermissionGrantInfoDto {
+  name: string;
+  displayName: string;
+  parentName?: string;
+  allowedProviders: string[];
+  isGranted: boolean;
+  grantedProviders: ProviderInfoDto[];
+}
+
+interface UpdatePermissionDto {
+  name: string;
+  isGranted: boolean;
+}
+```
+
+The `grantedProviders` list lets the modal show **why** a permission is granted ("granted by role admin"). When you toggle a permission off and another provider still grants it, the modal shows the badge so the user understands the resulting effective state.
+
+## `ePermissionManagementComponents`
+
+```ts permission-management/src/lib/enums/components.ts
+export enum ePermissionManagementComponents {
+  PermissionManagement = 'PermissionManagement.PermissionManagementComponent',
+}
+```
+
+Use it with `*abpReplaceableTemplate` (so a custom permission UI receives the same `providerName`, `providerKey`, `entityDisplayName` inputs and `visibleChange` output) or `ReplaceableComponentsService.add(...)`.
+
+## Filtering and search
+
+The modal includes a search box backed by an Angular signal (`filter = signal('')`) and a `computed()` selector that flattens permissions matching the query across all groups. The "Select all in this tab" / "Select all in all tabs" checkboxes use `viewChild` references (`selectAllInThisTabsRef`, `selectAllInAllTabsRef`) and toggle every leaf node of the permission tree.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Permissions" href="/security/permissions" icon="shield-check">
+    Backend concept guide — how permissions are declared and resolved.
+  </Card>
+  <Card title="@abp/ng.identity" href="/angular/identity" icon="users">
+    The main consumer — opens the modal from user/role entity actions.
+  </Card>
+  <Card title="@abp/ng.tenant-management" href="/angular/tenant-management" icon="building">
+    Uses the same component with `providerName='T'` to manage tenant permissions.
+  </Card>
+  <Card title="@abp/ng.theme.shared" href="/angular/theme-shared" icon="palette">
+    Provides `abp-modal`, `abp-button` and `ToasterService` used inside the modal.
+  </Card>
+</CardGroup>

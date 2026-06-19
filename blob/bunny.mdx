@@ -1,0 +1,313 @@
+---
+title: "Bunny BLOB Provider: Bunny CDN Edge Storage Backend"
+sidebarTitle: "Bunny CDN"
+description: "Use BunnyBlobProvider to persist ABP blobs in Bunny Storage zones backed by Bunny CDN, with regional edges and IBunnyClientFactory caching."
+---
+
+`Volo.Abp.BlobStoring.Bunny` is the [Bunny.net](https://bunny.net/) backend for ABP's BLOB Storing system. It writes blobs into Bunny **Storage Zones** — the durable origin behind Bunny's global CDN — using the official `BunnyCDN.Net.Storage` SDK, and serves them through your CDN pull zone.
+
+Source: `framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/`. The provider is `BunnyBlobProvider`; client lifecycle goes through `IBunnyClientFactory` (default: `DefaultBunnyClientFactory`); the per‑tenant blob key is computed by `IBunnyBlobNameCalculator`.
+
+## Module and configuration
+
+Depend on the module and call `UseBunny(...)`:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringModule),
+    typeof(AbpBunnyBlobStoringModule)
+)]
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                container.UseBunny(bunny =>
+                {
+                    bunny.AccessKey = "<your Bunny Storage API key>";
+                    bunny.Region = "de"; // de, ny, la, sg, syd, …
+                    bunny.ContainerName = "myapp-default-zone";
+                    bunny.CreateContainerIfNotExists = true;
+                });
+            });
+        });
+    }
+}
+```
+
+`UseBunny` follows the standard provider extension pattern:
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/BunnyBlobContainerConfigurationExtensions.cs"
+public static BlobContainerConfiguration UseBunny(
+    this BlobContainerConfiguration containerConfiguration,
+    Action<BunnyBlobProviderConfiguration> bunnyConfigureAction)
+{
+    containerConfiguration.ProviderType = typeof(BunnyBlobProvider);
+    containerConfiguration.NamingNormalizers.TryAdd<BunnyBlobNamingNormalizer>();
+
+    bunnyConfigureAction(new BunnyBlobProviderConfiguration(containerConfiguration));
+
+    return containerConfiguration;
+}
+```
+
+## `BunnyBlobProviderConfiguration`
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/BunnyBlobProviderConfiguration.cs"
+public class BunnyBlobProviderConfiguration
+{
+    /// <summary>Storage region (default "de"). Examples: de, ny, la, sg, syd.</summary>
+    public string? Region { get; set; }
+
+    /// <summary>
+    /// Storage zone name. 4–64 chars, globally unique within Bunny.
+    /// Lowercase letters, digits, hyphens, no spaces.
+    /// If not set, BlobProviderArgs.ContainerName is used.
+    /// </summary>
+    public string? ContainerName { get; set; }
+
+    /// <summary>Default: false. Provisions the storage zone on first save.</summary>
+    public bool CreateContainerIfNotExists { get; set; }
+
+    /// <summary>Bunny Storage API key (the per-account key from the dashboard).</summary>
+    public string AccessKey { get; set; }
+}
+```
+
+- **`AccessKey`** — the per‑account API key from the Bunny dashboard. It is used twice: against the Bunny Storage API to look up the storage zone, and (after the lookup) the zone's *password* is used by the SDK as the storage credential.
+- **`Region`** — the Bunny edge region for the storage zone (`de` Falkenstein, `ny` New York, `la` Los Angeles, `sg` Singapore, `syd` Sydney). Defaults to `de`.
+- **`ContainerName`** — overrides the storage zone name. Must follow Bunny's naming rules and be globally unique.
+- **`CreateContainerIfNotExists`** — provisions the zone if it does not exist when `SaveAsync` runs.
+
+## `BunnyBlobProvider`
+
+The provider validates that the storage zone exists, asks `IBunnyClientFactory` for a `BunnyCDNStorage` client, then uses the SDK to upload, download, delete, or list.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/BunnyBlobProvider.cs"
+public async override Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var configuration = args.Configuration.GetBunnyConfiguration();
+    var containerName = GetContainerName(args);
+    var blobName = BunnyBlobNameCalculator.Calculate(args);
+
+    await ValidateContainerExistsAsync(containerName, configuration);
+
+    var bunnyStorage = await GetBunnyCDNStorageAsync(args);
+
+    if (!args.OverrideExisting && await BlobExistsAsync(bunnyStorage, containerName, blobName))
+    {
+        throw new BlobAlreadyExistsException(
+            $"Blob '{args.BlobName}' already exists in container '{containerName}'. " +
+            $"Set {nameof(args.OverrideExisting)} to true to overwrite.");
+    }
+
+    using var memoryStream = new MemoryStream();
+    await args.BlobStream.CopyToAsync(memoryStream);
+    memoryStream.Position = 0;
+
+    await bunnyStorage.UploadAsync(memoryStream, $"{containerName}/{blobName}");
+}
+```
+
+A couple of important details:
+
+- The blob is materialized into a `MemoryStream` before upload because the Bunny SDK rewinds the source stream and requires `Position = 0`. As with other "in‑memory" provider implementations, do not use this provider for very large blobs without overriding the method to stream directly.
+- The upload key is `{containerName}/{blobName}` — Bunny treats `/` as a virtual folder separator, so blobs end up under a folder named after your zone (this is consistent with how Bunny's dashboard browses files).
+
+### Existence checks
+
+```csharp
+protected virtual async Task<bool> BlobExistsAsync(BunnyCDNStorage bunnyStorage, string containerName, string blobName)
+{
+    try
+    {
+        var fullBlobPath = $"/{containerName}/{blobName}";
+        var directoryPath = Path.GetDirectoryName(fullBlobPath)?.Replace('\\', '/') + "/";
+
+        if (string.IsNullOrWhiteSpace(directoryPath))
+        {
+            throw new Exception("Invalid directory path generated from blob name.");
+        }
+
+        var objects = await bunnyStorage.GetStorageObjectsAsync(directoryPath);
+        return objects?.Any(o => o.FullPath == fullBlobPath) == true;
+    }
+    catch (BunnyCDNStorageException ex) when (ex.Message.Contains("404"))
+    {
+        return false;
+    }
+}
+```
+
+The SDK does not have a per‑object HEAD; the provider lists the parent directory and checks the file's `FullPath`. 404 from Bunny is mapped to `false`. For very large directories this is heavier than the per‑object check used by Azure / AWS / GCS — if that becomes a bottleneck, override `BlobExistsAsync` with a Bunny REST call to `/storage/{zone}/{path}`.
+
+### Download
+
+```csharp
+public async override Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args)
+{
+    var blobName = BunnyBlobNameCalculator.Calculate(args);
+    var containerName = GetContainerName(args);
+    var bunnyStorage = await GetBunnyCDNStorageAsync(args);
+
+    if (!await BlobExistsAsync(bunnyStorage, containerName, blobName)) return null;
+
+    try
+    {
+        return await bunnyStorage.DownloadObjectAsStreamAsync($"{containerName}/{blobName}");
+    }
+    catch (WebException ex) when ((HttpStatusCode)ex.Status == HttpStatusCode.NotFound)
+    {
+        return null;
+    }
+}
+```
+
+The stream returned by the SDK is forwarded directly to the caller; ABP does not buffer it.
+
+## `IBunnyClientFactory` and storage zone discovery
+
+`DefaultBunnyClientFactory` is where the access key is used. It calls the Bunny Storage REST API to look up the storage zone, caches the result (with the zone *password* encrypted via `IStringEncryptionService`) for 12 hours, and constructs a `BunnyCDNStorage` client with the resolved password.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Bunny/Volo/Abp/BlobStoring/Bunny/DefaultBunnyClientFactory.cs (abridged)"
+public virtual async Task<BunnyCDNStorage> CreateAsync(
+    string accessKey, string containerName, string region = "de")
+{
+    var cacheKey = $"BunnyStorageZone:{containerName}";
+    var storageZoneInfo = await _cache.GetOrAddAsync(
+        cacheKey,
+        async () => {
+            var result = await GetStorageZoneAsync(accessKey, containerName);
+            if (result == null)
+            {
+                throw new AbpException($"Storage zone '{containerName}' not found");
+            }
+            result.Password = _stringEncryptionService.Encrypt(result.Password!)!;
+            return result;
+        },
+        () => new DistributedCacheEntryOptions
+        {
+            AbsoluteExpiration = DateTimeOffset.Now.Add(TimeSpan.FromHours(12))
+        }
+    );
+
+    var decryptedPassword = _stringEncryptionService.Decrypt(storageZoneInfo.Password);
+    return new BunnyCDNStorage(containerName, decryptedPassword, region);
+}
+```
+
+`EnsureStorageZoneExistsAsync` is called from `BunnyBlobProvider.ValidateContainerExistsAsync` and provisions the zone via Bunny's REST API when `CreateContainerIfNotExists = true`.
+
+To plug in a custom factory (for example, to use a different cache TTL, store the password somewhere else, or route through a forward proxy), implement `IBunnyClientFactory` and register it with `[Dependency(ReplaceServices = true)]`.
+
+## Tenant naming — `DefaultBunnyBlobNameCalculator`
+
+The Bunny calculator uses the same `host/` and `tenants/<tenantId>/` prefix pattern as the other cloud providers. Because the upload key is `{containerName}/{blobName}`, the on‑zone layout becomes:
+
+```text
+my-storage-zone/host/<blobName>
+my-storage-zone/tenants/<tenantId>/<blobName>
+```
+
+See [/tenancy/multi-tenancy-core](/tenancy/multi-tenancy-core) for the `ICurrentTenant` mechanics.
+
+## `BunnyBlobNamingNormalizer`
+
+Storage zone names must be globally unique, 4–64 lowercase letters/digits/hyphens, no spaces. `BunnyBlobNamingNormalizer` is registered by `UseBunny` to coerce ABP container names into Bunny‑compliant zone names; blob names are passed through.
+
+## Operational guidance
+
+<AccordionGroup>
+  <Accordion title="Pick the right region" icon="globe">
+    Storage zones live in one Bunny edge region but are mirrored to the CDN globally. Pick the region closest to your application (write performance) or to your origin (data residency requirements).
+  </Accordion>
+  <Accordion title="Pull zones and CDN URLs" icon="link">
+    Once blobs are in a Bunny storage zone, you typically expose them through a Bunny *pull zone* (CDN) — that mapping is configured in Bunny's dashboard, not by this provider. The provider only writes the origin.
+  </Accordion>
+  <Accordion title="Storage zone password" icon="key">
+    The Bunny SDK authenticates each request with the zone's *password*. ABP caches that password (encrypted) for 12 hours after discovery; rotate via the Bunny dashboard and invalidate the cache (`BunnyStorageZone:<name>`) to pick up the new credential.
+  </Accordion>
+  <Accordion title="Large blobs" icon="memory">
+    `SaveAsync` buffers the upload into a `MemoryStream`. Subclass to stream directly from the source for multi‑hundred‑MB uploads.
+  </Accordion>
+  <Accordion title="Existence cost" icon="magnifying-glass">
+    `BlobExistsAsync` lists the parent directory. Keep your per‑folder file counts modest, or override the method.
+  </Accordion>
+</AccordionGroup>
+
+## Usage example
+
+```csharp
+[BlobContainerName("public-assets")]
+public class PublicAssetContainer { }
+
+public class PublicAssetAppService : ApplicationService
+{
+    private readonly IBlobContainer<PublicAssetContainer> _blobs;
+
+    public PublicAssetAppService(IBlobContainer<PublicAssetContainer> blobs)
+    {
+        _blobs = blobs;
+    }
+
+    public Task SaveAsync(string path, Stream content)
+        => _blobs.SaveAsync(path, content, overrideExisting: true);
+
+    public Task<Stream?> GetOrNullAsync(string path)
+        => _blobs.GetOrNullAsync(path);
+}
+```
+
+Configure the container with `IsMultiTenant = false` if you want all tenants to share a single set of public CDN URLs:
+
+```csharp
+options.Containers.Configure<PublicAssetContainer>(c =>
+{
+    c.IsMultiTenant = false;
+    c.UseBunny(bunny =>
+    {
+        bunny.AccessKey = "…";
+        bunny.ContainerName = "public-cdn";
+    });
+});
+```
+
+## How CDN delivery fits in
+
+Bunny's Storage Zone is only the origin. To serve blobs over the CDN you create a *Pull Zone* in the Bunny dashboard that points at the storage zone, then expose its URL to clients. The ABP provider is unaware of the pull zone — it only writes to storage. This separation is intentional: you can rotate or front the storage zone with a different pull zone, change cache rules, or add edge transforms without touching the application.
+
+A typical setup:
+
+```text
+Application (writes)  ──►  Bunny Storage Zone   "my-zone"
+                                  │
+                                  ▼
+Browser (reads)  ◄──  Bunny Pull Zone  "cdn.my-app.com"
+```
+
+For tenant‑scoped private content, point the pull zone at the storage zone with token authentication enabled; for fully public assets, configure the pull zone with anonymous access and CORS as needed.
+
+## Provider package structure
+
+| File | Purpose |
+| --- | --- |
+| `AbpBunnyBlobStoringModule.cs` | The ABP module; depends on `AbpBlobStoringModule`. |
+| `BunnyBlobProvider.cs` | The `IBlobProvider`. |
+| `BunnyBlobProviderConfiguration.cs` | Typed view: `AccessKey`, `Region`, `ContainerName`, `CreateContainerIfNotExists`. |
+| `BunnyBlobProviderConfigurationNames.cs` | Property bag key constants. |
+| `BunnyBlobContainerConfigurationExtensions.cs` | `UseBunny(...)` and `GetBunnyConfiguration()`. |
+| `BunnyBlobNamingNormalizer.cs` | Storage zone name rules. |
+| `DefaultBunnyBlobNameCalculator.cs` | Tenant prefix logic. |
+| `DefaultBunnyClientFactory.cs` | Storage zone discovery + 12h cache. |
+| `BunnyStorageZoneModel.cs` | DTO for cached zone metadata. |
+| `BunnyApiException.cs` | Thrown by the factory on REST failures. |
+
+## Related
+
+- [BLOB Storing abstractions](/blob/abstractions) — `IBlobProvider`, `BlobProviderArgs`.
+- [Multi-tenancy core](/tenancy/multi-tenancy-core) — `ICurrentTenant.Id` drives blob name prefixing.
+- [AWS provider](/blob/aws), [Google provider](/blob/google), [Azure provider](/blob/azure) — full‑featured cloud object stores; pick Bunny when CDN‑first delivery is the primary requirement.
+- [Blob Storing Database module](/modules/blob-storing-database/overview) — for blobs that belong inside your domain DB.

@@ -1,0 +1,678 @@
+---
+title: "Volo.Abp.Caching: Typed Distributed Cache Abstractions"
+sidebarTitle: "Abstractions"
+description: "Inside Volo.Abp.Caching: AbpCachingModule, IDistributedCache<TCacheItem>, the key normalizer, JSON serializer, multi-tenancy hooks, and bulk APIs."
+---
+
+`Volo.Abp.Caching` is the package that turns Microsoft's `IDistributedCache` (a `string`-keyed, `byte[]`-valued blob store) into the typed, multi-tenant, UoW-aware cache that the rest of the framework depends on. This page walks the source file by file: the module, the contracts, the default implementations, the options, the normalizer, and the JSON serializer.
+
+The whole package lives under [`framework/src/Volo.Abp.Caching/Volo/Abp/Caching/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Caching/Volo/Abp/Caching).
+
+## `AbpCachingModule`
+
+This is the only module that needs to depend on `Volo.Abp.Caching`. Everything else is wired up here:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/AbpCachingModule.cs
+[DependsOn(
+    typeof(AbpThreadingModule),
+    typeof(AbpSerializationModule),
+    typeof(AbpUnitOfWorkModule),
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpJsonModule))]
+public class AbpCachingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMemoryCache();
+        context.Services.AddDistributedMemoryCache();
+
+        context.Services.AddSingleton(typeof(IDistributedCache<>), typeof(DistributedCache<>));
+        context.Services.AddSingleton(typeof(IDistributedCache<,>), typeof(DistributedCache<,>));
+
+        context.Services.AddHybridCache().AddSerializerFactory<AbpHybridCacheJsonSerializerFactory>();
+        context.Services.AddSingleton(typeof(IHybridCache<>), typeof(AbpHybridCache<>));
+        context.Services.AddSingleton(typeof(IHybridCache<,>), typeof(AbpHybridCache<,>));
+
+        Configure<AbpDistributedCacheOptions>(cacheOptions =>
+        {
+            cacheOptions.GlobalCacheEntryOptions.SlidingExpiration = TimeSpan.FromMinutes(20);
+        });
+
+        if (context.Services.GetAbpHostEnvironment().IsDevelopment())
+        {
+            Configure<AbpDistributedCacheOptions>(options =>
+            {
+                options.HideErrors = false;
+            });
+        }
+    }
+}
+```
+
+A few things to notice:
+
+- **Memory by default.** `AddDistributedMemoryCache()` registers `MemoryDistributedCache` as `IDistributedCache`. Any module that wants Redis depends on `AbpCachingStackExchangeRedisModule`, which calls `services.Replace(...)` to swap it out — see [Redis integration](/caching/stackexchange-redis).
+- **Open generic singletons.** The typed cache types are registered as singleton open generics. The DI container materializes one closed-generic instance per `TCacheItem`/`TCacheKey` combination, but each instance is itself a singleton — exactly what you want for a cache.
+- **Module dependencies.** `AbpMultiTenancyModule` pulls in `ICurrentTenant`; `AbpJsonModule` supplies the `IJsonSerializer` used by the default serializer; `AbpUnitOfWorkModule` provides `IUnitOfWorkManager` for `considerUow: true`; `AbpThreadingModule` brings `ICancellationTokenProvider`.
+
+## `IDistributedCache<TCacheItem>` and `IDistributedCache<TCacheItem, TCacheKey>`
+
+There are two typed interfaces. The two-parameter form is the real API; the one-parameter form is a `string`-keyed convenience that delegates everything to an internal two-parameter instance.
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCache.cs
+public interface IDistributedCache<TCacheItem> : IDistributedCache<TCacheItem, string>
+    where TCacheItem : class
+{
+    IDistributedCache<TCacheItem, string> InternalCache { get; }
+}
+
+public interface IDistributedCache<TCacheItem, TCacheKey>
+    where TCacheItem : class
+{
+    TCacheItem? Get(TCacheKey key, bool? hideErrors = null, bool considerUow = false);
+
+    Task<TCacheItem?> GetAsync(
+        [NotNull] TCacheKey key,
+        bool? hideErrors = null,
+        bool considerUow = false,
+        CancellationToken token = default);
+
+    // ... GetMany / GetManyAsync
+    // ... GetOrAdd / GetOrAddAsync
+    // ... GetOrAddMany / GetOrAddManyAsync
+    // ... Set / SetAsync / SetMany / SetManyAsync
+    // ... Refresh / RefreshAsync / RefreshMany / RefreshManyAsync
+    // ... Remove / RemoveAsync / RemoveMany / RemoveManyAsync
+}
+```
+
+Every method takes the same three optional knobs:
+
+- `hideErrors` — override `AbpDistributedCacheOptions.HideErrors` for one call.
+- `considerUow` — buffer the operation in the current unit of work so it only hits the backing store on commit.
+- `token` — cancellation, falling back to `ICancellationTokenProvider.Token` if you pass `default`.
+
+The `TCacheKey` type parameter only has to be `notnull`. Most code uses `string` (via the one-parameter shortcut), but `Guid`, `int`, composite records, or anything with a sensible `ToString()` works — the normalizer calls `key.ToString()` to build the actual string key.
+
+## `DistributedCache<TCacheItem>` and `DistributedCache<TCacheItem, TCacheKey>`
+
+The single-parameter implementation is a thin facade:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs
+public class DistributedCache<TCacheItem> :
+    IDistributedCache<TCacheItem>
+    where TCacheItem : class
+{
+    public IDistributedCache<TCacheItem, string> InternalCache { get; }
+
+    public DistributedCache(IDistributedCache<TCacheItem, string> internalCache)
+    {
+        InternalCache = internalCache;
+    }
+
+    public TCacheItem? Get(string key, bool? hideErrors = null, bool considerUow = false)
+        => InternalCache.Get(key, hideErrors, considerUow);
+
+    // ... every other method just forwards
+}
+```
+
+The interesting class is the two-parameter `DistributedCache<TCacheItem, TCacheKey>`. It carries the dependencies needed to serialize, normalize, and access the underlying byte cache:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCache.cs
+public class DistributedCache<TCacheItem, TCacheKey> : IDistributedCache<TCacheItem, TCacheKey>
+    where TCacheItem : class
+    where TCacheKey : notnull
+{
+    public const string UowCacheName = "AbpDistributedCache";
+
+    public ILogger<DistributedCache<TCacheItem, TCacheKey>> Logger { get; set; }
+
+    protected string CacheName { get; set; } = default!;
+    protected bool IgnoreMultiTenancy { get; set; }
+
+    protected IDistributedCache Cache { get; }
+    protected ICancellationTokenProvider CancellationTokenProvider { get; }
+    protected IDistributedCacheSerializer Serializer { get; }
+    protected IDistributedCacheKeyNormalizer KeyNormalizer { get; }
+    protected IServiceScopeFactory ServiceScopeFactory { get; }
+    protected IUnitOfWorkManager UnitOfWorkManager { get; }
+    protected SemaphoreSlim SyncSemaphore { get; }
+    protected DistributedCacheEntryOptions DefaultCacheOptions = default!;
+
+    private readonly AbpDistributedCacheOptions _distributedCacheOption;
+
+    public DistributedCache(
+        IOptions<AbpDistributedCacheOptions> distributedCacheOption,
+        IDistributedCache cache,
+        ICancellationTokenProvider cancellationTokenProvider,
+        IDistributedCacheSerializer serializer,
+        IDistributedCacheKeyNormalizer keyNormalizer,
+        IServiceScopeFactory serviceScopeFactory,
+        IUnitOfWorkManager unitOfWorkManager)
+    {
+        _distributedCacheOption = distributedCacheOption.Value;
+        Cache = cache;
+        CancellationTokenProvider = cancellationTokenProvider;
+        Logger = NullLogger<DistributedCache<TCacheItem, TCacheKey>>.Instance;
+        Serializer = serializer;
+        KeyNormalizer = keyNormalizer;
+        ServiceScopeFactory = serviceScopeFactory;
+        UnitOfWorkManager = unitOfWorkManager;
+
+        SyncSemaphore = new SemaphoreSlim(1, 1);
+
+        SetDefaultOptions();
+    }
+}
+```
+
+The constructor calls `SetDefaultOptions()` once. That method is where the cache reads its compile-time configuration off the `TCacheItem` type:
+
+```csharp
+protected virtual void SetDefaultOptions()
+{
+    CacheName = CacheNameAttribute.GetCacheName(typeof(TCacheItem));
+
+    //IgnoreMultiTenancy
+    IgnoreMultiTenancy = typeof(TCacheItem).IsDefined(typeof(IgnoreMultiTenancyAttribute), true);
+
+    //Configure default cache entry options
+    DefaultCacheOptions = GetDefaultCacheEntryOptions();
+}
+```
+
+So a single `TCacheItem` definition determines:
+
+- The **cache name** — pulled from `[CacheName("…")]` or derived by stripping the `CacheItem` postfix from the type's full name.
+- Whether to **ignore multi-tenancy** — true if `TCacheItem` carries `[IgnoreMultiTenancy]`.
+- The **default `DistributedCacheEntryOptions`** — first matching configurator from `AbpDistributedCacheOptions.CacheConfigurators`, falling back to `GlobalCacheEntryOptions`.
+
+### `Get`/`Set` flow
+
+A read looks like this:
+
+```csharp
+public virtual TCacheItem? Get(
+    TCacheKey key,
+    bool? hideErrors = null,
+    bool considerUow = false)
+{
+    hideErrors = hideErrors ?? _distributedCacheOption.HideErrors;
+
+    if (ShouldConsiderUow(considerUow))
+    {
+        var value = GetUnitOfWorkCache().GetOrDefault(key)?.GetUnRemovedValueOrNull();
+        if (value != null)
+        {
+            return value;
+        }
+    }
+
+    byte[]? cachedBytes;
+
+    try
+    {
+        cachedBytes = Cache.Get(NormalizeKey(key));
+    }
+    catch (Exception ex)
+    {
+        if (hideErrors == true)
+        {
+            HandleException(ex);
+            return null;
+        }
+
+        throw;
+    }
+
+    return ToCacheItem(cachedBytes);
+}
+```
+
+The same shape repeats for `Set`, `Refresh`, and `Remove`: check the UoW buffer, normalize the key, talk to `Cache`, optionally swallow exceptions, return.
+
+### `GetOrAddAsync` and the lock
+
+`GetOrAddAsync` is the most-used method. It double-checks the cache around a `SemaphoreSlim` so concurrent factories don't both fire:
+
+```csharp
+public virtual async Task<TCacheItem?> GetOrAddAsync(
+    TCacheKey key,
+    Func<Task<TCacheItem>> factory,
+    Func<DistributedCacheEntryOptions>? optionsFactory = null,
+    bool? hideErrors = null,
+    bool considerUow = false,
+    CancellationToken token = default)
+{
+    token = CancellationTokenProvider.FallbackToProvider(token);
+    var value = await GetAsync(key, hideErrors, considerUow, token);
+    if (value != null)
+    {
+        return value;
+    }
+
+    using (await SyncSemaphore.LockAsync(token))
+    {
+        value = await GetAsync(key, hideErrors, considerUow, token);
+        if (value != null)
+        {
+            return value;
+        }
+
+        value = await factory();
+
+        if (ShouldConsiderUow(considerUow))
+        {
+            var uowCache = GetUnitOfWorkCache();
+            if (uowCache.TryGetValue(key, out var item))
+            {
+                item.SetValue(value);
+            }
+            else
+            {
+                uowCache.Add(key, new UnitOfWorkCacheItem<TCacheItem>(value));
+            }
+        }
+
+        await SetAsync(key, value, optionsFactory?.Invoke(), hideErrors, considerUow, token);
+    }
+
+    return value;
+}
+```
+
+<Note>
+The `SyncSemaphore` is **per closed generic instance**. Two different `TCacheItem` types use two different semaphores, so they don't block each other. Two callers asking for two different keys *of the same `TCacheItem`* will serialize through the lock — usually fine for cache misses, occasionally a hotspot if you have a single very-hot key with a slow factory.
+</Note>
+
+## `AbpDistributedCacheOptions`
+
+The options object centralises everything that isn't compile-time-fixed on `TCacheItem`:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/AbpDistributedCacheOptions.cs
+public class AbpDistributedCacheOptions
+{
+    /// <summary>
+    /// Throw or hide exceptions for the distributed cache.
+    /// </summary>
+    public bool HideErrors { get; set; } = true;
+
+    /// <summary>
+    /// Cache key prefix.
+    /// </summary>
+    public string KeyPrefix { get; set; }
+
+    /// <summary>
+    /// Global Cache entry options.
+    /// </summary>
+    public DistributedCacheEntryOptions GlobalCacheEntryOptions { get; set; }
+
+    /// <summary>
+    /// List of all cache configurators.
+    /// (func argument:Name of cache)
+    /// </summary>
+    public List<Func<string, DistributedCacheEntryOptions?>> CacheConfigurators { get; set; }
+
+    public AbpDistributedCacheOptions()
+    {
+        CacheConfigurators = new List<Func<string, DistributedCacheEntryOptions?>>();
+        GlobalCacheEntryOptions = new DistributedCacheEntryOptions();
+        KeyPrefix = "";
+    }
+
+    public void ConfigureCache<TCacheItem>(DistributedCacheEntryOptions? options)
+        => ConfigureCache(typeof(TCacheItem), options);
+
+    public void ConfigureCache(Type cacheItemType, DistributedCacheEntryOptions? options)
+        => ConfigureCache(CacheNameAttribute.GetCacheName(cacheItemType), options);
+
+    public void ConfigureCache(string cacheName, DistributedCacheEntryOptions? options)
+    {
+        CacheConfigurators.Add(name => cacheName != name ? null : options);
+    }
+}
+```
+
+| Field | Default | What it controls |
+| --- | --- | --- |
+| `HideErrors` | `true` (`false` in Development) | Whether cache-backend exceptions bubble out of `Get`/`Set`/etc. or get logged and swallowed. |
+| `KeyPrefix` | `""` | Inserted into every normalized key. Use it to separate environments or applications that share one Redis instance. |
+| `GlobalCacheEntryOptions` | `new DistributedCacheEntryOptions { SlidingExpiration = 20m }` (set by `AbpCachingModule`) | Default expiration/options for every cache that doesn't override. |
+| `CacheConfigurators` | empty | Per-cache-name overrides. `ConfigureCache<TCacheItem>(...)` adds one entry that returns the right `DistributedCacheEntryOptions` when asked for that name. |
+
+### Configuring a per-cache override
+
+```csharp
+Configure<AbpDistributedCacheOptions>(options =>
+{
+    options.KeyPrefix = "myapp-prod-";
+
+    options.ConfigureCache<BookCacheItem>(new DistributedCacheEntryOptions
+    {
+        SlidingExpiration = TimeSpan.FromHours(1)
+    });
+
+    options.ConfigureCache("PermissionGrants", new DistributedCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+    });
+});
+```
+
+The configurators are evaluated in registration order; the first non-null result wins. So later modules can prepend their own configurators to override defaults set by earlier ones.
+
+## `CacheNameAttribute` and `[IgnoreMultiTenancy]`
+
+`CacheNameAttribute` decouples your cache key namespace from your CLR type name. If you rename `BookCacheItem` to `BookCachedItem`, your Redis keys break — unless you pin the name:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/CacheNameAttribute.cs
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Interface | AttributeTargets.Struct)]
+public class CacheNameAttribute : Attribute
+{
+    public string Name { get; }
+
+    public CacheNameAttribute([NotNull] string name)
+    {
+        Check.NotNull(name, nameof(name));
+        Name = name;
+    }
+
+    public static string GetCacheName<TCacheItem>()
+        => GetCacheName(typeof(TCacheItem));
+
+    public static string GetCacheName(Type cacheItemType)
+    {
+        var cacheNameAttribute = cacheItemType
+            .GetCustomAttributes(true)
+            .OfType<CacheNameAttribute>()
+            .FirstOrDefault();
+
+        if (cacheNameAttribute != null)
+        {
+            return cacheNameAttribute.Name;
+        }
+
+        return cacheItemType.FullName!.RemovePostFix("CacheItem")!;
+    }
+}
+```
+
+To opt out of the tenant segment in the normalized key, decorate the cache item with `[IgnoreMultiTenancy]` (from `Volo.Abp.MultiTenancy`):
+
+```csharp
+[CacheName("AppGlobalSettings")]
+[IgnoreMultiTenancy]
+public class AppGlobalSettingsCacheItem
+{
+    public string Currency { get; set; } = default!;
+}
+```
+
+Now the host caches one copy for the whole application instead of one per tenant. This is exactly what the framework uses for things like the global feature value store and host-scoped settings — see [Multi-Tenancy Core](/tenancy/multi-tenancy-core) for the broader picture of `ICurrentTenant`.
+
+## `IDistributedCacheKeyNormalizer` and the default
+
+The contract is one method:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCacheKeyNormalizer.cs
+public interface IDistributedCacheKeyNormalizer
+{
+    string NormalizeKey(DistributedCacheKeyNormalizeArgs args);
+}
+```
+
+Where `DistributedCacheKeyNormalizeArgs` carries the three inputs:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCacheKeyNormalizeArgs.cs
+public class DistributedCacheKeyNormalizeArgs
+{
+    public string Key { get; }
+    public string CacheName { get; }
+    public bool IgnoreMultiTenancy { get; }
+
+    public DistributedCacheKeyNormalizeArgs(string key, string cacheName, bool ignoreMultiTenancy)
+    {
+        Key = key;
+        CacheName = cacheName;
+        IgnoreMultiTenancy = ignoreMultiTenancy;
+    }
+}
+```
+
+The default implementation reads `ICurrentTenant` and the options to build the final string:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/DistributedCacheKeyNormalizer.cs
+public class DistributedCacheKeyNormalizer : IDistributedCacheKeyNormalizer, ITransientDependency
+{
+    protected ICurrentTenant CurrentTenant { get; }
+    protected AbpDistributedCacheOptions DistributedCacheOptions { get; }
+
+    public DistributedCacheKeyNormalizer(
+        ICurrentTenant currentTenant,
+        IOptions<AbpDistributedCacheOptions> distributedCacheOptions)
+    {
+        CurrentTenant = currentTenant;
+        DistributedCacheOptions = distributedCacheOptions.Value;
+    }
+
+    public virtual string NormalizeKey(DistributedCacheKeyNormalizeArgs args)
+    {
+        var normalizedKey = $"c:{args.CacheName},k:{DistributedCacheOptions.KeyPrefix}{args.Key}";
+
+        if (!args.IgnoreMultiTenancy && CurrentTenant.Id.HasValue)
+        {
+            normalizedKey = $"t:{CurrentTenant.Id.Value},{normalizedKey}";
+        }
+
+        return normalizedKey;
+    }
+}
+```
+
+`DistributedCache<,>` calls into it like this:
+
+```csharp
+protected virtual string NormalizeKey(TCacheKey key)
+{
+    return KeyNormalizer.NormalizeKey(
+        new DistributedCacheKeyNormalizeArgs(
+            key.ToString()!,
+            CacheName,
+            IgnoreMultiTenancy
+        )
+    );
+}
+```
+
+<Tip>
+Replace `DistributedCacheKeyNormalizer` with your own implementation if you need a different layout — for example, hashing the key segment to fit a hard Redis key-length budget, or adding an app-version stripe so deploys invalidate the cache automatically.
+</Tip>
+
+## `IDistributedCacheSerializer` and `Utf8JsonDistributedCacheSerializer`
+
+The serializer turns your `TCacheItem` into `byte[]` and back. The contract is symmetric:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/IDistributedCacheSerializer.cs
+public interface IDistributedCacheSerializer
+{
+    byte[] Serialize<T>(T obj);
+    T Deserialize<T>(byte[] bytes);
+}
+```
+
+The default implementation routes everything through `IJsonSerializer` from `Volo.Abp.Json`:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/Utf8JsonDistributedCacheSerializer.cs
+public class Utf8JsonDistributedCacheSerializer : IDistributedCacheSerializer, ITransientDependency
+{
+    protected IJsonSerializer JsonSerializer { get; }
+
+    public Utf8JsonDistributedCacheSerializer(IJsonSerializer jsonSerializer)
+    {
+        JsonSerializer = jsonSerializer;
+    }
+
+    public byte[] Serialize<T>(T obj)
+    {
+        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(obj!));
+    }
+
+    public T Deserialize<T>(byte[] bytes)
+    {
+        return (T)JsonSerializer.Deserialize(typeof(T), Encoding.UTF8.GetString(bytes));
+    }
+}
+```
+
+Two consequences:
+
+- Any global JSON configuration (custom converters, naming policies, enum handling) applied via `AbpSystemTextJsonSerializerOptions` propagates to the cache automatically. See [`misc/json`](/misc/json) for the full JSON pipeline.
+- Cache entries are human-readable. Open a Redis key with `redis-cli` or RedisInsight and you see a JSON blob, which makes debugging stale or corrupted entries pleasant.
+
+If you need binary serialization (MessagePack, Protobuf), replace the registration in your host module:
+
+```csharp
+context.Services.Replace(
+    ServiceDescriptor.Transient<IDistributedCacheSerializer, MyMessagePackCacheSerializer>());
+```
+
+For more on the underlying contracts and why `IDistributedCacheSerializer` looks a lot like `IObjectSerializer`, see [Serialization](/core/serialization).
+
+## Bulk operations: `ICacheSupportsMultipleItems`
+
+When you call `GetManyAsync`/`SetManyAsync`/`RefreshManyAsync`/`RemoveManyAsync` on the typed cache, ABP checks whether the underlying `IDistributedCache` understands a bulk protocol:
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/ICacheSupportsMultipleItems.cs
+public interface ICacheSupportsMultipleItems
+{
+    byte[]?[] GetMany(IEnumerable<string> keys);
+    Task<byte[]?[]> GetManyAsync(IEnumerable<string> keys, CancellationToken token = default);
+
+    void SetMany(IEnumerable<KeyValuePair<string, byte[]>> items, DistributedCacheEntryOptions options);
+    Task SetManyAsync(IEnumerable<KeyValuePair<string, byte[]>> items, DistributedCacheEntryOptions options, CancellationToken token = default);
+
+    void RefreshMany(IEnumerable<string> keys);
+    Task RefreshManyAsync(IEnumerable<string> keys, CancellationToken token = default);
+
+    void RemoveMany(IEnumerable<string> keys);
+    Task RemoveManyAsync(IEnumerable<string> keys, CancellationToken token = default);
+}
+```
+
+In `DistributedCache<,>.GetMany` the dispatch is a single cast:
+
+```csharp
+var cacheSupportsMultipleItems = Cache as ICacheSupportsMultipleItems;
+if (cacheSupportsMultipleItems == null)
+{
+    return GetManyFallback(keyArray, hideErrors, considerUow);
+}
+
+// ... else use cacheSupportsMultipleItems.GetMany(NormalizeKey-ed keys)
+```
+
+`MemoryDistributedCache` does **not** implement `ICacheSupportsMultipleItems`, so the in-memory backend takes the loop-based fallback. `AbpRedisCache` *does* implement it, pipelining the operations through `StackExchange.Redis` — see [Redis integration](/caching/stackexchange-redis) for the implementation details.
+
+### A typical bulk read
+
+```csharp
+public async Task<List<BookCacheItem>> GetManyAsync(IEnumerable<Guid> ids)
+{
+    var keys = ids.Select(id => id.ToString()).ToArray();
+
+    var results = await _cache.GetManyAsync(keys);
+    // results[i].Value is null when the key is a miss
+
+    var missing = results
+        .Where(r => r.Value == null)
+        .Select(r => Guid.Parse(r.Key))
+        .ToArray();
+
+    if (missing.Any())
+    {
+        var loaded = await _repository.GetListAsync(b => missing.Contains(b.Id));
+
+        await _cache.SetManyAsync(
+            loaded.Select(b => new KeyValuePair<string, BookCacheItem>(
+                b.Id.ToString(),
+                new BookCacheItem { Id = b.Id, Name = b.Name })));
+
+        // merge `loaded` back into `results` ...
+    }
+
+    return results.Select(r => r.Value!).Where(v => v != null).ToList();
+}
+```
+
+The shape of the return value is fixed by the interface contract: `GetManyAsync` returns one `KeyValuePair<TCacheKey, TCacheItem?>` per requested key, in the same order, with `null` values for misses. So callers always know which keys were hits without doing a separate lookup.
+
+## Unit-of-work caching
+
+Setting `considerUow: true` switches the operation from "write to Redis now" to "remember this write inside the current `IUnitOfWork` and flush on commit". The buffer is a dictionary stored under `DistributedCache<,>.UowCacheName` (the string literal `"AbpDistributedCache"`) inside `IUnitOfWork.Items`.
+
+This matters when:
+
+- You're inside a database transaction and don't want a cached projection to leak before the row commits.
+- You want a "read your own writes" view inside one logical operation without forcing a Redis round-trip per re-read.
+
+The fields involved:
+
+```csharp
+protected IUnitOfWorkManager UnitOfWorkManager { get; }
+public const string UowCacheName = "AbpDistributedCache";
+```
+
+`ShouldConsiderUow(considerUow)` returns `true` only if both the caller asked for it *and* there is an active unit of work. Outside a UoW the flag is silently ignored.
+
+## End-to-end resolution example
+
+Putting it all together — what happens when `BookAppService` calls `_cache.GetAsync("42")` inside a tenant scope, with `KeyPrefix = "prod-"`:
+
+<Steps>
+  <Step title="Compose the normalized key">
+    `DistributedCache<BookCacheItem, string>.NormalizeKey("42")` calls the normalizer with `CacheName = "BookCache"`, `IgnoreMultiTenancy = false`, and the tenant id from `ICurrentTenant`. Result:
+
+    ```text
+    t:8c2d…,c:BookCache,k:prod-42
+    ```
+  </Step>
+  <Step title="Hit the byte cache">
+    `Cache.Get("t:8c2d…,c:BookCache,k:prod-42")` returns the stored `byte[]` or `null`.
+  </Step>
+  <Step title="Deserialize">
+    `Serializer.Deserialize<BookCacheItem>(bytes)` decodes UTF-8 and runs the JSON pipeline.
+  </Step>
+  <Step title="Return">
+    Caller gets a `BookCacheItem` (or `null` on miss). If anything threw and `HideErrors` is `true`, the exception is logged and the method returns `null`.
+  </Step>
+</Steps>
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="layer-group" href="/caching/overview">
+    The big-picture diagram and a tour of the two cache backends.
+  </Card>
+  <Card title="Redis integration" icon="database" href="/caching/stackexchange-redis">
+    How `AbpCachingStackExchangeRedisModule` swaps the backend and how `AbpRedisCache` implements bulk operations.
+  </Card>
+  <Card title="Multi-Tenancy Core" icon="building" href="/tenancy/multi-tenancy-core">
+    `ICurrentTenant` is read on every key normalization; `[IgnoreMultiTenancy]` opts out.
+  </Card>
+  <Card title="Serialization & JSON" icon="file-code" href="/misc/json">
+    The default cache serializer delegates to `IJsonSerializer`. See also [`core/serialization`](/core/serialization).
+  </Card>
+</CardGroup>

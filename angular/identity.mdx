@@ -1,0 +1,359 @@
+---
+title: "@abp/ng.identity"
+description: "User and role management pages — built on the extensible CRUD primitives, with permission management and lock/unlock actions."
+---
+
+`@abp/ng.identity` (source: `npm/ng-packs/packages/identity/`) is the Angular counterpart to the [Identity module](/modules/identity/overview). It ships two management pages:
+
+- `/identity/users` — list, search, create, edit, delete, lock, unlock and assign permissions to users.
+- `/identity/roles` — list, search, create, edit, delete and assign permissions to roles.
+
+Both screens are wired through the [extensions system](/angular/components#extensible) so applications can add columns, actions, toolbar buttons and form fields without forking the components.
+
+```text
+npm/ng-packs/packages/identity/src/lib/
+├── components/
+│   ├── users/users.component.{ts,html}
+│   └── roles/
+├── defaults/                 default props, actions, toolbar actions, form props
+├── enums/                    eIdentityComponents
+├── guards/
+├── identity.routes.ts
+├── identity-routing.module.ts
+├── identity.module.ts
+├── models/                   IdentityConfigOptions
+├── resolvers/                identityExtensionsResolver
+└── tokens/                   IDENTITY_ENTITY_ACTION_CONTRIBUTORS, …
+```
+
+Generated proxies live in the secondary entry point `@abp/ng.identity/proxy` (folder `npm/ng-packs/packages/identity/proxy/`). They consume the controllers `IdentityUserAppService` and `IdentityRoleAppService` of the backend module.
+
+## Route table
+
+```ts identity/src/lib/identity.routes.ts
+export const createRoutes = (options: IdentityConfigOptions = {}): Routes => [
+  {
+    path: '',
+    component: RouterOutletComponent,
+    canActivate: [authGuard, permissionGuard],
+    resolve: [identityExtensionsResolver],
+    providers: provideIdentity(options),
+    children: [
+      { path: '', redirectTo: 'roles', pathMatch: 'full' },
+      {
+        path: 'roles',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpIdentity.Roles',
+          replaceableComponent: {
+            key: eIdentityComponents.Roles,
+            defaultComponent: RolesComponent,
+          } as ReplaceableComponents.RouteData<RolesComponent>,
+        },
+        title: 'AbpIdentity::Roles',
+      },
+      {
+        path: 'users',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpIdentity.Users',
+          replaceableComponent: {
+            key: eIdentityComponents.Users,
+            defaultComponent: UsersComponent,
+          } as ReplaceableComponents.RouteData<UsersComponent>,
+        },
+        title: 'AbpIdentity::Users',
+      },
+    ],
+  },
+];
+```
+
+The parent route applies both `authGuard` (must be logged in) and `permissionGuard` (must have one of the children's required policies). Each child carries its own `requiredPolicy` — `AbpIdentity.Roles` and `AbpIdentity.Users` — so the route is hidden in the side menu when the user lacks the permission.
+
+`identityExtensionsResolver` initialises the extension service with the contributor tokens declared in `provideIdentity(options)`:
+
+```ts identity/src/lib/identity.routes.ts
+export function provideIdentity(options: IdentityConfigOptions = {}): Provider[] {
+  return [
+    { provide: IDENTITY_ENTITY_ACTION_CONTRIBUTORS, useValue: options.entityActionContributors },
+    { provide: IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS, useValue: options.toolbarActionContributors },
+    { provide: IDENTITY_ENTITY_PROP_CONTRIBUTORS, useValue: options.entityPropContributors },
+    { provide: IDENTITY_CREATE_FORM_PROP_CONTRIBUTORS, useValue: options.createFormPropContributors },
+    { provide: IDENTITY_EDIT_FORM_PROP_CONTRIBUTORS, useValue: options.editFormPropContributors },
+  ];
+}
+```
+
+## Wiring it up
+
+```ts app.routes.ts
+{
+  path: 'identity',
+  loadChildren: () => import('@abp/ng.identity').then(m => m.createRoutes()),
+}
+```
+
+For Lepton X or any other theme that wants to advertise these routes in the side menu, register them through `RoutesService.add(...)` at app boot:
+
+```ts
+this.routes.add([
+  {
+    name: 'AbpIdentity::Menu:IdentityManagement',
+    iconClass: 'fas fa-id-card-alt',
+    path: '/identity',
+    layout: eLayoutType.application,
+    order: 4,
+    requiredPolicy: 'AbpIdentity.Users || AbpIdentity.Roles',
+  },
+  { name: 'AbpIdentity::Roles', parentName: 'AbpIdentity::Menu:IdentityManagement', path: '/identity/roles' },
+  { name: 'AbpIdentity::Users', parentName: 'AbpIdentity::Menu:IdentityManagement', path: '/identity/users' },
+]);
+```
+
+## `UsersComponent`
+
+`identity/src/lib/components/users/users.component.ts` is the canonical example of an extension‑aware CRUD page. It depends on:
+
+```ts identity/src/lib/components/users/users.component.ts
+import {
+  InitDirective, ListService, LocalizationPipe, PagedResultDto,
+  ReplaceableTemplateDirective,
+} from '@abp/ng.core';
+import {
+  GetIdentityUsersInput, IdentityRoleDto, IdentityUserDto, IdentityUserService,
+} from '@abp/ng.identity/proxy';
+import {
+  ePermissionManagementComponents, PermissionManagementComponent,
+} from '@abp/ng.permission-management';
+import {
+  ButtonComponent, Confirmation, ConfirmationService, eFormComponets, FormCheckboxComponent,
+  ModalCloseDirective, ModalComponent, ToasterService,
+} from '@abp/ng.theme.shared';
+import {
+  ExtensibleFormComponent, ExtensibleTableComponent, EXTENSIONS_IDENTIFIER,
+  FormPropData, generateFormFromProps,
+} from '@abp/ng.components/extensible';
+import { PageComponent } from '@abp/ng.components/page';
+```
+
+The CRUD methods sit right on the component:
+
+```ts identity/src/lib/components/users/users.component.ts
+add() {
+  this.selected = {} as IdentityUserDto;
+  this.selectedUserRoles = [] as IdentityRoleDto[];
+  this.openModal();
+}
+
+edit(id: string) {
+  this.service.get(id).pipe(
+    tap(user => (this.selected = user)),
+    switchMap(() => this.service.getRoles(id)),
+  ).subscribe(userRole => {
+    this.selectedUserRoles = userRole.items || [];
+    this.openModal();
+  });
+}
+
+save() {
+  if (!this.form.valid || this.modalBusy) return;
+  this.modalBusy = true;
+
+  const { roleNames = [] } = this.form.value;
+  const mappedRoleNames = roleNames
+    .filter(r => !!r[Object.keys(r)[0]])
+    .map(r => Object.keys(r)[0]);
+
+  const { id } = this.selected || {};
+  (id
+    ? this.service.update(id, { ...this.selected, ...this.form.value, roleNames: mappedRoleNames })
+    : this.service.create({ ...this.form.value, roleNames: mappedRoleNames })
+  )
+    .pipe(finalize(() => (this.modalBusy = false)))
+    .subscribe(() => {
+      this.isModalVisible = false;
+      this.toasterService.success('AbpUi::SavedSuccessfully');
+      this.list.get();
+    });
+}
+
+delete(id: string, userName: string) {
+  this.confirmationService
+    .warn('AbpIdentity::UserDeletionConfirmationMessage', 'AbpIdentity::AreYouSure', {
+      messageLocalizationParams: [userName],
+    })
+    .subscribe((status: Confirmation.Status) => {
+      if (status === Confirmation.Status.confirm) {
+        this.service.delete(id).subscribe(() => {
+          this.toasterService.success('AbpUi::DeletedSuccessfully');
+          this.list.get();
+        });
+      }
+    });
+}
+```
+
+The interplay between the layers:
+
+- `IdentityUserService` (a generated proxy) talks to the `IdentityUserAppService` controller through `RestService`.
+- `ListService` (from `@abp/ng.core`) drives pagination/sort/filter on the table.
+- `ConfirmationService` (from `@abp/ng.theme.shared`) opens the delete confirmation.
+- `ToasterService` (from `@abp/ng.theme.shared`) shows success messages.
+- `PermissionManagementComponent` (from `@abp/ng.permission-management`) is opened as a modal when the user clicks the "Permissions" action — see [`/angular/permission-management`](/angular/permission-management).
+- `ExtensibleFormComponent`/`ExtensibleTableComponent` (from `@abp/ng.components/extensible`) render the form and table from the contributor‑driven prop list.
+
+## Default columns, actions and form fields
+
+`identity/src/lib/defaults/` declares the out‑of‑the‑box props. For example, the user table's default columns are configured through `defaultUserEntityProps` and include `userName`, `email`, `phoneNumber`, `creationTime`, `lockoutEnd`. The default actions are:
+
+- Edit (requires `AbpIdentity.Users.Update`).
+- Permissions (requires `AbpIdentity.Users.ManagePermissions`).
+- Delete (requires `AbpIdentity.Users.Delete`).
+- Lock / Unlock (requires `AbpIdentity.Users.Update`).
+
+Adding extra contributions at route declaration time:
+
+```ts identity-extensions.ts
+import { ePropType, EntityAction, EntityProp, FormProp } from '@abp/ng.components/extensible';
+import { eIdentityComponents, IdentityConfigOptions } from '@abp/ng.identity';
+import { IdentityUserDto } from '@abp/ng.identity/proxy';
+
+export const identityConfig: IdentityConfigOptions = {
+  entityPropContributors: {
+    [eIdentityComponents.Users]: [
+      list => list.addByIndex(new EntityProp<IdentityUserDto>({
+        type: ePropType.String,
+        name: 'department',
+        displayName: 'MyProject::Department',
+      }), 3),
+    ],
+  },
+  entityActionContributors: {
+    [eIdentityComponents.Users]: [
+      list => list.addTail(new EntityAction<IdentityUserDto>({
+        text: 'MyProject::SendInvitation',
+        action: data => sendInvitation(data.record),
+        visible: data => data.record.isActive,
+      })),
+    ],
+  },
+  createFormPropContributors: {
+    [eIdentityComponents.Users]: [
+      list => list.addTail(new FormProp({
+        type: ePropType.String,
+        name: 'department',
+        displayName: 'MyProject::Department',
+        validators: () => [Validators.required],
+      })),
+    ],
+  },
+};
+```
+
+Pass `identityConfig` to `createRoutes(identityConfig)` and every user table/form picks up the extra column / action / field.
+
+## `IdentityUserService` proxy
+
+Generated from the `IdentityUserAppService` controller; lives under `npm/ng-packs/packages/identity/proxy/`.
+
+```ts identity/proxy/.../identity-user.service.ts (generated)
+@Injectable({ providedIn: 'root' })
+export class IdentityUserService {
+  apiName = 'AbpIdentity';
+  protected restService = inject(RestService);
+
+  get      = (id, config?) => this.restService.request<void, IdentityUserDto>(
+    { method: 'GET', url: `/api/identity/users/${id}` },
+    { apiName: this.apiName, ...config });
+
+  getList  = (input, config?) => this.restService.request<void, PagedResultDto<IdentityUserDto>>(
+    { method: 'GET', url: '/api/identity/users', params: input as any },
+    { apiName: this.apiName, ...config });
+
+  getRoles = (id, config?) => this.restService.request<void, PagedResultDto<IdentityRoleDto>>(
+    { method: 'GET', url: `/api/identity/users/${id}/roles` },
+    { apiName: this.apiName, ...config });
+
+  create   = (input, config?) => this.restService.request<IdentityUserCreateDto, IdentityUserDto>(
+    { method: 'POST', url: '/api/identity/users', body: input },
+    { apiName: this.apiName, ...config });
+
+  update   = (id, input, config?) => this.restService.request<IdentityUserUpdateDto, IdentityUserDto>(
+    { method: 'PUT', url: `/api/identity/users/${id}`, body: input },
+    { apiName: this.apiName, ...config });
+
+  delete   = (id, config?) => this.restService.request<void, void>(
+    { method: 'DELETE', url: `/api/identity/users/${id}` },
+    { apiName: this.apiName, ...config });
+}
+```
+
+`apiName = 'AbpIdentity'` means each request is prefixed with the URL configured under `environment.apis.AbpIdentity` (with `environment.apis.default` as fallback) — see [`EnvironmentService`](/angular/core#environmentservice).
+
+The matching DTOs (`IdentityUserDto`, `IdentityUserCreateDto`, `IdentityUserUpdateDto`, `GetIdentityUsersInput`, `IdentityRoleDto`) are emitted alongside the service into `proxy/.../models.ts`.
+
+## Lock / Unlock action
+
+The default action list includes a Lock/Unlock toggle backed by the user's `lockoutEnd` property:
+
+```ts
+new EntityAction<IdentityUserDto>({
+  text: 'AbpIdentity::Unlock',
+  permission: 'AbpIdentity.Users.Update',
+  visible: data => !!data.record.lockoutEnd && new Date(data.record.lockoutEnd) > new Date(),
+  action: data => this.unlock(data.record.id),
+});
+```
+
+`unlock(id)` calls `IdentityUserService.unlock(id)` (POST `/api/identity/users/{id}/unlock`).
+
+## `eIdentityComponents`
+
+```ts identity/src/lib/enums/components.ts
+export enum eIdentityComponents {
+  Roles = 'Identity.RolesComponent',
+  Users = 'Identity.UsersComponent',
+}
+```
+
+Replace either page with `ReplaceableComponentsService.add({ key: eIdentityComponents.Users, component: … })`.
+
+## Resolver — `identityExtensionsResolver`
+
+The route resolver pre‑initialises `ExtensionsService` with the contributor lists registered via `provideIdentity()` so the extensible table can render synchronously when the page mounts:
+
+```ts identity/src/lib/resolvers/identity-extensions.resolver.ts
+export const identityExtensionsResolver: ResolveFn<void> = () => {
+  const extensions = inject(ExtensionsService);
+  extensions.init({
+    [eIdentityComponents.Users]: {
+      entityActions: inject(IDENTITY_ENTITY_ACTION_CONTRIBUTORS, { optional: true }) ?? [],
+      entityProps:   inject(IDENTITY_ENTITY_PROP_CONTRIBUTORS,   { optional: true }) ?? [],
+      toolbarActions:inject(IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS,{ optional: true }) ?? [],
+      createFormProps: inject(IDENTITY_CREATE_FORM_PROP_CONTRIBUTORS, { optional: true }) ?? [],
+      editFormProps:   inject(IDENTITY_EDIT_FORM_PROP_CONTRIBUTORS,   { optional: true }) ?? [],
+    },
+    // … same shape for eIdentityComponents.Roles …
+  });
+};
+```
+
+This is the same pattern every other extensible module follows.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.permission-management" href="/angular/permission-management" icon="shield-check">
+    The modal used by the "Permissions" entity action.
+  </Card>
+  <Card title="@abp/ng.components" href="/angular/components" icon="grid-2">
+    `ExtensibleTableComponent`, `ExtensibleFormComponent` and `PageComponent` — the building blocks used here.
+  </Card>
+  <Card title="Identity module" href="/modules/identity/overview" icon="users">
+    The ASP.NET Core counterpart — `IdentityUserAppService`, `IdentityRoleAppService`, the permission catalogue, lockout policies.
+  </Card>
+  <Card title="@abp/ng.core" href="/angular/core" icon="cube">
+    `permissionGuard`, `ListService` and `RestService` — the plumbing every CRUD page on top of this stack depends on.
+  </Card>
+</CardGroup>

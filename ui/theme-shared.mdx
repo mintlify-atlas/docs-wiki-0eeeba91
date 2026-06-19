@@ -1,0 +1,339 @@
+---
+title: "Theme.Shared: Layout primitives every theme inherits"
+sidebarTitle: "Theme.Shared"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared and Theme.Shared.Demo — shared layout components, page toolbars, the IToolbarManager pipeline, and the Global standard bundle."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared` is the package every ABP MVC theme depends on. It does **not** ship a layout of its own. Instead it provides the **building blocks** a theme (Basic, LeptonX, your own) assembles into a `~/Themes/<Name>/Layouts/Application.cshtml`: a header toolbar pipeline, a page toolbar pipeline, the `<vc:abp-page-toolbar>` / `<vc:abp-page-search-box>` view components, an error page, and a `Global` standard bundle name that any theme can subclass with `AddBaseBundles(...)`.
+
+`Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Demo` is a separate package that exists only to render a manual visual test page for every tag helper / component (`/abp/components` style URLs). Themes pull it in to render their own demo gallery.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/
+├── AbpAspNetCoreMvcUiThemeSharedModule.cs
+├── AbpErrorPageOptions.cs
+├── AbpApplicationBuilderErrorPageExtensions.cs
+├── Areas/
+├── Bundling/
+│   ├── SharedThemeGlobalScriptContributor.cs
+│   ├── SharedThemeGlobalStyleContributor.cs
+│   └── StandardBundles.cs           # "Global"
+├── Controllers/ErrorController.cs
+├── PageToolbars/                    # Per-page toolbar pipeline
+│   ├── AbpPageToolbarOptions.cs
+│   ├── IPageToolbarManager.cs
+│   ├── PageToolbar.cs
+│   ├── PageToolbarContributor.cs
+│   └── SimplePageToolbarContributor.cs
+├── Toolbars/                        # Header (global) toolbar pipeline
+│   ├── AbpToolbarOptions.cs
+│   ├── IToolbarManager.cs
+│   ├── IToolbarContributor.cs
+│   ├── StandardToolbars.cs          # "Main"
+│   ├── Toolbar.cs
+│   ├── ToolbarItem.cs
+│   └── ToolbarManager.cs
+├── Pages/
+│   └── Shared/Components/
+│       ├── AbpPageToolbar/AbpPageToolbarViewComponent.cs
+│       ├── AbpPageSearchBox/AbpPageSearchBoxViewComponent.cs
+│       └── AbpApplicationPath/...
+├── Views/Error/                     # Error & 404 razor views
+└── wwwroot/libs/abp/                # ABP JS/CSS runtime
+```
+
+The sibling demo package:
+
+```
+framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Demo/
+├── AbpAspNetCoreMvcUiThemeSharedDemoModule.cs
+└── Views/Components/...
+```
+
+## Module
+
+The shared theme module wires the package into MVC, registers its embedded files, and seeds the **`Global`** bundle that downstream themes extend.
+
+```csharp
+// AbpAspNetCoreMvcUiThemeSharedModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiBootstrapModule),
+    typeof(AbpAspNetCoreMvcUiPackagesModule),
+    typeof(AbpAspNetCoreMvcUiWidgetsModule)
+    )]
+public class AbpAspNetCoreMvcUiThemeSharedModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAspNetCoreMvcUiThemeSharedModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiThemeSharedModule>("Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared");
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles.Add(StandardBundles.Styles.Global,
+                bundle => bundle.AddContributors(typeof(SharedThemeGlobalStyleContributor)));
+
+            options.ScriptBundles.Add(StandardBundles.Scripts.Global,
+                bundle => bundle.AddContributors(typeof(SharedThemeGlobalScriptContributor)));
+        });
+    }
+}
+```
+
+Two things to notice:
+
+1. `AddApplicationPartIfNotExists(...)` is what makes the embedded Razor views (the Error views, the view components under `Pages/Shared/Components/`) discoverable by the MVC view engine in the host.
+2. `StandardBundles.Styles.Global` and `StandardBundles.Scripts.Global` are both just the string `"Global"`. A concrete theme registers its own `Basic.Global` bundle and calls `AddBaseBundles("Global")` to pull in the shared one. See [/ui/basic-theme](/ui/basic-theme) and [/ui/minify-and-bundling](/ui/minify-and-bundling).
+
+```csharp
+// Bundling/StandardBundles.cs
+public class StandardBundles
+{
+    public static class Styles  { public static string Global = "Global"; }
+    public static class Scripts { public static string Global = "Global"; }
+}
+```
+
+## The header toolbar pipeline (`IToolbarManager`)
+
+The package owns the **header-area toolbar** that every theme renders at the top right of the layout (language switch, user menu, notifications…). The pipeline is a contributor list that produces a `Toolbar` instance keyed by name.
+
+```csharp
+// Toolbars/AbpToolbarOptions.cs
+public class AbpToolbarOptions
+{
+    public List<IToolbarContributor> Contributors { get; }
+    public AbpToolbarOptions() => Contributors = new List<IToolbarContributor>();
+}
+
+// Toolbars/StandardToolbars.cs
+public static class StandardToolbars { public const string Main = "Main"; }
+
+// Toolbars/IToolbarManager.cs
+public interface IToolbarManager
+{
+    Task<Toolbar> GetAsync(string name);
+}
+
+// Toolbars/IToolbarContributor.cs
+public interface IToolbarContributor
+{
+    Task ConfigureToolbarAsync(IToolbarConfigurationContext context);
+}
+```
+
+The default implementation `ToolbarManager` runs every contributor, then strips items the current user is not allowed to see via the simple state-checker pipeline (permissions, features, etc.):
+
+```csharp
+// Toolbars/ToolbarManager.cs (excerpt)
+public class ToolbarManager : IToolbarManager, ITransientDependency
+{
+    public async Task<Toolbar> GetAsync(string name)
+    {
+        var toolbar = new Toolbar(name);
+
+        using (var scope = ServiceProvider.CreateScope())
+        using (RequirePermissionsSimpleBatchStateChecker<ToolbarItem>.Use(
+                   new RequirePermissionsSimpleBatchStateChecker<ToolbarItem>()))
+        {
+            var context = new ToolbarConfigurationContext(
+                ThemeManager.CurrentTheme, toolbar, scope.ServiceProvider);
+
+            foreach (var contributor in Options.Contributors)
+            {
+                await contributor.ConfigureToolbarAsync(context);
+            }
+
+            await CheckPermissionsAsync(scope.ServiceProvider, toolbar);
+        }
+
+        return toolbar;
+    }
+}
+```
+
+To add an item to the header toolbar, register an `IToolbarContributor`:
+
+```csharp
+public class MyToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name == StandardToolbars.Main)
+        {
+            context.Toolbar.Items.Insert(0,
+                new ToolbarItem(typeof(MyHelpViewComponent)));
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+// In your module:
+Configure<AbpToolbarOptions>(options =>
+{
+    options.Contributors.Add(new MyToolbarContributor());
+});
+```
+
+`ToolbarItem` carries a view component type — the layout renders each one with `@await Component.InvokeAsync(item.ComponentType)`.
+
+> See the navigation page for the closely related `IMenuContributor` pipeline: [/ui/navigation-and-menus](/ui/navigation-and-menus).
+
+## The page toolbar pipeline (`IPageToolbarManager`)
+
+A separate, **per-Razor-Page** toolbar pipeline lives under `PageToolbars/`. Whereas `IToolbarManager` is global, `IPageToolbarManager` produces the buttons rendered at the top of an individual page (the typical "New" / "Save" / "Refresh" buttons on a list page).
+
+```csharp
+// PageToolbars/AbpPageToolbarOptions.cs
+public class AbpPageToolbarOptions
+{
+    public PageToolbarDictionary Toolbars { get; }
+
+    public void Configure<TPage>(Action<PageToolbar> configureAction) =>
+        Configure(typeof(TPage).FullName!, configureAction);
+
+    public void Configure(string pageName, Action<PageToolbar> configureAction)
+    {
+        var toolbar = Toolbars.GetOrAdd(pageName, () => new PageToolbar(pageName));
+        configureAction(toolbar);
+    }
+}
+
+// PageToolbars/PageToolbar.cs
+public class PageToolbar
+{
+    public string PageName { get; }
+    public PageToolbarContributorList Contributors { get; set; }
+}
+
+// PageToolbars/IPageToolbarContributor.cs
+public interface IPageToolbarContributor
+{
+    Task ContributeAsync(PageToolbarContributionContext context);
+}
+```
+
+Typical usage from a module:
+
+```csharp
+Configure<AbpPageToolbarOptions>(options =>
+{
+    options.Configure<MyApp.Pages.Books.IndexModel>(toolbar =>
+    {
+        toolbar.AddButton(
+            LocalizableString.Create<MyResource>("NewBook"),
+            icon: "plus",
+            type: AbpButtonType.Primary,
+            name: "NewBookButton");
+    });
+});
+```
+
+The view component that renders the result is:
+
+```csharp
+// Pages/Shared/Components/AbpPageToolbar/AbpPageToolbarViewComponent.cs
+public class AbpPageToolbarViewComponent : AbpViewComponent
+{
+    protected IPageToolbarManager ToolbarManager { get; }
+
+    public AbpPageToolbarViewComponent(IPageToolbarManager toolbarManager) =>
+        ToolbarManager = toolbarManager;
+
+    public virtual async Task<IViewComponentResult> InvokeAsync(string pageName)
+    {
+        var items = await ToolbarManager.GetItemsAsync(pageName);
+        return View("~/Pages/Shared/Components/AbpPageToolbar/Default.cshtml", items);
+    }
+}
+```
+
+In your Razor Page, drop the page toolbar with the view component tag helper:
+
+```cshtml
+@page
+@model MyApp.Pages.Books.IndexModel
+
+@section content_toolbar {
+    @await Component.InvokeAsync(typeof(AbpPageToolbarViewComponent),
+        new { pageName = typeof(IndexModel).FullName })
+}
+```
+
+`SimplePageToolbarContributor` (in the same folder) is the helper the `AbpPageToolbarOptions.Configure<TPage>(t => t.AddButton(...))` API uses under the hood — it captures the button definition and contributes it at render time.
+
+## The search box view component
+
+`AbpPageSearchBox` is a companion view component most theme pages use:
+
+```cshtml
+@await Component.InvokeAsync(typeof(AbpPageSearchBoxViewComponent),
+    new { @class = "page-search-box" })
+```
+
+The default razor file is at `Pages/Shared/Components/AbpPageSearchBox/Default.cshtml` in the source. A theme can override it by shipping a file at the same virtual path (the virtual file system will pick the **last-registered** file set — that is how themes override shared components — see [/ui/virtual-file-system](/ui/virtual-file-system)).
+
+## Error pages
+
+The package ships an `ErrorController` and embedded views under `Views/Error/`. They are wired into the host by:
+
+```csharp
+// AbpApplicationBuilderErrorPageExtensions.cs (excerpt)
+public static class AbpApplicationBuilderErrorPageExtensions
+{
+    public static IApplicationBuilder UseErrorPage(this IApplicationBuilder app)
+    {
+        // Configures the StatusCodePages + ExceptionHandler middlewares
+        // to route to /Error and /Error/{code}, served by ErrorController.
+        // ...
+    }
+}
+```
+
+You can override the redirect routes (and the supported status codes) by configuring `AbpErrorPageOptions` in your `ConfigureServices`.
+
+## The Demo package
+
+`Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Demo` exists for two reasons:
+
+1. It is the **visual test suite** for the Bootstrap tag helpers — it renders every `<abp-*>` variant on a single set of pages so theme authors can verify their CSS still looks right.
+2. It registers its own embedded views so that downstream themes can include it and expose `/themes/{name}/demo` style URLs.
+
+```csharp
+// AbpAspNetCoreMvcUiThemeSharedDemoModule.cs
+[DependsOn(typeof(AbpAspNetCoreMvcUiThemeSharedModule))]
+public class AbpAspNetCoreMvcUiThemeSharedDemoModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiThemeSharedDemoModule>();
+        });
+    }
+}
+```
+
+You typically only reference this package from a theme development project — application templates do not include it.
+
+## Cross-references
+
+- The Bootstrap tag helpers used by every shared component: [/ui/bootstrap-theme](/ui/bootstrap-theme).
+- The Basic theme reads the `Global` bundle and overrides the layouts: [/ui/basic-theme](/ui/basic-theme) and [/modules/basic-theme/overview](/modules/basic-theme/overview).
+- Menus and the closely related navigation/toolbar contributors: [/ui/navigation-and-menus](/ui/navigation-and-menus).
+- How `AddEmbedded<T>(...)` and the `IVirtualFileProvider` actually resolve files: [/ui/virtual-file-system](/ui/virtual-file-system).
+- Bundling, minification, and the `BundleManager` that runs `SharedThemeGlobalStyleContributor`: [/ui/minify-and-bundling](/ui/minify-and-bundling) and [/aspnetcore/mvc-ui-bundling](/aspnetcore/mvc-ui-bundling).
+- The corresponding Blazor host: [/blazor/theming](/blazor/theming).

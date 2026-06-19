@@ -1,0 +1,600 @@
+---
+title: "abp login, logout, login-info, translate"
+description: "LoginCommand, LogoutCommand, LoginInfoCommand store an OAuth token at ~/.abp/cli/access-token.bin against account.abp.io. TranslateCommand walks JSON resource files and produces / applies translations (optionally via DeepL)."
+---
+
+These four commands are the *non*-codegen surface of the CLI. The login family writes / reads an OAuth access token used by the pro template downloader and the NuGet feed; `translate` is a developer utility that diffs and merges ABP's JSON-based localization resources.
+
+<Info>
+Source files:
+- [`LoginCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginCommand.cs)
+- [`LogoutCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LogoutCommand.cs)
+- [`LoginInfoCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginInfoCommand.cs)
+- [`Auth/AuthService.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/AuthService.cs), [`Auth/IAuthService.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/IAuthService.cs), [`Auth/LoginInfo.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/LoginInfo.cs)
+- [`TranslateCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/TranslateCommand.cs)
+</Info>
+
+## The auth model
+
+The CLI keeps a single access token on disk at `CliPaths.AccessToken` (`~/.abp/cli/access-token.bin`). Every HTTP request issued via `CliHttpClientFactory.CreateClient(needsAuthentication: true)` reads that token and adds a `Bearer` header. The CLI talks to two related but distinct services:
+
+- `account.abp.io` — the abp.io OpenIddict server. Hosts `/connect/token`, `/connect/deviceauthorization`, `/api/license/login-info`, `/api/license/logout`.
+- `nuget.abp.io` — the abp.io NuGet feed (for pro packages). Authenticates with the same bearer token via a per-user API key embedded in the path (`{apiKey}/v3/index.json`).
+
+The token is **shared between the CLI and ABP Studio** — Studio reads the same file so users only log in once.
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliPaths.cs
+public static string AccessToken => Path.Combine(AbpRootPath, "cli", "access-token.bin");
+```
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/IAuthService.cs
+public interface IAuthService
+{
+    Task<LoginInfo> GetLoginInfoAsync();
+
+    Task LoginAsync(string userName, string password, string organizationName = null);
+
+    Task LogoutAsync();
+
+    Task<bool> CheckMultipleOrganizationsAsync(string username);
+}
+```
+
+`LoginInfo` is the DTO returned by `account.abp.io/api/license/login-info`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/LoginInfo.cs
+public class LoginInfo
+{
+    public Guid? Id { get; set; }
+
+    public string Name { get; set; }
+
+    public string Surname { get; set; }
+
+    public string Username { get; set; }
+
+    public string EmailAddress { get; set; }
+
+    public string Organization { get; set; }
+
+    public bool HasSourceCodeAccess { get; set; }
+}
+```
+
+`HasSourceCodeAccess` is the bit that controls whether `abp get-source <module>` and `abp add-module --with-source-code` are allowed against pro modules.
+
+## `abp login` — `LoginCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginCommand.cs
+public class LoginCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "login";
+
+    public ILogger<LoginCommand> Logger { get; set; }
+
+    protected AuthService AuthService { get; }
+    public ICancellationTokenProvider CancellationTokenProvider { get; }
+    public IRemoteServiceExceptionHandler RemoteServiceExceptionHandler { get; }
+
+    public LoginCommand(AuthService authService,
+        ICancellationTokenProvider cancellationTokenProvider,
+        IRemoteServiceExceptionHandler remoteServiceExceptionHandler)
+    {
+        AuthService = authService;
+        CancellationTokenProvider = cancellationTokenProvider;
+        RemoteServiceExceptionHandler = remoteServiceExceptionHandler;
+        Logger = NullLogger<LoginCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (!commandLineArgs.Options.ContainsKey("device"))
+        {
+            if (commandLineArgs.Target.IsNullOrEmpty())
+            {
+                throw new CliUsageException(
+                    "Username name is missing!" +
+                    Environment.NewLine + Environment.NewLine +
+                    GetUsageInfo()
+                );
+            }
+
+            var organization = commandLineArgs.Options.GetOrNull(Options.Organization.Short, Options.Organization.Long);
+
+            if (await HasMultipleOrganizationAndThisNotSpecified(commandLineArgs, organization))
+            {
+                return;
+            }
+
+            var password = commandLineArgs.Options.GetOrNull(Options.Password.Short, Options.Password.Long);
+            if (password == null)
+            {
+                Console.Write("Password: ");
+                password = ConsoleHelper.ReadSecret();
+                if (password.IsNullOrWhiteSpace())
+                {
+                    throw new CliUsageException(
+                        "Password is missing!" +
+                        Environment.NewLine + Environment.NewLine +
+                        GetUsageInfo()
+                    );
+                }
+            }
+
+            try
+            {
+                await AuthService.LoginAsync(
+                    commandLineArgs.Target,
+                    password,
+                    organization
+                );
+            }
+            catch (Exception ex)
+            {
+                LogCliError(ex, commandLineArgs);
+                return;
+            }
+
+            Logger.LogInformation($"Successfully logged in as '{commandLineArgs.Target}'");
+        }
+        else
+        {
+            try
+            {
+                await AuthService.DeviceLoginAsync();
+            }
+            catch (Exception ex)
+            {
+                LogCliError(ex, commandLineArgs);
+                return;
+            }
+
+            var loginInfo = await AuthService.GetLoginInfoAsync();
+            Logger.LogInformation($"Successfully logged in as '{loginInfo.Username}'");
+        }
+    }
+    // ...
+}
+```
+
+Two flows:
+
+| Mode | Trigger | What runs |
+| --- | --- | --- |
+| **Password** | `abp login <user> [-p <pwd>] [-o <org>]` | `AuthService.LoginAsync` → OIDC password grant against `account.abp.io`. |
+| **Device** | `abp login --device` | `AuthService.DeviceLoginAsync` → OIDC device-code grant. Prints a URL + user-code and polls until the user authorises in a browser. |
+
+If the user has multiple organisations, the password mode probes `CheckMultipleOrganizationsAsync` and errors with a helpful message:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginCommand.cs
+private async Task<bool> HasMultipleOrganizationAndThisNotSpecified(CommandLineArgs commandLineArgs, string organization)
+{
+    if (string.IsNullOrWhiteSpace(organization) &&
+        await AuthService.CheckMultipleOrganizationsAsync(commandLineArgs.Target))
+    {
+        Logger.LogError($"You have multiple organizations, please specify your organization with `--organization` parameter.");
+        return true;
+    }
+
+    return false;
+}
+```
+
+### `AuthService.LoginAsync` — the OIDC handshake
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/AuthService.cs
+public async Task LoginAsync(string userName, string password, string organizationName = null)
+{
+    var configuration = new IdentityClientConfiguration(
+        CliUrls.AccountAbpIo,
+        "abpio offline_access",
+        "abp-cli",
+        null,
+        OidcConstants.GrantTypes.Password,
+        userName,
+        password
+    );
+    // ... add organization parameter, call AuthenticationService.GetAccessTokenOrNullAsync,
+    //     write token to CliPaths.AccessToken ...
+}
+```
+
+Key points:
+
+- **Authority**: `CliUrls.AccountAbpIo` (`https://account.abp.io/`).
+- **Scopes**: `abpio offline_access` — the second scope gives the CLI a refresh token, so token renewal is automatic on subsequent calls (handled inside `CliHttpClientHandler`).
+- **Client ID**: `abp-cli`. There is no client secret — the CLI is a public client.
+- **Grant**: `password` (resource owner credentials). Pro tip: use `--device` instead in environments where you don't want to type a password.
+
+The resulting access token (+ refresh token) is written to `CliPaths.AccessToken` in a serialized form.
+
+### Error handling
+
+The CLI tries to give friendly errors even when the IDP returns HTML pages:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginCommand.cs
+private void LogCliError(Exception ex, CommandLineArgs args)
+{
+    if (ex.Message.Contains("Invalid username or password"))
+    {
+        Logger.LogError("Invalid username or password!");
+        return;
+    }
+
+    if (ex.Message.Contains("RequiresTwoFactor"))
+    {
+        Logger.LogError("Two factor authentication is enabled for your account. Please use `abp login --device` command to login.");
+        return;
+    }
+
+    if (TryGetErrorMessageFromHtmlPage(ex.Message, out var errorMsg))
+    {
+        Logger.LogError(errorMsg);
+        return;
+    }
+
+    Logger.LogError(ex.Message);
+}
+```
+
+`TryGetErrorMessageFromHtmlPage` uses a regex against `<h2 class="text-danger">` in the response — `account.abp.io`'s error page format. If the server enables 2FA, the user is directed to `--device` since the password grant can't pump a code.
+
+### Usage block (verbatim)
+
+```text
+Usage:
+  abp login <username>
+  abp login <username> -p <password>
+  abp login <username> --device
+
+Example:
+
+  abp login john
+  abp login john -p 1234
+```
+
+## `abp login-info` — `LoginInfoCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LoginInfoCommand.cs
+public class LoginInfoCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "login-info";
+
+    public ILogger<LoginInfoCommand> Logger { get; set; }
+
+    protected AuthService AuthService { get; }
+
+    public LoginInfoCommand(AuthService authService)
+    {
+        AuthService = authService;
+        Logger = NullLogger<LoginInfoCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (!AuthService.IsLoggedIn())
+        {
+            Logger.LogError("You are not logged in.");
+            return;
+        }
+
+        var loginInfo = await AuthService.GetLoginInfoAsync();
+
+        if (loginInfo == null)
+        {
+            Logger.LogError("Unable to get login info.");
+            return;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine("");
+        sb.AppendLine("Login info:");
+        sb.AppendLine($"Name: {loginInfo.Name}");
+        sb.AppendLine($"Surname: {loginInfo.Surname}");
+        sb.AppendLine($"Username: {loginInfo.Username}");
+        sb.AppendLine($"Email Address: {loginInfo.EmailAddress}");
+        sb.AppendLine($"Organization: {loginInfo.Organization}");
+        Logger.LogInformation(sb.ToString());
+    }
+    // ...
+}
+```
+
+A two-step routine: check the token exists (`IsLoggedIn` just looks for the file), then hit `<AccountAbpIo>api/license/login-info` and pretty-print. Useful for CI scripts that want to verify the right account is signed in before pushing pro packages.
+
+`AuthService.GetLoginInfoAsync`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Auth/AuthService.cs
+public async Task<LoginInfo> GetLoginInfoAsync()
+{
+    if (!IsLoggedIn())
+    {
+        return null;
+    }
+
+    var url = $"{CliUrls.AccountAbpIo}api/license/login-info";
+
+    var client = CliHttpClientFactory.CreateClient();
+
+    using (var response = await client.GetHttpResponseMessageWithRetryAsync(url, CancellationTokenProvider.Token, Logger))
+    {
+        if (!response.IsSuccessStatusCode)
+        {
+            Logger.LogError($"Remote server returns '{response.StatusCode}'");
+            return null;
+        }
+
+        await RemoteServiceExceptionHandler.EnsureSuccessfulHttpResponseAsync(response);
+
+        var responseContent = await response.Content.ReadAsStringAsync();
+
+        return JsonSerializer.Deserialize<LoginInfo>(responseContent);
+    }
+}
+```
+
+## `abp logout` — `LogoutCommand`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/LogoutCommand.cs
+public class LogoutCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "logout";
+
+    public ILogger<LogoutCommand> Logger { get; set; }
+
+    protected AuthService AuthService { get; }
+
+    public LogoutCommand(AuthService authService)
+    {
+        AuthService = authService;
+        Logger = NullLogger<LogoutCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        await AuthService.LogoutAsync();
+
+        Logger.LogInformation("You are logged out.");
+    }
+
+    public string GetUsageInfo()
+    {
+        return string.Empty;
+    }
+
+    public static string GetShortDescription()
+    {
+        return "Sign out from " + CliUrls.AccountAbpIo + ".";
+    }
+}
+```
+
+`AuthService.LogoutAsync` calls `CliConsts.LogoutUrl` (`https://account.abp.io/api/license/logout`) and deletes `CliPaths.AccessToken`. Note that `GetUsageInfo()` returns an empty string — `abp help logout` simply shows nothing because there are no arguments.
+
+## `abp translate` — `TranslateCommand`
+
+`abp translate` is **not** a runtime localization tool. It is a developer workflow that walks every `<culture>.json` localization file under the current directory, compares each against a reference file, and either:
+
+- emits an `abp-translation.json` diff file describing what is missing (default), or
+- applies a previously prepared `abp-translation.json` back into the per-culture files, or
+- runs the values through DeepL for the listed pairs.
+
+The entry method drives all three modes:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/TranslateCommand.cs
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    var currentDirectory = Directory.GetCurrentDirectory();
+
+    // Verify
+    if (commandLineArgs.Options.ContainsKey(Options.Verify.Long))
+    {
+        await VerifyJsonAsync(currentDirectory);
+        return;
+    }
+
+    var referenceCulture = commandLineArgs.Options.GetOrNull(Options.ReferenceCulture.Short, Options.ReferenceCulture.Long) ?? "en";
+    var allValues = commandLineArgs.Options.ContainsKey(Options.AllValues.Short) || commandLineArgs.Options.ContainsKey(Options.AllValues.Long);
+
+    // Apply abp-translation.json file
+    if (commandLineArgs.Options.ContainsKey(Options.Apply.Short) || commandLineArgs.Options.ContainsKey(Options.Apply.Long))
+    {
+        var inputFile = Path.Combine(currentDirectory, commandLineArgs.Options.GetOrNull(Options.File.Short, Options.File.Long) ?? "abp-translation.json");
+        await ApplyAbpTranslateInfoAsync(currentDirectory, inputFile);
+        return;
+    }
+
+    var targetCulture = commandLineArgs.Options.GetOrNull(Options.Culture.Short, Options.Culture.Long);
+    if (targetCulture == null)
+    {
+        throw new CliUsageException("Target culture is missing!" + Environment.NewLine + Environment.NewLine + GetUsageInfo());
+    }
+
+    // Translate online
+    if (commandLineArgs.Options.ContainsKey(Options.Online.Long))
+    {
+        var authKey = commandLineArgs.Options.GetOrNull(Options.DeepLAuthKey.Short, Options.DeepLAuthKey.Short);
+        if (authKey == null)
+        {
+            throw new CliUsageException("DeepL auth key is missing!" + Environment.NewLine + Environment.NewLine + GetUsageInfo());
+        }
+        await TranslateAbpTranslateInfoAsync(currentDirectory, targetCulture, referenceCulture, allValues, authKey);
+        return;
+    }
+
+    // Generate abp-translation.json file
+    var outputFile = Path.Combine(currentDirectory, commandLineArgs.Options.GetOrNull(Options.Output.Short, Options.Output.Long) ?? "abp-translation.json");
+    await GenerateAbpTranslateInfoAsync(currentDirectory, targetCulture, referenceCulture, allValues, outputFile);
+}
+```
+
+### Four sub-modes
+
+| Mode | Flag | Outcome |
+| --- | --- | --- |
+| Generate diff | (default) | Walks `<reference>.json` (default `en.json`) files, finds the matching `<target>.json`, and writes an `abp-translation.json` file in the working directory. Only missing values by default; pass `-all`/`--all-values` to include all. |
+| Apply diff | `-a` / `--apply` | Reads `abp-translation.json` (or `-f`/`--file <path>`) and writes the `Target` values back into each `<target>.json` next to the resources. |
+| Online translate | `--online --deepl-auth-key <key>` | Same as generate, but each missing `Reference` is fed through DeepL via the `DeepL` NuGet package, and the `Target` is set directly in the per-culture file. |
+| Verify | `--verify` | Walks every `*.json` resource file and reports invalid JSON. No translation happens. |
+
+### Generation
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/TranslateCommand.cs
+private AbpTranslateInfo GetAbpTranslateInfo(string directory, string targetCultureName, string referenceCultureName, bool allValues)
+{
+    var translateInfo = new AbpTranslateInfo
+    {
+        ReferenceCulture = referenceCultureName,
+        TargetCulture = targetCultureName,
+        Resources = new List<AbpTranslateResource>()
+    };
+
+    var referenceCultureFiles = GetCultureJsonFiles(directory, referenceCultureName);
+    foreach (var filePath in referenceCultureFiles)
+    {
+        var directoryName = Path.GetDirectoryName(filePath) ?? string.Empty;
+
+        var referenceLocalizationInfo = GetAbpLocalizationInfoOrNull(filePath);
+        if (referenceLocalizationInfo == null) // Not abp json file
+        {
+            continue;
+        }
+
+        var resource = new AbpTranslateResource
+        {
+            ResourcePath = directoryName,
+            Texts = new List<AbpTranslateResourceText>()
+        };
+
+        foreach (var text in referenceLocalizationInfo.Texts)
+        {
+            resource.Texts.Add(new AbpTranslateResourceText
+            {
+                LocalizationKey = text.Name,
+                Reference = text.Value,
+                Target = string.Empty
+            });
+        }
+
+        //Use target json file content to fill resource texts
+        var targetFile = Path.Combine(directoryName, $"{targetCultureName}.json");
+        if (File.Exists(targetFile))
+        {
+            var targetLocalizationInfo = GetAbpLocalizationInfoOrNull(targetFile);
+            foreach (var referenceResourceText in resource.Texts)
+            {
+                var text = targetLocalizationInfo.Texts.FirstOrDefault(x => x.Name == referenceResourceText.LocalizationKey);
+                referenceResourceText.Target = text?.Value ?? string.Empty;
+            }
+        }
+
+        if (!allValues)
+        {
+            //Only include missing keys.
+            resource.Texts.RemoveAll(x => !x.Target.Equals(string.Empty));
+        }
+
+        if (resource.Texts.Any())
+        {
+            translateInfo.Resources.Add(resource);
+        }
+    }
+
+    return translateInfo;
+}
+```
+
+The output shape (`AbpTranslateInfo`):
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/TranslateCommand.cs
+public class AbpTranslateInfo
+{
+    public string ReferenceCulture { get; set; }
+
+    public string TargetCulture { get; set; }
+
+    public List<AbpTranslateResource> Resources { get; set; }
+}
+
+public class AbpTranslateResource
+{
+    public string ResourcePath { get; set; }
+
+    public List<AbpTranslateResourceText> Texts { get; set; }
+}
+
+public class AbpTranslateResourceText
+{
+    public string LocalizationKey { get; set; }
+
+    public string Reference { get; set; }
+
+    public string Target { get; set; }
+}
+```
+
+For each ABP localization JSON in the tree, the command writes one `AbpTranslateResource` containing the keys missing in the target. The reference value is what was in `en.json`; the target is empty (or pre-filled if the file already had the key). Translators fill the `Target` strings and the CLI applies them back.
+
+### Online translation (DeepL)
+
+When `--online --deepl-auth-key <key>` is set, the command instantiates a `DeepL.Translator` and translates each missing reference into the target language. This requires a valid DeepL API key — it is not provided by ABP.
+
+### Verify
+
+`--verify` walks every JSON resource file and tries to parse it with Newtonsoft. Any parse failure is logged with the file path. Useful in CI gates to fail the build if a contributor commits malformed JSON.
+
+### Usage block (verbatim)
+
+```text
+Usage:
+  abp translate [options]
+
+Options:
+
+--culture|-c <culture>                       Target culture. eg: zh-Hans
+--reference-culture|-r <culture>             Default: en
+--output|-o <file-name>                      Output file name, Default abp-translation.json
+--all-values|-all                            Include all keys. Default false
+--apply|-a                                   Creates or updates the file for the translated culture.
+--file|-f <file-name>                        Default: abp-translation.json
+--online                                     Translate online.
+--deepl-auth-key <auth-key>                  DeepL auth key for online translation.
+--verify                                     Verify that all localized files are correct JSON format.
+
+Examples:
+
+  abp translate -c zh-Hans
+  abp translate -c zh-Hans -r en
+  abp translate --apply
+  abp translate -a -f my-translation.json
+  abp translate -c zh-Hans --online --deepl-auth-key <auth-key>
+  abp translate -c zh-Hans -r tr --online --deepl-auth-key <auth-key>
+```
+
+## Putting it together
+
+A typical translator workflow:
+
+```bash
+# In your solution's localization folder
+$ abp translate -c zh-Hans              # produce abp-translation.json
+# (translator fills in the Target fields)
+$ abp translate -a                      # apply the file back into zh-Hans.json files
+$ abp translate --verify                # CI gate
+```
+
+A CI gate that needs the pro nuget feed:
+
+```bash
+$ abp login ci-bot -p $ABP_BOT_PASSWORD
+$ abp login-info                        # verifies token
+$ abp new Acme.Microservice -t microservice-pro
+$ abp logout                            # remove token before storing build artefacts
+```
+
+## Related
+
+- [CLI architecture](/cli/architecture#cliconsts) — `CliConsts.LogoutUrl`, `CliPaths.AccessToken`, `CliUrls.AccountAbpIo`.
+- [`abp new`](/cli/new-command) — uses `IApiKeyService` (which reads the same access token) to authorise pro template downloads.
+- [`abp get-source`](/cli/version-switch-commands#getsourcecommand) — requires `HasSourceCodeAccess` on the logged-in account.
+- [`abp suite`](/cli/version-switch-commands#suitecommand) — installs Suite from the pro NuGet feed, so requires `abp login` first.

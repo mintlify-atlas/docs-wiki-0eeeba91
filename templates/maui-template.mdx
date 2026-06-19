@@ -1,0 +1,322 @@
+---
+title: ".NET MAUI Template"
+description: "Tour of templates/maui/ — the .NET MAUI client app template that bootstraps an ABP application for cross-platform mobile + desktop."
+---
+
+The `maui` template under [`templates/maui/`](https://github.com/abpframework/abp/tree/dev/templates/maui) is the **cross-platform client** in ABP's roster. It produces a single .NET MAUI project that targets Android, iOS, macOS (Catalyst), and Windows from one codebase — with ABP's modularity, DI, and configuration system already wired in.
+
+Generate it with:
+
+```bash
+abp new Acme.BookstoreMobile -t maui
+```
+
+Use it for:
+
+- A mobile companion app that calls an ABP backend over HTTP.
+- A desktop tool that needs ABP's module composition (e.g. plugging in a [module](/templates/module-template)).
+- Native UIs that share business logic with a [layered ASP.NET Core](/templates/app-template-aspnet-core) backend via `Application.Contracts` + `HttpApi.Client` references.
+
+## Solution layout
+
+```
+templates/maui/
+├── MyCompanyName.MyProjectName.slnx
+├── common.props
+└── src/
+    └── MyCompanyName.MyProjectName/
+        ├── App.xaml / App.xaml.cs
+        ├── AppShell.xaml / AppShell.xaml.cs
+        ├── HelloWorldService.cs
+        ├── MainPage.xaml / MainPage.xaml.cs
+        ├── MauiProgram.cs                  # Bootstrap
+        ├── MyCompanyName.MyProjectName.csproj
+        ├── MyProjectNameModule.cs          # The ABP module
+        ├── Platforms/
+        │   ├── Android/
+        │   ├── iOS/
+        │   ├── MacCatalyst/
+        │   ├── Tizen/
+        │   └── Windows/
+        ├── Properties/
+        ├── Resources/
+        └── appsettings.json
+```
+
+One MAUI project, multi-targeted, with the standard `Platforms/` folders for platform-specific code.
+
+## `.csproj` — multi-targeting
+
+```xml templates/maui/src/MyCompanyName.MyProjectName/MyCompanyName.MyProjectName.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <Import Project="..\..\common.props" />
+
+    <PropertyGroup>
+        <TargetFrameworks>net10.0;net10.0-android;net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+        <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net10.0-windows10.0.19041.0</TargetFrameworks>
+        <!-- Uncomment to also build the tizen app. You will need to install tizen by following this: https://github.com/Samsung/Tizen.NET -->
+        <!-- <TargetFrameworks>$(TargetFrameworks);net10.0-tizen</TargetFrameworks> -->
+        <Nullable>enable</Nullable>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>MyCompanyName.MyProjectName</RootNamespace>
+        <UseMaui>true</UseMaui>
+        <SingleProject>true</SingleProject>
+        <ImplicitUsings>enable</ImplicitUsings>
+
+        <ApplicationTitle>MyCompanyName.MyProjectName</ApplicationTitle>
+        <ApplicationId>com.mycompanyname.myprojectname</ApplicationId>
+        <ApplicationIdGuid>27317750-B571-4690-B433-B358B2480E01</ApplicationIdGuid>
+        <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+        <ApplicationVersion>1</ApplicationVersion>
+        /* SupportedOSPlatformVersion blocks per platform */
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\..\framework\src\Volo.Abp.Autofac\Volo.Abp.Autofac.csproj" />
+        <PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" Version="10.0.0" />
+    </ItemGroup>
+</Project>
+```
+
+The interesting bits for an ABP module author:
+
+- **`<SingleProject>true</SingleProject>`** — one csproj, many target frameworks. MAUI's hallmark.
+- **`<UseMaui>true</UseMaui>`** — pulls in the MAUI workload.
+- **`Volo.Abp.Autofac`** reference — needed because ABP's module composition relies on Autofac.
+- **`Microsoft.Extensions.FileProviders.Embedded`** — used to load `appsettings.json` from an embedded resource at runtime (MAUI doesn't ship a file system in the desktop sense on every platform).
+
+## `MauiProgram.cs` — bootstrap
+
+MAUI doesn't have a `Program.cs` with `Main` — it has `MauiProgram.CreateMauiApp` invoked by each platform's entry point. ABP plugs into the builder before `Build`:
+
+```csharp templates/maui/src/MyCompanyName.MyProjectName/MauiProgram.cs
+public static class MauiProgram
+{
+    public static MauiApp CreateMauiApp()
+    {
+        var builder = MauiApp.CreateBuilder();
+        builder
+            .UseMauiApp<App>()
+            .ConfigureFonts(fonts =>
+            {
+                fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");
+                fonts.AddFont("OpenSans-Semibold.ttf", "OpenSansSemibold");
+            })
+            .ConfigureContainer(new AbpAutofacServiceProviderFactory(new Autofac.ContainerBuilder()));
+
+        ConfigureConfiguration(builder);
+
+        builder.Services.AddApplication<MyProjectNameModule>(options =>
+        {
+            options.Services.ReplaceConfiguration(builder.Configuration);
+        });
+
+        var app = builder.Build();
+
+        app.Services.GetRequiredService<IAbpApplicationWithExternalServiceProvider>().Initialize(app.Services);
+
+        return app;
+    }
+
+    private static void ConfigureConfiguration(MauiAppBuilder builder)
+    {
+        var assembly = typeof(App).GetTypeInfo().Assembly;
+        builder.Configuration.AddJsonFile(new EmbeddedFileProvider(assembly), "appsettings.json", optional: false, false);
+    }
+}
+```
+
+Three pieces that differ from the web template:
+
+1. **`ConfigureContainer(new AbpAutofacServiceProviderFactory(...))`** — ABP brings its own Autofac factory. The web hosts use `UseAutofac()`; MAUI uses the lower-level `ConfigureContainer` because `MauiAppBuilder` doesn't expose `UseAutofac()`.
+2. **`AddApplication<TModule>` (not `AddApplicationAsync`)** — MAUI's startup is synchronous on most platforms, so the template uses the synchronous overload.
+3. **External service provider initialization.** `Initialize(app.Services)` is called *after* `Build()` because MAUI owns the root `IServiceProvider`; ABP can't construct its own.
+
+`ConfigureConfiguration` reads `appsettings.json` from an embedded resource:
+
+```jsonc
+"AppName": "MyProjectName"
+```
+
+(see [`appsettings.json`](https://github.com/abpframework/abp/blob/dev/templates/maui/src/MyCompanyName.MyProjectName/appsettings.json) — the file is literally `{"AppName": "MyProjectName"}` at template time).
+
+<Warning>
+On mobile platforms there is no working directory you can put `appsettings.json` in. Loading from an embedded resource (the `EmbeddedFileProvider` line) is the canonical fix.
+</Warning>
+
+## `App.xaml.cs` and `AppShell.xaml.cs`
+
+`App` is a thin host that points MAUI at its initial shell:
+
+```csharp templates/maui/src/MyCompanyName.MyProjectName/App.xaml.cs
+public partial class App : Application
+{
+    public App()
+    {
+        InitializeComponent();
+
+        MainPage = new AppShell();
+    }
+}
+```
+
+`AppShell` is generated by MAUI's template tooling and is unchanged from the stock MAUI shell — flyout, routing, navigation. ABP doesn't touch this layer.
+
+## `MainPage.xaml.cs` — DI-aware page
+
+`MainPage` shows how to use ABP DI on a MAUI page:
+
+```csharp templates/maui/src/MyCompanyName.MyProjectName/MainPage.xaml.cs
+public partial class MainPage : ContentPage, ISingletonDependency
+{
+    private readonly HelloWorldService _helloWorldService;
+
+    int count = 0;
+
+    public MainPage(HelloWorldService helloWorldService)
+    {
+        _helloWorldService = helloWorldService;
+        InitializeComponent();
+        SetHelloLabText();
+    }
+
+    private void SetHelloLabText()
+    {
+        HelloLab.Text = _helloWorldService.SayHello();
+    }
+
+    private void OnCounterClicked(object sender, EventArgs e)
+    {
+        count++;
+
+        if (count == 1)
+            CounterBtn.Text = $"Clicked {count} time";
+        else
+            CounterBtn.Text = $"Clicked {count} times";
+
+        SemanticScreenReader.Announce(CounterBtn.Text);
+    }
+}
+```
+
+Two ABP idioms:
+
+1. **`ISingletonDependency`** on `MainPage` — registers the page as a singleton so MAUI can resolve it from DI when needed.
+2. **Constructor injection of `HelloWorldService`** — works because the page was instantiated by the Autofac-backed service provider.
+
+## `HelloWorldService.cs`
+
+The trivial transient service the page consumes:
+
+```csharp templates/maui/src/MyCompanyName.MyProjectName/HelloWorldService.cs
+public class HelloWorldService : ITransientDependency
+{
+    public string SayHello()
+    {
+        return "Hello, World!";
+    }
+}
+```
+
+`ITransientDependency` is the marker that auto-registers it. Same pattern as the [console template](/templates/console-template).
+
+## `MyProjectNameModule.cs`
+
+The smallest possible ABP module — depends on Autofac and nothing else:
+
+```csharp templates/maui/src/MyCompanyName.MyProjectName/MyProjectNameModule.cs
+[DependsOn(typeof(AbpAutofacModule))]
+public class MyProjectNameModule : AbpModule
+{
+}
+```
+
+This is where you'll add `[DependsOn(typeof(MyHttpApiClientModule))]` to consume the `HttpApi.Client` package from a layered backend so the MAUI app can call its application services with typed proxies.
+
+## `Platforms/`
+
+Standard MAUI platform folders:
+
+```
+Platforms/
+├── Android/      # MainActivity.cs, AndroidManifest.xml, app icons
+├── MacCatalyst/  # AppDelegate.cs, Info.plist
+├── Tizen/        # tizen-manifest.xml
+├── Windows/      # App.xaml, Package.appxmanifest, WinUI assets
+└── iOS/          # AppDelegate.cs, Info.plist
+```
+
+Each platform's `AppDelegate` / `MainActivity` / `App.xaml.cs` calls back into `MauiProgram.CreateMauiApp()` so ABP's wiring runs identically on every target.
+
+## `Resources/`
+
+Shared MAUI resources — fonts, images, splash screens, app icon. The default template includes the `OpenSans-Regular.ttf` and `OpenSans-Semibold.ttf` fonts that `MauiProgram.cs` registers.
+
+## Building and running
+
+<Steps>
+  <Step title="Install the MAUI workload">
+    ```bash
+    dotnet workload install maui
+    ```
+  </Step>
+  <Step title="Build for your target">
+    ```bash
+    dotnet build src/Acme.BookstoreMobile -f net10.0-android
+    ```
+    Swap the framework for `net10.0-ios`, `net10.0-maccatalyst`, or `net10.0-windows10.0.19041.0` as needed.
+  </Step>
+  <Step title="Run on the simulator/emulator">
+    Use the IDE's debug target picker (Visual Studio, Rider, VS Code with MAUI extension). On the CLI:
+    ```bash
+    dotnet run --project src/Acme.BookstoreMobile -f net10.0-android
+    ```
+  </Step>
+</Steps>
+
+See [Project building](/cli/project-building) for the broader post-`abp new` workflow.
+
+## Extending the template
+
+<CardGroup cols={2}>
+  <Card title="Call a layered backend" icon="cloud">
+    Reference the backend's `Application.Contracts` and `HttpApi.Client` packages, add `[DependsOn(typeof(MyProjectNameHttpApiClientModule))]`, and you can call application services from any page.
+  </Card>
+  <Card title="Add OAuth login" icon="lock">
+    Wire `Volo.Abp.OpenIddict.Authentication` (or your IdP's SDK) and store tokens in the platform's secure storage (`SecureStorage.Default.SetAsync`).
+  </Card>
+  <Card title="Add a module" icon="puzzle-piece">
+    Build a [module template](/templates/module-template) with a `Blazor.WebAssembly` UI and consume it from MAUI's Blazor hybrid hosting.
+  </Card>
+  <Card title="Add background sync" icon="rotate">
+    Register an `IHostedService`-equivalent with platform-specific lifecycle hooks (`Android.WorkManager`, `iOS BGTaskScheduler`) and inject ABP services.
+  </Card>
+</CardGroup>
+
+## Differences vs. the other client templates
+
+| Aspect | Console | WPF | MAUI |
+| --- | --- | --- | --- |
+| Bootstrap entry | `Program.Main` + `Host.CreateApplicationBuilder` | `App.OnStartup` + `AbpApplicationFactory.CreateAsync` | `MauiProgram.CreateMauiApp` + `AddApplication<T>` |
+| DI factory | `AddAutofacServiceProviderFactory` | `options.UseAutofac()` | `AbpAutofacServiceProviderFactory` via `ConfigureContainer` |
+| Module init | `host.InitializeAsync()` | `_abpApplication.InitializeAsync()` | `IAbpApplicationWithExternalServiceProvider.Initialize(app.Services)` |
+| Configuration source | `appsettings.json` from working dir | `appsettings.json` from working dir | Embedded `appsettings.json` |
+| Logging | Serilog | Serilog | (template ships none — add Serilog yourself) |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    `-t maui` and combinations.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    Workloads, platforms, publish settings.
+  </Card>
+  <Card title="WPF template" icon="window-restore" href="/templates/wpf-template">
+    Windows-only desktop alternative.
+  </Card>
+  <Card title="Layered app" icon="layer-group" href="/templates/app-template-aspnet-core">
+    Backend this client typically talks to.
+  </Card>
+</CardGroup>

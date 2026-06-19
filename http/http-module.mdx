@@ -1,0 +1,320 @@
+---
+title: "Http Module — ApiDescription Model & Remote Config"
+sidebarTitle: "Http Module"
+description: "Volo.Abp.Http: the ApplicationApiDescriptionModel that drives proxy generation and dynamic client routing, plus AbpHttpModule wiring of jQuery scripting."
+---
+
+`Volo.Abp.Http` sits one rung above the abstractions package. It defines the *concrete* `ApplicationApiDescriptionModel` / `ControllerApiDescriptionModel` / `ActionApiDescriptionModel` graph that ABP servers expose at `GET /api/abp/api-definition` and that the client-side `ApiDescriptionFinder` walks to map a `MethodInfo` onto an HTTP route. The package also hosts the legacy `ProxyScripting` infrastructure (jQuery generators) and the `HttpMethodHelper` used by both sides.
+
+Module path: `framework/src/Volo.Abp.Http/Volo/Abp/Http/`.
+
+## `AbpHttpModule`
+
+```csharp
+[DependsOn(typeof(AbpHttpAbstractionsModule))]
+[DependsOn(typeof(AbpJsonModule))]
+[DependsOn(typeof(AbpMinifyModule))]
+public class AbpHttpModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpApiProxyScriptingOptions>(options =>
+        {
+            options.Generators[JQueryProxyScriptGenerator.Name] = typeof(JQueryProxyScriptGenerator);
+        });
+    }
+}
+```
+
+It depends on `AbpJsonModule` because the API description model is serialized to JSON for both transport and the in-memory `ApiDescriptionCache`. It depends on `AbpMinifyModule` because the proxy-script generators run the resulting JavaScript through the minifier when minified delivery is requested.
+
+## `AbpHttpConsts`
+
+```csharp
+public static class AbpHttpConsts
+{
+    public const string AbpErrorFormat = "_AbpErrorFormat";
+    public const string AbpTenantResolveError = "Abp-Tenant-Resolve-Error";
+}
+```
+
+`AbpErrorFormat` is the marker that tells the server "this caller speaks ABP error envelope" — typed clients send it so they always get `RemoteServiceErrorResponse` shape even when content-negotiation would prefer ProblemDetails. `AbpTenantResolveError` is the response header that signals a failed tenant resolution downstream.
+
+## `ApplicationApiDescriptionModel`
+
+The root of the description graph returned by the server. Its `Modules` dictionary keys by ABP module name, each `ModuleApiDescriptionModel.Controllers` keys by controller name, and each `ControllerApiDescriptionModel.Actions` keys by action name.
+
+File layout:
+
+```text
+framework/src/Volo.Abp.Http/Volo/Abp/Http/Modeling/
+├── ApplicationApiDescriptionModel.cs
+├── ApplicationApiDescriptionModelRequestDto.cs   // filter input
+├── ModuleApiDescriptionModel.cs
+├── ControllerApiDescriptionModel.cs
+├── ControllerInterfaceApiDescriptionModel.cs
+├── ActionApiDescriptionModel.cs
+├── InterfaceMethodApiDescriptionModel.cs
+├── ParameterApiDescriptionModel.cs                // server route binding
+├── MethodParameterApiDescriptionModel.cs          // C# method signature
+├── PropertyApiDescriptionModel.cs
+├── ReturnValueApiDescriptionModel.cs
+├── TypeApiDescriptionModel.cs
+└── ApiTypeNameHelper.cs
+```
+
+Each `ActionApiDescriptionModel` records the HTTP method, the URL template, the `Parameters` collection (with `BindingSourceId` from `ParameterBindingSources` — `path`, `query`, `body`, `form`, `header`), the `SupportedVersions` list, and the `ImplementFrom` type FullName that lets the client check which interface a controller implements.
+
+## `AbpHttpClientOptions`
+
+> Lives in `Volo.Abp.Http.Client` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/AbpHttpClientOptions.cs`) but is documented here because it is the contract every server-side description discovery feeds.
+
+```csharp
+public class AbpHttpClientOptions
+{
+    public Dictionary<Type, HttpClientProxyConfig> HttpClientProxies { get; set; }
+
+    public Dictionary<string, List<Action<HttpClientProxyConfig, ClientProxyRequestContext, HttpClient>>>
+        ProxyHttpClientPreSendActions { get; }
+
+    public AbpHttpClientOptions()
+    {
+        HttpClientProxies = new Dictionary<Type, HttpClientProxyConfig>();
+        ProxyHttpClientPreSendActions = new ();
+    }
+
+    public AbpHttpClientOptions AddPreSendAction(string remoteServiceName,
+        Action<HttpClientProxyConfig, ClientProxyRequestContext, HttpClient> action)
+    {
+        ProxyHttpClientPreSendActions
+            .GetOrAdd(remoteServiceName, () => new List<Action<...>>())
+            .Add(action);
+        return this;
+    }
+}
+```
+
+`HttpClientProxies` is populated by `AddHttpClientProxies(Assembly, remoteServiceName)`. `ProxyHttpClientPreSendActions` is the hook callers use to mutate the `HttpClient` (set headers, swap base address) on each request:
+
+```csharp
+Configure<AbpHttpClientOptions>(o =>
+{
+    o.AddPreSendAction("Saas", (cfg, ctx, http) =>
+    {
+        http.DefaultRequestHeaders.Add("X-Caller", "WebGateway");
+    });
+});
+```
+
+## `IRemoteServiceConfigurationProvider`
+
+Defined in `Volo.Abp.RemoteServices`:
+
+```csharp
+namespace Volo.Abp.Http.Client;
+
+public interface IRemoteServiceConfigurationProvider
+{
+    [ItemNotNull]
+    Task<RemoteServiceConfiguration> GetConfigurationOrDefaultAsync(string name);
+
+    Task<RemoteServiceConfiguration?> GetConfigurationOrDefaultOrNullAsync(string name);
+}
+```
+
+`GetConfigurationOrDefaultAsync` falls back to the `"Default"` named entry; the nullable variant returns `null` when neither the requested name nor the default exists.
+
+## `DefaultRemoteServiceConfigurationProvider`
+
+The shipped implementation is named `RemoteServiceConfigurationProvider` (in the `Volo.Abp.RemoteServices` package). It is a `IScopedDependency` because the result depends on the current tenant — `IMultiTenantUrlProvider` can rewrite `BaseUrl` to embed `{0}` tenant placeholders.
+
+```csharp
+public class RemoteServiceConfigurationProvider : IRemoteServiceConfigurationProvider, IScopedDependency
+{
+    protected AbpRemoteServiceOptions Options { get; }
+    protected IMultiTenantUrlProvider MultiTenantUrlProvider { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public RemoteServiceConfigurationProvider(
+        IOptionsMonitor<AbpRemoteServiceOptions> options,
+        IMultiTenantUrlProvider multiTenantUrlProvider,
+        ICurrentTenant currentTenant)
+    {
+        MultiTenantUrlProvider = multiTenantUrlProvider;
+        CurrentTenant = currentTenant;
+        Options = options.CurrentValue;
+    }
+
+    public virtual async Task<RemoteServiceConfiguration> GetConfigurationOrDefaultAsync(string name)
+    {
+        return (await GetMultiTenantConfigurationAsync(
+            Options.RemoteServices.GetConfigurationOrDefault(name)))!;
+    }
+
+    public virtual async Task<RemoteServiceConfiguration?> GetConfigurationOrDefaultOrNullAsync(string name)
+    {
+        return await GetMultiTenantConfigurationAsync(
+            Options.RemoteServices.GetConfigurationOrDefaultOrNull(name));
+    }
+
+    protected virtual async Task<RemoteServiceConfiguration?> GetMultiTenantConfigurationAsync(
+        RemoteServiceConfiguration? configuration)
+    {
+        if (configuration == null) return configuration;
+
+        var baseUrl = await MultiTenantUrlProvider.GetUrlAsync(configuration.BaseUrl);
+        if (baseUrl == configuration.BaseUrl) return configuration;
+
+        return new RemoteServiceConfiguration(configuration) { BaseUrl = baseUrl };
+    }
+}
+```
+
+Because the provider clones the configuration before rewriting `BaseUrl`, you can safely cache the original `RemoteServiceConfiguration` instance in `AbpRemoteServiceOptions` without ever mutating it.
+
+## `AbpRemoteServiceOptions`
+
+```csharp
+public class AbpRemoteServiceOptions
+{
+    public RemoteServiceConfigurationDictionary RemoteServices { get; set; }
+
+    public AbpRemoteServiceOptions()
+    {
+        RemoteServices = new RemoteServiceConfigurationDictionary();
+    }
+}
+```
+
+Bound from configuration in `AbpRemoteServicesModule.ConfigureServices` via `Configure<AbpRemoteServiceOptions>(context.Services.GetConfiguration())`. A typical `appsettings.json` looks like:
+
+```json
+{
+  "RemoteServices": {
+    "Default":   { "BaseUrl": "https://api.example.com/" },
+    "Identity":  { "BaseUrl": "https://identity-svc.example.com/" },
+    "Saas":      { "BaseUrl": "https://saas-svc.example.com/", "Version": "v1" }
+  }
+}
+```
+
+## `RemoteServiceConfiguration`
+
+A `Dictionary<string, string?>` with strongly-typed accessors. Storing extras as plain string entries lets extension packages (the IdentityModel authenticator, the SignalR client, etc.) tack on their own settings without modifying this class.
+
+```csharp
+public class RemoteServiceConfiguration : Dictionary<string, string?>
+{
+    public string  BaseUrl { get => this.GetOrDefault(nameof(BaseUrl))!;  set => this[nameof(BaseUrl)] = value; }
+    public string? Version { get => this.GetOrDefault(nameof(Version));   set => this[nameof(Version)] = value; }
+
+    public RemoteServiceConfiguration() { }
+    public RemoteServiceConfiguration(string baseUrl, string? version = null)
+    {
+        this[nameof(BaseUrl)] = baseUrl;
+        this[nameof(Version)] = version;
+    }
+    public RemoteServiceConfiguration(RemoteServiceConfiguration configuration)
+    {
+        foreach (var kv in configuration) this.Add(kv.Key, kv.Value);
+    }
+}
+```
+
+The `Volo.Abp.Http.Client.IdentityModel` package adds extension methods that store an `IdentityClient` name and a `UseCurrentAccessToken` flag in this same dictionary — see [Http.Client.IdentityModel](/http/http-client-identitymodel).
+
+## `IHttpClientProxy<TRemoteService>`
+
+The contract `AddHttpClientProxies` registers for every discovered interface — useful when you want to *also* keep DI registrations of the original implementation, but ask explicitly for the HTTP version:
+
+```csharp
+namespace Volo.Abp.Http.Client.DynamicProxying;
+
+public interface IHttpClientProxy<out TRemoteService>
+{
+    TRemoteService Service { get; }
+}
+
+public class HttpClientProxy<TRemoteService> : IHttpClientProxy<TRemoteService>
+{
+    public TRemoteService Service { get; }
+    public HttpClientProxy(TRemoteService service) { Service = service; }
+}
+```
+
+```csharp
+public class OrdersPage
+{
+    public OrdersPage(IHttpClientProxy<IBookAppService> bookProxy)
+    {
+        var books = bookProxy.Service.GetListAsync(new());
+    }
+}
+```
+
+## `HttpMethodHelper`
+
+Lives in `framework/src/Volo.Abp.Http/Volo/Abp/Http/HttpMethodHelper.cs`. It encodes the "convention-over-configuration" verb mapping used by both auto-controller generation and `ApiDescriptionFinder`:
+
+- `Get*`, `Find*`, `Query*` → `GET`
+- `Create*`, `Add*`, `Insert*`, `Post*` → `POST`
+- `Update*`, `Put*` → `PUT`
+- `Delete*`, `Remove*` → `DELETE`
+- `Patch*` → `PATCH`
+
+Override the convention server-side with `[HttpGet]` / `[HttpPost]` and the description model will surface the explicit verb in `ActionApiDescriptionModel.HttpMethod`.
+
+## ProxyScripting (legacy jQuery generator)
+
+`AbpHttpModule` also wires the jQuery proxy-script generator, which the MVC bundle middleware serves at `/Abp/ServiceProxyScript`. The relevant types live under `framework/src/Volo.Abp.Http/Volo/Abp/Http/ProxyScripting/`:
+
+```text
+ProxyScripting/
+├── IProxyScriptManager.cs
+├── IProxyScriptManagerCache.cs
+├── ProxyScriptManager.cs
+├── ProxyScriptManagerCache.cs
+├── ProxyScriptingModel.cs
+├── Configuration/
+│   ├── AbpApiProxyScriptingConfiguration.cs
+│   └── AbpApiProxyScriptingOptions.cs
+└── Generators/
+    ├── IProxyScriptGenerator.cs
+    ├── ParameterBindingSources.cs
+    ├── ProxyScriptingHelper.cs
+    ├── ProxyScriptingJsFuncHelper.cs
+    └── JQuery/
+        ├── DynamicJavaScriptProxyOptions.cs
+        └── JQueryProxyScriptGenerator.cs
+```
+
+`ProxyScriptingHelper` and `ProxyScriptingJsFuncHelper` are pure functions reused by alternative generators (Angular, Vue) hosted as separate community packages.
+
+### `ParameterBindingSources`
+
+Encodes the binding sources that show up in `ParameterApiDescriptionModel.BindingSourceId`:
+
+```csharp
+public static class ParameterBindingSources
+{
+    public const string ModelBinding = "ModelBinding";
+    public const string Form         = "Form";
+    public const string Body         = "Body";
+    public const string Path         = "Path";
+    public const string Query        = "Query";
+    public const string Header       = "Header";
+    public const string FormFile     = "FormFile";
+    public const string Services     = "Services";
+    public const string Custom       = "Custom";
+}
+```
+
+Client proxies inspect this to decide how to encode each argument — `Path` → URL template substitution, `Query` → query string, `Body` → JSON body, `Form` → form-url-encoded payload, etc.
+
+## Related
+
+- [Http.Abstractions](/http/http-abstractions) — the marker module + `RemoteServiceErrorInfo`.
+- [Http.Client](/http/http-client) — the consumer of `IRemoteServiceConfigurationProvider` and `ApplicationApiDescriptionModel`.
+- [RemoteServices](/http/remote-services) — the module that registers `AbpRemoteServiceOptions` from `IConfiguration`.
+- [Dynamic HTTP API and Proxy Generation](/aspnetcore/mvc-controllers-and-conventions) — the end-to-end flow.
+- [MVC Controllers and Conventions](/aspnetcore/mvc-controllers-and-conventions) — the server-side that builds the description model.

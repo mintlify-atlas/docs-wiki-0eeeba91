@@ -1,0 +1,317 @@
+---
+title: "AWS BLOB Provider: Amazon S3 Object Storage Backend"
+sidebarTitle: "AWS S3"
+description: "Use AwsBlobProvider to persist ABP blobs in Amazon S3 with profile, temporary or federated credentials, STS session caching and per-tenant key prefixes."
+---
+
+`Volo.Abp.BlobStoring.Aws` is the S3 backend for ABP's BLOB Storing system. It wires the official AWS SDK (`AWSSDK.S3`, `AWSSDK.SecurityToken`) to `IBlobProvider`, supports four credential modes (static, profile, temporary, temporary federated), caches temporary STS credentials in the distributed cache, and prefixes blob keys per tenant.
+
+Source: `framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/`. The four classes you will read most are `AwsBlobProvider`, `AwsBlobProviderConfiguration`, `IAmazonS3ClientFactory` (and its default), and `DefaultAwsBlobNameCalculator`.
+
+## Module and configuration
+
+Add `AbpBlobStoringAwsModule` to your `[DependsOn]` list and configure any container with `UseAws(...)`:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringModule),
+    typeof(AbpBlobStoringAwsModule)
+)]
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                container.UseAws(aws =>
+                {
+                    aws.AccessKeyId = "AKIA...";
+                    aws.SecretAccessKey = "...";
+                    aws.Region = "us-east-1";
+                    aws.ContainerName = "myapp-bucket";
+                    aws.CreateContainerIfNotExists = true;
+                });
+            });
+        });
+    }
+}
+```
+
+The extension follows the same pattern as the other providers: assign the provider type, register an S3‑specific naming normalizer, and expose a typed configuration view.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/AwsBlobContainerConfigurationExtensions.cs"
+public static BlobContainerConfiguration UseAws(
+    this BlobContainerConfiguration containerConfiguration,
+    Action<AwsBlobProviderConfiguration> awsConfigureAction)
+{
+    containerConfiguration.ProviderType = typeof(AwsBlobProvider);
+    containerConfiguration.NamingNormalizers.TryAdd<AwsBlobNamingNormalizer>();
+
+    awsConfigureAction(new AwsBlobProviderConfiguration(containerConfiguration));
+
+    return containerConfiguration;
+}
+```
+
+## `AwsBlobProviderConfiguration`
+
+`AwsBlobProviderConfiguration` exposes the full set of credential and bucket settings.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/AwsBlobProviderConfiguration.cs"
+public class AwsBlobProviderConfiguration
+{
+    public string? AccessKeyId { get; set; }
+    public string? SecretAccessKey { get; set; }
+
+    public bool UseCredentials { get; set; }
+    public bool UseTemporaryCredentials { get; set; }
+    public bool UseTemporaryFederatedCredentials { get; set; }
+
+    public string? ProfileName { get; set; }
+    public string? ProfilesLocation { get; set; }
+
+    /// <summary>
+    /// Validity period of temporary credentials in seconds.
+    /// Minimum 900, maximum 129600.
+    /// </summary>
+    public int DurationSeconds { get; set; }
+
+    public string Name { get; set; }
+    public string? Policy { get; set; }
+
+    public string Region { get; set; }
+
+    /// <summary>
+    /// S3 bucket name. Must be 3–63 chars, lowercase, no underscores, etc.
+    /// If not specified, the BlobProviderArgs.ContainerName is used.
+    /// </summary>
+    public string? ContainerName { get; set; }
+
+    /// <summary>Default: false.</summary>
+    public bool CreateContainerIfNotExists { get; set; }
+
+    public string? TemporaryCredentialsCacheKey { get; set; }
+}
+```
+
+Four credential modes are exposed as boolean flags, each one taking precedence in a specific order inside the client factory. Mix them as your environment requires:
+
+| Mode | Flags | Source of credentials |
+| --- | --- | --- |
+| Static | None (default) | `AccessKeyId` + `SecretAccessKey` literal values |
+| Profile / SSO | `UseCredentials = true` | `~/.aws/credentials` profile via `CredentialProfileStoreChain` |
+| STS session | `UseTemporaryCredentials = true` | `GetSessionToken` from STS, cached |
+| Federated session | `UseTemporaryFederatedCredentials = true` | `GetFederationToken` with `Name` + `Policy`, cached |
+
+`TemporaryCredentialsCacheKey` is a per‑container random GUID by default, so each container's STS session is cached independently. Override it if you intentionally want containers to share credentials.
+
+## `AwsBlobProvider`
+
+The provider creates an `AmazonS3Client` for the call (and disposes it via `using`), then issues SDK calls.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/AwsBlobProvider.cs"
+public override async Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var blobName = AwsBlobNameCalculator.Calculate(args);
+    var configuration = args.Configuration.GetAwsConfiguration();
+    var containerName = GetContainerName(args);
+
+    using (var amazonS3Client = await GetAmazonS3Client(args))
+    {
+        if (!args.OverrideExisting && await BlobExistsAsync(amazonS3Client, containerName, blobName))
+        {
+            throw new BlobAlreadyExistsException(
+                $"Saving BLOB '{args.BlobName}' does already exists in the container '{containerName}'! " +
+                $"Set {nameof(args.OverrideExisting)} if it should be overwritten.");
+        }
+
+        if (configuration.CreateContainerIfNotExists)
+        {
+            await CreateContainerIfNotExists(amazonS3Client, containerName);
+        }
+
+        await amazonS3Client.PutObjectAsync(new PutObjectRequest
+        {
+            BucketName = containerName,
+            Key = blobName,
+            InputStream = args.BlobStream
+        });
+    }
+}
+```
+
+`BlobExistsAsync` first probes the bucket via `AmazonS3Util.DoesS3BucketExistV2Async`, then `GetObjectMetadataAsync`. The bucket pre‑check guards against a 404 from S3 when the bucket itself does not exist.
+
+`CreateContainerIfNotExists` issues a `PutBucketAsync` when the bucket is missing, gated by the configuration flag. As with Azure, leave the flag `false` in production where buckets are provisioned via IaC.
+
+## S3 client wiring — `DefaultAmazonS3ClientFactory`
+
+The factory turns an `AwsBlobProviderConfiguration` into an `AmazonS3Client`. It is where the four credential modes are evaluated.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/DefaultAmazonS3ClientFactory.cs"
+public virtual async Task<AmazonS3Client> GetAmazonS3Client(
+    AwsBlobProviderConfiguration configuration)
+{
+    var region = RegionEndpoint.GetBySystemName(configuration.Region);
+
+    if (configuration.UseCredentials)
+    {
+        var awsCredentials = GetAwsCredentials(configuration);
+        return awsCredentials == null
+            ? new AmazonS3Client(region)
+            : new AmazonS3Client(awsCredentials, region);
+    }
+
+    if (configuration.UseTemporaryCredentials)
+    {
+        return new AmazonS3Client(await GetTemporaryCredentialsAsync(configuration), region);
+    }
+
+    if (configuration.UseTemporaryFederatedCredentials)
+    {
+        return new AmazonS3Client(await GetTemporaryFederatedCredentialsAsync(configuration), region);
+    }
+
+    Check.NotNullOrWhiteSpace(configuration.AccessKeyId, nameof(configuration.AccessKeyId));
+    Check.NotNullOrWhiteSpace(configuration.SecretAccessKey, nameof(configuration.SecretAccessKey));
+
+    return new AmazonS3Client(configuration.AccessKeyId, configuration.SecretAccessKey, region);
+}
+```
+
+### Profile / SSO mode
+
+When `UseCredentials = true`, `GetAwsCredentials` walks the `CredentialProfileStoreChain` for the named profile:
+
+```csharp
+protected virtual AWSCredentials? GetAwsCredentials(AwsBlobProviderConfiguration configuration)
+{
+    if (configuration.ProfileName.IsNullOrWhiteSpace())
+    {
+        return null;
+    }
+
+    var chain = new CredentialProfileStoreChain(configuration.ProfilesLocation);
+
+    if (chain.TryGetAWSCredentials(configuration.ProfileName, out var awsCredentials))
+    {
+        return awsCredentials;
+    }
+
+    throw new AmazonS3Exception("Not found aws credentials");
+}
+```
+
+If `ProfileName` is empty, the SDK's default credentials resolver (instance profile, environment variables, container metadata) is used — that is the common path for EC2/ECS/EKS workloads.
+
+### STS session and federated tokens
+
+For `UseTemporaryCredentials`, the factory calls `STS.GetSessionTokenAsync` with `DurationSeconds`. For `UseTemporaryFederatedCredentials`, it calls `STS.GetFederationTokenAsync` with `Name` + `Policy`. Both paths cache the resulting access key / secret / session token in `IDistributedCache<AwsTemporaryCredentialsCacheItem>` so each request does not pay the STS round‑trip.
+
+```csharp
+private async Task<AwsTemporaryCredentialsCacheItem> SetTemporaryCredentialsCache(
+    AwsBlobProviderConfiguration configuration,
+    Credentials credentials)
+{
+    var temporaryCredentialsCache = new AwsTemporaryCredentialsCacheItem(
+        StringEncryptionService.Encrypt(credentials.AccessKeyId)!,
+        StringEncryptionService.Encrypt(credentials.SecretAccessKey)!,
+        StringEncryptionService.Encrypt(credentials.SessionToken)!);
+
+    await Cache.SetAsync(configuration.TemporaryCredentialsCacheKey!, temporaryCredentialsCache,
+        new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(configuration.DurationSeconds - 10)
+        });
+
+    return temporaryCredentialsCache;
+}
+```
+
+Three points worth knowing:
+
+1. The cache TTL is `DurationSeconds - 10` so credentials always refresh before they would expire server‑side.
+2. The three secret fields are encrypted at rest by `IStringEncryptionService` — even the distributed cache never sees plaintext tokens.
+3. The cache key is per container by default; if you want all containers to share an STS session, set the same `TemporaryCredentialsCacheKey`.
+
+You can replace `DefaultAmazonS3ClientFactory` to add custom endpoints (S3 compatible appliances behind a private VPC endpoint, for example) by implementing `IAmazonS3ClientFactory` and registering with `[Dependency(ReplaceServices = true)]`.
+
+## `DefaultAwsBlobNameCalculator`
+
+Like the Azure calculator, the AWS calculator prefixes each blob key with `host/` or `tenants/{tenantId}/` based on `ICurrentTenant`. The blob name produced becomes the S3 object key inside the configured bucket.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Aws/Volo/Abp/BlobStoring/Aws/DefaultAwsBlobNameCalculator.cs (shape)"
+public class DefaultAwsBlobNameCalculator : IAwsBlobNameCalculator, ITransientDependency
+{
+    public virtual string Calculate(BlobProviderArgs args)
+    {
+        return CurrentTenant.Id == null
+            ? $"host/{args.BlobName}"
+            : $"tenants/{CurrentTenant.Id.Value:D}/{args.BlobName}";
+    }
+}
+```
+
+Combined with `BlobContainer.GetTenantIdOrNull()` (driven by `BlobContainerConfiguration.IsMultiTenant`), this gives you free per‑tenant object key isolation. See [/tenancy/multi-tenancy-core](/tenancy/multi-tenancy-core) for the upstream mechanics.
+
+## `AwsBlobNamingNormalizer`
+
+S3 bucket names are stricter than blob keys: 3–63 chars, lowercase, digits, hyphens; no underscores; cannot start or end with hyphen; cannot resemble an IP. `UseAws` registers `AwsBlobNamingNormalizer` to coerce ABP container names into S3‑compliant bucket names before they leave the framework. Keys (blob names) are passed through.
+
+## Operational guidance
+
+<AccordionGroup>
+  <Accordion title="Credential rotation" icon="rotate">
+    For long‑running services on EC2/ECS/EKS, prefer instance roles (no `AccessKeyId`/`SecretAccessKey` at all) so credentials rotate automatically. For end‑user federation flows, use `UseTemporaryFederatedCredentials` with a tight `Policy`.
+  </Accordion>
+  <Accordion title="Bucket provisioning" icon="bucket">
+    Set `CreateContainerIfNotExists = true` only in dev. In production, provision buckets via Terraform / CloudFormation / CDK with the right lifecycle, encryption, and public‑access settings; leave the ABP flag `false` to fail fast when something is misconfigured.
+  </Accordion>
+  <Accordion title="Server-side encryption" icon="shield">
+    The default `PutObjectRequest` does not set `ServerSideEncryptionMethod`. To enforce SSE‑S3 or SSE‑KMS, subclass `AwsBlobProvider`, override `SaveAsync`, and set `request.ServerSideEncryptionMethod = ServerSideEncryptionMethod.AESGCM` (or the KMS equivalent) before `PutObjectAsync`.
+  </Accordion>
+  <Accordion title="Large objects" icon="cloud-arrow-up">
+    `PutObjectAsync(Stream)` does not multipart upload by default. For objects larger than ~100 MB, replace `AwsBlobProvider` with a subclass that uses `TransferUtility.UploadAsync` to chunk uploads.
+  </Accordion>
+  <Accordion title="HEAD-by-default existence check" icon="magnifying-glass">
+    `BlobExistsAsync` performs `DoesS3BucketExistV2Async` + `GetObjectMetadataAsync`. That is two requests on every existence test. If you know the bucket exists, override `BlobExistsAsync` to skip the bucket probe.
+  </Accordion>
+</AccordionGroup>
+
+## Usage example
+
+```csharp
+[BlobContainerName("user-uploads")]
+public class UserUploadContainer { }
+
+public class UploadAppService : ApplicationService
+{
+    private readonly IBlobContainer<UserUploadContainer> _blobs;
+
+    public UploadAppService(IBlobContainer<UserUploadContainer> blobs)
+    {
+        _blobs = blobs;
+    }
+
+    public Task SaveAsync(string fileName, Stream content)
+        => _blobs.SaveAsync(fileName, content, overrideExisting: false);
+}
+```
+
+With the configuration shown at the top, a tenant upload lands at:
+
+```text
+S3 bucket: myapp-bucket
+Object key: tenants/<tenantId>/<fileName>
+```
+
+If you switch to `UseAzure`, `UseGoogle`, or `UseMinio` the application service does not change.
+
+## Related
+
+- [BLOB Storing abstractions](/blob/abstractions) — `IBlobProvider`, `BlobProviderArgs`, naming normalization.
+- [Multi-tenancy core](/tenancy/multi-tenancy-core) — `ICurrentTenant.Id` is what `DefaultAwsBlobNameCalculator` reads.
+- [Azure provider](/blob/azure), [Google provider](/blob/google), [Aliyun](/blob/aliyun), [MinIO](/blob/minio) — peer object‑store backends.
+- [Blob Storing Database module](/modules/blob-storing-database/overview) — when blobs should be in the same DB as their data.

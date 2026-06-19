@@ -1,0 +1,466 @@
+---
+title: "OpenIddict MongoDB — DbContext, Collections, Repositories"
+sidebarTitle: "MongoDB"
+description: "Volo.Abp.OpenIddict.MongoDB — the OpenIddictMongoDbContext / IOpenIddictMongoDbContext, the ConfigureOpenIddict() model‑builder extension, the four MongoOpenIddict*Repository classes, and the MongoDB concurrency‑exception handler."
+---
+
+`Volo.Abp.OpenIddict.MongoDB` is the MongoDB **persistence provider** for the OpenIddict domain layer. It maps the four aggregate roots (`OpenIddictApplication`, `OpenIddictAuthorization`, `OpenIddictScope`, `OpenIddictToken`) to MongoDB collections, supplies a dedicated `OpenIddictMongoDbContext` (single‑database, `[IgnoreMultiTenancy]`), and implements `IOpenIddictApplicationRepository` / `IOpenIddictAuthorizationRepository` / `IOpenIddictScopeRepository` / `IOpenIddictTokenRepository` against `MongoDbRepository<TContext, TEntity, TKey>`.
+
+Folder covered: `modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/`.
+
+## Module declaration
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/MongoDB/AbpOpenIddictMongoDbModule.cs
+[DependsOn(
+    typeof(AbpOpenIddictDomainModule),
+    typeof(AbpMongoDbModule)
+)]
+public class AbpOpenIddictMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<OpenIddictMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IOpenIddictMongoDbContext>();
+
+            options.AddRepository<OpenIddictApplication,   MongoOpenIddictApplicationRepository>();
+            options.AddRepository<OpenIddictAuthorization, MongoOpenIddictAuthorizationRepository>();
+            options.AddRepository<OpenIddictScope,         MongoOpenIddictScopeRepository>();
+            options.AddRepository<OpenIddictToken,         MongoOpenIddictTokenRepository>();
+        });
+    }
+}
+```
+
+Same shape as the EF Core module — wire up the DbContext, register default repositories, then attach a custom implementation for each of the four aggregates. No `AbpEntityChangeOptions` tweak is required: MongoDB doesn't have the navigation‑aware change tracker that pulled `OpenIddictApplication` into related entity diffs on the relational side.
+
+## The DbContext
+
+The contract:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/MongoDB/IOpenIddictMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpOpenIddictDbProperties.ConnectionStringName)] // "AbpOpenIddict"
+public interface IOpenIddictMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<OpenIddictApplication>   Applications   { get; }
+    IMongoCollection<OpenIddictAuthorization> Authorizations { get; }
+    IMongoCollection<OpenIddictScope>         Scopes         { get; }
+    IMongoCollection<OpenIddictToken>         Tokens         { get; }
+}
+```
+
+The implementation:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/MongoDB/OpenIddictMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpOpenIddictDbProperties.ConnectionStringName)]
+public class OpenIddictMongoDbContext : AbpMongoDbContext, IOpenIddictMongoDbContext
+{
+    public IMongoCollection<OpenIddictApplication>   Applications   => Collection<OpenIddictApplication>();
+    public IMongoCollection<OpenIddictAuthorization> Authorizations => Collection<OpenIddictAuthorization>();
+    public IMongoCollection<OpenIddictScope>         Scopes         => Collection<OpenIddictScope>();
+    public IMongoCollection<OpenIddictToken>         Tokens         => Collection<OpenIddictToken>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+
+        modelBuilder.ConfigureOpenIddict();
+    }
+}
+```
+
+The attributes are the same as for EF Core:
+
+- **`[IgnoreMultiTenancy]`** — host‑level collections; ABP's data filter system does not auto‑scope queries by `ICurrentTenant.Id`.
+- **`[ConnectionStringName("AbpOpenIddict")]`** — point at a dedicated MongoDB connection string (defaults to `Default` if undefined):
+
+```json
+{
+  "ConnectionStrings": {
+    "Default":       "mongodb://localhost:27017/MyApp",
+    "AbpOpenIddict": "mongodb://localhost:27017/MyApp_OpenIddict"
+  }
+}
+```
+
+## Reusing your application DbContext
+
+Like the EF Core provider, you can fold the OpenIddict collections into your application MongoDB context. Implement `IOpenIddictMongoDbContext` on your own `AbpMongoDbContext` subclass and call `ConfigureOpenIddict()` from `CreateModel`:
+
+```csharp
+public class MyAppMongoDbContext : AbpMongoDbContext, IIdentityProMongoDbContext, IOpenIddictMongoDbContext
+{
+    public IMongoCollection<OpenIddictApplication>   Applications   => Collection<OpenIddictApplication>();
+    public IMongoCollection<OpenIddictAuthorization> Authorizations => Collection<OpenIddictAuthorization>();
+    public IMongoCollection<OpenIddictScope>         Scopes         => Collection<OpenIddictScope>();
+    public IMongoCollection<OpenIddictToken>         Tokens         => Collection<OpenIddictToken>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureOpenIddict();
+        // modelBuilder.ConfigureIdentityPro(); etc.
+    }
+}
+
+// And in your MongoDB module:
+context.Services.AddMongoDbContext<MyAppMongoDbContext>(options =>
+{
+    options.ReplaceDbContext<IOpenIddictMongoDbContext>();
+    options.AddDefaultRepositories<IOpenIddictMongoDbContext>();
+});
+```
+
+`ReplaceDbContext<TInterface>()` reroutes resolution so the OpenIddict repositories operate against your DbContext.
+
+## The collections
+
+`ConfigureOpenIddict` is the single source of truth for the MongoDB model. It simply names the four collections — there is no schema, no max‑length, no indices declared here (MongoDB lets you create indices imperatively on the cluster as part of provisioning):
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/MongoDB/OpenIddictMongoDbContextExtensions.cs
+public static class OpenIddictMongoDbContextExtensions
+{
+    public static void ConfigureOpenIddict(this IMongoModelBuilder builder)
+    {
+        Check.NotNull(builder, nameof(builder));
+
+        builder.Entity<OpenIddictApplication>(b =>
+        {
+            b.CollectionName = AbpOpenIddictDbProperties.DbTablePrefix + "Applications";
+        });
+
+        builder.Entity<OpenIddictAuthorization>(b =>
+        {
+            b.CollectionName = AbpOpenIddictDbProperties.DbTablePrefix + "Authorizations";
+        });
+
+        builder.Entity<OpenIddictScope>(b =>
+        {
+            b.CollectionName = AbpOpenIddictDbProperties.DbTablePrefix + "Scopes";
+        });
+
+        builder.Entity<OpenIddictToken>(b =>
+        {
+            b.CollectionName = AbpOpenIddictDbProperties.DbTablePrefix + "Tokens";
+        });
+    }
+}
+```
+
+Default collection names use the `AbpOpenIddictDbProperties.DbTablePrefix` (`"OpenIddict"`):
+
+| Collection | Notable indices to create |
+| --- | --- |
+| `OpenIddictApplications` | `{ ClientId: 1 }` |
+| `OpenIddictAuthorizations` | `{ ApplicationId: 1, Status: 1, Subject: 1, Type: 1 }` |
+| `OpenIddictScopes` | `{ Name: 1 }` |
+| `OpenIddictTokens` | `{ ReferenceId: 1 }`, `{ ApplicationId: 1, Status: 1, Subject: 1, Type: 1 }` |
+
+<Info>
+Unlike EF Core, the MongoDB provider does **not** create indices automatically — they have no model‑builder hook. Bake them into your deployment scripts or wire them up in a host startup contributor. The four indices above match the ones the EF Core provider declares in `ConfigureOpenIddict` and they line up with the queries the repositories run on hot paths (e.g. `FindByClientIdAsync`, `FindByReferenceIdAsync`, the `FindAsync` composite for tokens / authorizations).
+</Info>
+
+## The repositories
+
+Each repository derives from `MongoDbRepository<OpenIddictMongoDbContext, TEntity, Guid>` and implements the OpenIddict‑specific query surface.
+
+### MongoOpenIddictApplicationRepository
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/Applications/MongoOpenIddictApplicationRepository.cs
+public class MongoOpenIddictApplicationRepository
+    : MongoDbRepository<OpenIddictMongoDbContext, OpenIddictApplication, Guid>,
+      IOpenIddictApplicationRepository
+{
+    public MongoOpenIddictApplicationRepository(
+        IMongoDbContextProvider<OpenIddictMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<List<OpenIddictApplication>> GetListAsync(
+        string sorting, int skipCount, int maxResultCount,
+        string filter = null, CancellationToken cancellationToken = default)
+    {
+        return await ((await GetQueryableAsync(cancellationToken)))
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .OrderBy(sorting.IsNullOrWhiteSpace()
+                ? nameof(OpenIddictApplication.CreationTime) + " desc"
+                : sorting)
+            .PageBy(skipCount, maxResultCount)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<long> GetCountAsync(
+        string filter = null, CancellationToken cancellationToken = default)
+    {
+        return await ((await GetQueryableAsync(cancellationToken)))
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .LongCountAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<OpenIddictApplication> FindByClientIdAsync(
+        string clientId, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .FirstOrDefaultAsync(x => x.ClientId == clientId, cancellationToken);
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> FindByPostLogoutRedirectUriAsync(
+        string address, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(x => x.PostLogoutRedirectUris.Contains(address))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> FindByRedirectUriAsync(
+        string address, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(x => x.RedirectUris.Contains(address))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<TResult> GetAsync<TState, TResult>(
+        Func<IQueryable<OpenIddictApplication>, TState, IQueryable<TResult>> query,
+        TState state, CancellationToken cancellationToken = default)
+    {
+        return await query(await GetQueryableAsync(cancellationToken), state)
+            .FirstOrDefaultAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> ListAsync(
+        int? count, int? offset, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .SkipIf<OpenIddictApplication, IQueryable<OpenIddictApplication>>(offset.HasValue, offset)
+            .TakeIf<OpenIddictApplication, IQueryable<OpenIddictApplication>>(count.HasValue, count)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Just like the EF Core version, `FindByRedirectUriAsync` / `FindByPostLogoutRedirectUriAsync` rely on string `Contains` against the JSON arrays. The MongoDB driver's LINQ provider translates that into a regex `$regex` match, so the operation works without parsing JSON server‑side.
+
+### MongoOpenIddictAuthorizationRepository
+
+The authorization repository also injects an `IMongoDbRepositoryFilterer<OpenIddictToken, Guid>` so it can apply the standard data filters when reading tokens during a cascading prune:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/Authorizations/MongoOpenIddictAuthorizationRepository.cs
+public class MongoOpenIddictAuthorizationRepository
+    : MongoDbRepository<OpenIddictMongoDbContext, OpenIddictAuthorization, Guid>,
+      IOpenIddictAuthorizationRepository
+{
+    protected IMongoDbRepositoryFilterer<OpenIddictToken, Guid> TokenDbRepositoryFilterer { get; }
+
+    public MongoOpenIddictAuthorizationRepository(
+        IMongoDbContextProvider<OpenIddictMongoDbContext> dbContextProvider,
+        IMongoDbRepositoryFilterer<OpenIddictToken, Guid> tokenDbRepositoryFilterer)
+        : base(dbContextProvider)
+    {
+        TokenDbRepositoryFilterer = tokenDbRepositoryFilterer;
+    }
+
+    public virtual async Task<List<OpenIddictAuthorization>> FindAsync(
+        string subject, Guid? client, string status, string type,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .WhereIf(!subject.IsNullOrWhiteSpace(), x => x.Subject == subject)
+            .WhereIf(client.HasValue,              x => x.ApplicationId == client)
+            .WhereIf(!status.IsNullOrWhiteSpace(), x => x.Status == status)
+            .WhereIf(!type.IsNullOrWhiteSpace(),   x => x.Type == type)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+    // ... FindByApplicationIdAsync, FindByIdAsync, FindBySubjectAsync, ListAsync, PruneAsync ...
+}
+```
+
+`PruneAsync(threshold, ct)` is the cleanup hot path; it removes authorizations older than the cutoff in terminal statuses and then asks the token collection to remove any orphaned tokens.
+
+### MongoOpenIddictScopeRepository
+
+Mirror of the EF Core scope repo — `FindByNameAsync`, `FindByNamesAsync`, `FindByResourceAsync`, plus list / count. Nothing scope‑specific beyond that; the collection is small and frequently cache‑hit through `AbpOpenIddictScopeCache`.
+
+### MongoOpenIddictTokenRepository
+
+The heaviest of the four. It implements the same cascade helpers as its EF Core counterpart so the `AbpOpenIddictApplicationStore` / `AbpOpenIddictAuthorizationStore` cascades work identically on both providers:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/Tokens/MongoOpenIddictTokenRepository.cs
+public class MongoOpenIddictTokenRepository
+    : MongoDbRepository<OpenIddictMongoDbContext, OpenIddictToken, Guid>,
+      IOpenIddictTokenRepository
+{
+    public virtual async Task DeleteManyByApplicationIdAsync(
+        Guid applicationId, bool autoSave = false,
+        CancellationToken cancellationToken = default)
+    {
+        var tokens = await (await GetQueryableAsync(GetCancellationToken(cancellationToken)))
+            .Where(x => x.ApplicationId == applicationId)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        await DeleteManyAsync(tokens, autoSave, cancellationToken);
+    }
+
+    public virtual async Task DeleteManyByAuthorizationIdAsync(
+        Guid authorizationId, bool autoSave = false,
+        CancellationToken cancellationToken = default)
+    {
+        var tokens = await (await GetQueryableAsync(GetCancellationToken(cancellationToken)))
+            .Where(x => x.AuthorizationId == authorizationId)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        await DeleteManyAsync(tokens, autoSave, GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteManyByAuthorizationIdsAsync(
+        Guid[] authorizationIds, bool autoSave = false,
+        CancellationToken cancellationToken = default)
+    {
+        var tokens = await (await GetQueryableAsync(GetCancellationToken(cancellationToken)))
+            .Where(x => x.AuthorizationId != null
+                     && authorizationIds.AsEnumerable().Contains(x.AuthorizationId.Value))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        await DeleteManyAsync(tokens, autoSave, GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictToken>> FindAsync(
+        string subject, Guid? client, string status, string type,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .WhereIf(!subject.IsNullOrWhiteSpace(), x => x.Subject == subject)
+            .WhereIf(client.HasValue,              x => x.ApplicationId == client)
+            .WhereIf(!status.IsNullOrWhiteSpace(), x => x.Status == status)
+            .WhereIf(!type.IsNullOrWhiteSpace(),   x => x.Type == type)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<OpenIddictToken> FindByReferenceIdAsync(
+        string referenceId, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(GetCancellationToken(cancellationToken)))
+            .FirstOrDefaultAsync(x => x.ReferenceId == referenceId,
+                GetCancellationToken(cancellationToken));
+    }
+    // ... FindByApplicationIdAsync, FindByAuthorizationIdAsync, FindByIdAsync,
+    //     FindBySubjectAsync, ListAsync, PruneAsync ...
+}
+```
+
+`PruneAsync(threshold, ct)` is called by `TokenCleanupService` on the cleanup schedule and clears expired, redeemed, revoked, or inactive tokens older than the cutoff.
+
+## Concurrency exception handler
+
+MongoDB's document model doesn't have the row‑version drama EF Core has, so the handler is a no‑op:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.MongoDB/Volo/Abp/OpenIddict/MongoOpenIddictDbConcurrencyExceptionHandler.cs
+public class MongoOpenIddictDbConcurrencyExceptionHandler
+    : IOpenIddictDbConcurrencyExceptionHandler, ITransientDependency
+{
+    public virtual Task HandleAsync(AbpDbConcurrencyException exception)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+ABP's stores still translate `AbpDbConcurrencyException` to `OpenIddictExceptions.ConcurrencyException` after calling the handler, so the OpenIddict pipeline retry logic remains the same on both providers — the handler is just where each provider gets to "reset" its caches between attempts. For MongoDB there is nothing to reset.
+
+## Multi‑tenancy
+
+`[IgnoreMultiTenancy]` on both the interface and the concrete DbContext means OpenIddict documents are *not* automatically scoped by the current tenant. Like EF Core, that is by design: an authorization server's clients, scopes, authorizations, and tokens are host‑level data. If you want per‑tenant clients you should add a tenant‑id property via the extensible‑object system and filter explicitly.
+
+## Customizing collection names
+
+Mutate `AbpOpenIddictDbProperties.DbTablePrefix` (or `DbSchema`, although MongoDB doesn't use it) before `OnModelCreating` runs:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/AbpOpenIddictDbProperties.cs
+public static class AbpOpenIddictDbProperties
+{
+    public static string DbTablePrefix { get; set; } = "OpenIddict";
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpOpenIddict";
+}
+```
+
+```csharp
+AbpOpenIddictDbProperties.DbTablePrefix = "OAuth";
+// collections become OAuthApplications, OAuthAuthorizations, OAuthScopes, OAuthTokens
+```
+
+## Creating indices in production
+
+A startup contributor that creates the indices once per environment is the typical pattern:
+
+```csharp
+public class OpenIddictMongoIndexEnsurer : IHostedService
+{
+    private readonly IOpenIddictMongoDbContext _ctx;
+
+    public OpenIddictMongoIndexEnsurer(IOpenIddictMongoDbContext ctx) => _ctx = ctx;
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await _ctx.Applications.Indexes.CreateOneAsync(
+            new CreateIndexModel<OpenIddictApplication>(
+                Builders<OpenIddictApplication>.IndexKeys.Ascending(x => x.ClientId)),
+            cancellationToken: cancellationToken);
+
+        await _ctx.Tokens.Indexes.CreateOneAsync(
+            new CreateIndexModel<OpenIddictToken>(
+                Builders<OpenIddictToken>.IndexKeys.Ascending(x => x.ReferenceId)),
+            cancellationToken: cancellationToken);
+
+        await _ctx.Tokens.Indexes.CreateOneAsync(
+            new CreateIndexModel<OpenIddictToken>(
+                Builders<OpenIddictToken>.IndexKeys
+                    .Ascending(x => x.ApplicationId)
+                    .Ascending(x => x.Status)
+                    .Ascending(x => x.Subject)
+                    .Ascending(x => x.Type)),
+            cancellationToken: cancellationToken);
+        // ... matching index for Authorizations ...
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+Mirror the ones from EF Core's `ConfigureOpenIddict` to keep introspection and admin‑UI queries fast.
+
+## Quick reference
+
+| Concept | Type | File |
+| --- | --- | --- |
+| Module | `AbpOpenIddictMongoDbModule` | `MongoDB/AbpOpenIddictMongoDbModule.cs` |
+| DbContext interface | `IOpenIddictMongoDbContext` | `MongoDB/IOpenIddictMongoDbContext.cs` |
+| DbContext | `OpenIddictMongoDbContext` | `MongoDB/OpenIddictMongoDbContext.cs` |
+| Model builder | `OpenIddictMongoDbContextExtensions.ConfigureOpenIddict` | `MongoDB/OpenIddictMongoDbContextExtensions.cs` |
+| Application repo | `MongoOpenIddictApplicationRepository` | `Applications/MongoOpenIddictApplicationRepository.cs` |
+| Authorization repo | `MongoOpenIddictAuthorizationRepository` | `Authorizations/MongoOpenIddictAuthorizationRepository.cs` |
+| Scope repo | `MongoOpenIddictScopeRepository` | `Scopes/MongoOpenIddictScopeRepository.cs` |
+| Token repo | `MongoOpenIddictTokenRepository` | `Tokens/MongoOpenIddictTokenRepository.cs` |
+| Concurrency handler | `MongoOpenIddictDbConcurrencyExceptionHandler` | `MongoOpenIddictDbConcurrencyExceptionHandler.cs` |
+
+## See also
+
+- Aggregate roots, managers, stores: [/modules/openiddict/domain](/modules/openiddict/domain)
+- ASP.NET Core wiring on top: [/modules/openiddict/aspnetcore-integration](/modules/openiddict/aspnetcore-integration)
+- EF Core alternative: [/modules/openiddict/efcore](/modules/openiddict/efcore)
+- Module overview: [/modules/openiddict/overview](/modules/openiddict/overview)
+- Login UI: [/modules/account/openiddict-host](/modules/account/openiddict-host)
+- Identity store: [/modules/identity/overview](/modules/identity/overview)
+- Browser apps consuming the tokens: [/aspnetcore/auth-openidconnect](/aspnetcore/auth-openidconnect)
+- Granting permissions to clients: [/security/permissions](/security/permissions)

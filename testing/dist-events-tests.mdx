@@ -1,0 +1,505 @@
+---
+title: "test/DistEvents/: Manual Sample Apps for the Distributed Event Bus"
+sidebarTitle: "DistEvents tests"
+description: "The three top-level console apps under test/DistEvents/ — EF Core + RabbitMQ, MongoDB + Kafka, MongoDB + Rebus — used to verify outbox/inbox flows against real brokers."
+---
+
+Most of ABP's test code lives under `framework/test/` or `modules/*/test/` and is run by xUnit against in-memory backing stores. The directory `test/DistEvents/` is different: it contains **runnable console applications** wired against real RabbitMQ, Kafka, MongoDB, and SQL Server. They aren't xUnit projects — you launch them, watch the logs, and confirm that messages flow through the outbox, hit the broker, hit the inbox on another process, and update a `TodoSummary` aggregate.
+
+```
+test/DistEvents/
+├── DistEventsDemo.slnx              // solution wrapping the four projects
+├── DistDemoApp.Shared/              // domain + handlers shared by all three samples
+├── DistDemoApp.EfCoreRabbitMq/      // SQL Server (EF Core) + RabbitMQ
+├── DistDemoApp.MongoDbKafka/        // MongoDB + Kafka
+└── DistDemoApp.MongoDbRebus/        // MongoDB + Rebus in-memory transport
+```
+
+The solution file:
+
+```xml
+<!-- test/DistEvents/DistEventsDemo.slnx -->
+<Solution>
+  <Project Path="DistDemoApp.EfCoreRabbitMq/DistDemoApp.EfCoreRabbitMq.csproj" />
+  <Project Path="DistDemoApp.MongoDbKafka/DistDemoApp.MongoDbKafka.csproj" />
+  <Project Path="DistDemoApp.MongoDbRebus/DistDemoApp.MongoDbRebus.csproj" />
+  <Project Path="DistDemoApp.Shared/DistDemoApp.Shared.csproj" />
+</Solution>
+```
+
+## What they verify, end to end
+
+The shared domain is a "todo" + "summary" pair:
+
+1. `DemoService.CreateTodoItemAsync()` inserts a `TodoItem`.
+2. ABP's `AbpDistributedEntityEventOptions` sees `TodoItem` in `AutoEventSelectors` and publishes an `EntityCreatedEto<TodoItemEto>`.
+3. The publish goes through the **outbox** (table or collection) in the same UoW that wrote the `TodoItem`.
+4. A background worker drains the outbox and sends to RabbitMQ / Kafka / Rebus.
+5. On consume, ABP writes the event to the **inbox** so the same delivery is processed exactly once even on retry.
+6. `TodoEventHandler` picks the event up, looks up the per-day `TodoSummary` aggregate, and increments its `TotalCount`.
+
+The full cycle exercises [Event Bus → Distributed events](/eventbus/distributed-event-bus), [outbox/inbox](/eventbus/distributed-event-bus), the [Unit of Work](/data/unit-of-work) interaction with event publishing, and the broker-specific transport modules. None of that is feasible in an xUnit run because it needs a real broker, so it lives here as a manual rig.
+
+## DistDemoApp.Shared — domain and handlers
+
+This project is the heart of the rig. It does not pick a database or a transport — those are layered on by the three concrete apps.
+
+```csharp
+// DistDemoApp.Shared/DistDemoAppSharedModule.cs
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpDddDomainModule),
+    typeof(AbpEventBusModule)
+    )]
+public class DistDemoAppSharedModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        context.Services.AddHostedService<DistDemoAppHostedService>();
+
+        Configure<AbpDistributedEntityEventOptions>(options =>
+        {
+            options.EtoMappings.Add<TodoItem, TodoItemEto>();
+            options.AutoEventSelectors.Add<TodoItem>();
+        });
+
+        context.Services.AddSingleton<IDistributedLockProvider>(sp =>
+        {
+            var connection = ConnectionMultiplexer.Connect(configuration["Redis:Configuration"]);
+            return new RedisDistributedSynchronizationProvider(connection.GetDatabase());
+        });
+    }
+}
+```
+
+Three things are happening:
+
+1. **`AutoEventSelectors.Add<TodoItem>()`** — ABP auto-publishes `EntityCreatedEto<TodoItemEto>` / `EntityUpdatedEto<...>` / `EntityDeletedEto<...>` for the aggregate.
+2. **`EtoMappings.Add<TodoItem, TodoItemEto>()`** — declares the DTO ABP serializes onto the wire.
+3. **Redis-based `IDistributedLockProvider`** — the outbox draining worker uses Medallion.Threading on Redis so multiple instances of the app can run side-by-side without double-publishing.
+
+### The aggregate and ETO
+
+```csharp
+// TodoItem.cs
+public class TodoItem : CreationAuditedAggregateRoot<Guid>
+{
+    public string Text { get; set; }
+
+    public override string ToString() => $"{base.ToString()}, Text = {Text}";
+}
+
+// TodoItemEto.cs
+[EventName("todo-item")]
+public class TodoItemEto
+{
+    public DateTime CreationTime { get; set; }
+    public string Text { get; set; }
+}
+```
+
+`[EventName("todo-item")]` is the routing-key / topic-name prefix the broker sees. The summary aggregate keeps a per-day counter:
+
+```csharp
+// TodoSummary.cs
+public class TodoSummary : AggregateRoot<int>
+{
+    public int Year { get; private set; }
+    public byte Month { get; private set; }
+    public byte Day { get; private set; }
+    public int TotalCount { get; private set; }
+
+    public TodoSummary(DateTime dateTime, int initialCount = 1) { /* ... */ }
+
+    public void Increase(int amount = 1) => TotalCount += amount;
+    public void Decrease(int amount = 1) => TotalCount -= amount;
+}
+```
+
+### The handler
+
+```csharp
+public class TodoEventHandler :
+    IDistributedEventHandler<EntityCreatedEto<TodoItemEto>>,
+    IDistributedEventHandler<EntityDeletedEto<TodoItemEto>>,
+    ITransientDependency
+{
+    private readonly IRepository<TodoSummary, int> _todoSummaryRepository;
+
+    public TodoEventHandler(IRepository<TodoSummary, int> todoSummaryRepository)
+    {
+        _todoSummaryRepository = todoSummaryRepository;
+    }
+
+    [UnitOfWork]
+    public virtual async Task HandleEventAsync(EntityCreatedEto<TodoItemEto> eventData)
+    {
+        var dateTime = eventData.Entity.CreationTime;
+        var todoSummary = await _todoSummaryRepository.FindAsync(
+            x => x.Year == dateTime.Year
+              && x.Month == dateTime.Month
+              && x.Day == dateTime.Day);
+
+        if (todoSummary == null)
+        {
+            todoSummary = await _todoSummaryRepository.InsertAsync(new TodoSummary(dateTime));
+        }
+        else
+        {
+            todoSummary.Increase();
+            await _todoSummaryRepository.UpdateAsync(todoSummary);
+        }
+
+        Console.WriteLine("Increased total count: " + todoSummary);
+    }
+
+    public async Task HandleEventAsync(EntityDeletedEto<TodoItemEto> eventData)
+    {
+        // mirror image: decrement the summary
+    }
+}
+```
+
+The `[UnitOfWork]` attribute is what makes this a manual *integration* test: it requires the Autofac interception to fire, the inbox row to be inserted in the same transaction as the summary update, and the broker ack to happen after the UoW commits. See [Unit of Work](/data/unit-of-work).
+
+### The hosted service that drives the test
+
+```csharp
+public class DistDemoAppHostedService : IHostedService
+{
+    private readonly IAbpApplicationWithExternalServiceProvider _application;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly DemoService _demoService;
+
+    public DistDemoAppHostedService(
+        IAbpApplicationWithExternalServiceProvider application,
+        IServiceProvider serviceProvider,
+        DemoService demoService)
+    {
+        _application = application;
+        _serviceProvider = serviceProvider;
+        _demoService = demoService;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        _application.Initialize(_serviceProvider);
+        await _demoService.CreateTodoItemAsync();
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        _application.Shutdown();
+        return Task.CompletedTask;
+    }
+}
+```
+
+`DemoService` does the deed:
+
+```csharp
+public class DemoService : ITransientDependency
+{
+    private readonly IRepository<TodoItem, Guid> _todoItemRepository;
+
+    public DemoService(IRepository<TodoItem, Guid> todoItemRepository)
+    {
+        _todoItemRepository = todoItemRepository;
+    }
+
+    public async Task CreateTodoItemAsync()
+    {
+        var todoItem = await _todoItemRepository.InsertAsync(
+            new TodoItem { Text = "todo item " + DateTime.Now.Ticks });
+
+        Console.WriteLine("Created a new todo item: " + todoItem);
+    }
+}
+```
+
+Run any of the three apps and you should see one "Created a new todo item: ..." log immediately (publisher side), then — when a sibling instance is running — one or more "Increased total count: ..." logs as the event lands in the inbox and the handler updates the summary.
+
+## DistDemoApp.EfCoreRabbitMq — SQL Server + RabbitMQ
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreSqlServerModule),
+    typeof(AbpEventBusRabbitMqModule),
+    typeof(DistDemoAppSharedModule)
+)]
+public class DistDemoAppEfCoreRabbitMqModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<TodoDbContext>(options =>
+        {
+            options.AddDefaultRepositories();
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseSqlServer();
+        });
+
+        Configure<AbpDistributedEventBusOptions>(options =>
+        {
+            options.Outboxes.Configure(config =>
+            {
+                config.UseDbContext<TodoDbContext>();
+            });
+
+            options.Inboxes.Configure(config =>
+            {
+                config.UseDbContext<TodoDbContext>();
+            });
+        });
+    }
+}
+```
+
+The DbContext implements the two outbox/inbox interfaces:
+
+```csharp
+public class TodoDbContext : AbpDbContext<TodoDbContext>, IHasEventOutbox, IHasEventInbox
+{
+    public DbSet<TodoItem> TodoItems { get; set; }
+    public DbSet<TodoSummary> TodoSummaries { get; set; }
+    public DbSet<OutgoingEventRecord> OutgoingEvents { get; set; }
+    public DbSet<IncomingEventRecord> IncomingEvents { get; set; }
+
+    public TodoDbContext(DbContextOptions<TodoDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        base.OnModelCreating(modelBuilder);
+
+        modelBuilder.ConfigureEventOutbox();
+        modelBuilder.ConfigureEventInbox();
+
+        modelBuilder.Entity<TodoItem>(b =>
+        {
+            b.Property(x => x.Text).IsRequired().HasMaxLength(128);
+        });
+    }
+}
+```
+
+`ConfigureEventOutbox()` and `ConfigureEventInbox()` are extension methods from `Volo.Abp.EntityFrameworkCore.DistributedEvents` that create the `AbpEventOutbox` and `AbpEventInbox` tables.
+
+`appsettings.json` is the operator's contract:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=DistEventsDemo;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "RabbitMQ": {
+    "Connections": {
+      "Default": { "HostName": "localhost" }
+    },
+    "EventBus": {
+      "ClientName": "DistDemoApp",
+      "ExchangeName": "DistDemo"
+    }
+  },
+  "Redis": { "Configuration": "127.0.0.1" }
+}
+```
+
+Migrations are checked in under `Migrations/` (`20210910152547_Added_Boxes_Initial.cs` and the model snapshot) so `dotnet ef database update` brings the schema up before the first run.
+
+### How to drive it manually
+
+<Steps>
+  <Step title="Start the dependencies">
+    LocalDB (or your SQL Server), RabbitMQ on `localhost:5672`, and Redis on `127.0.0.1:6379`. The Redis instance is only used for the distributed lock that gates outbox draining.
+  </Step>
+  <Step title="Apply migrations">
+    From `test/DistEvents/DistDemoApp.EfCoreRabbitMq/`, `dotnet ef database update`. The migrations create `TodoItems`, `TodoSummaries`, `AbpEventOutbox`, `AbpEventInbox`.
+  </Step>
+  <Step title="Run two instances">
+    Two terminals, both `dotnet run`. Each one issues one `CreateTodoItemAsync` at startup; both consume each other's events (and their own, via the inbox).
+  </Step>
+  <Step title="Watch the logs">
+    "Created a new todo item: ..." on the producer; "Increased total count: ..." on every consumer that successfully processed the event. The `AbpEventInbox` table will show one row per (event, consumer) pair.
+  </Step>
+</Steps>
+
+## DistDemoApp.MongoDbKafka — MongoDB + Kafka
+
+```csharp
+[DependsOn(
+    typeof(AbpMongoDbModule),
+    typeof(AbpEventBusKafkaModule),
+    typeof(DistDemoAppSharedModule)
+)]
+public class DistDemoAppMongoDbKafkaModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<TodoMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories();
+        });
+
+        Configure<AbpDistributedEventBusOptions>(options =>
+        {
+            options.Outboxes.Configure(config =>
+            {
+                config.UseMongoDbContext<TodoMongoDbContext>();
+            });
+
+            options.Inboxes.Configure(config =>
+            {
+                config.UseMongoDbContext<TodoMongoDbContext>();
+            });
+        });
+    }
+}
+```
+
+The Mongo connection string targets a three-node replica set on ports 27018–27020 — outbox/inbox writes require multi-document transactions, which Mongo only supports in replica-set mode:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "mongodb://localhost:27018,localhost:27019,localhost:27020/DistEventsDemo"
+  },
+  "Kafka": {
+    "Connections": {
+      "Default": { "BootstrapServers": "localhost:9092" }
+    },
+    "EventBus": {
+      "GroupId": "DistDemoApp",
+      "TopicName": "DistDemoTopic"
+    }
+  },
+  "Redis": { "Configuration": "127.0.0.1" }
+}
+```
+
+The Kafka `GroupId` and `TopicName` lines decide the consumer-group semantics: two instances with the same `GroupId` will compete for partitions (load balance), two with different `GroupId`s will each get every message (fan-out). Useful for confirming the producer/consumer side independently.
+
+## DistDemoApp.MongoDbRebus — MongoDB + Rebus
+
+The Rebus variant exercises ABP's Rebus integration without requiring an external broker. The Rebus transport is configured to use an in-process `InMemNetwork` so the sample runs standalone — useful for verifying the ABP↔Rebus glue itself:
+
+```csharp
+[DependsOn(
+    typeof(AbpMongoDbModule),
+    typeof(AbpEventBusRebusModule),
+    typeof(DistDemoAppSharedModule)
+)]
+public class DistDemoAppMongoDbRebusModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<AbpRebusEventBusOptions>(options =>
+        {
+            options.InputQueueName = "eventbus";
+            options.Configurer = rebusConfigurer =>
+            {
+                rebusConfigurer.Transport(t =>
+                    t.UseInMemoryTransport(new InMemNetwork(), "eventbus"));
+                rebusConfigurer.Subscriptions(s => s.StoreInMemory());
+            };
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<TodoMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories();
+        });
+
+        Configure<AbpDistributedEventBusOptions>(options =>
+        {
+            options.Outboxes.Configure(config => config.UseMongoDbContext<TodoMongoDbContext>());
+            options.Inboxes.Configure(config => config.UseMongoDbContext<TodoMongoDbContext>());
+        });
+    }
+}
+```
+
+`PreConfigure<AbpRebusEventBusOptions>` runs before any `ConfigureServices` callbacks — necessary because `Configurer` has to be available at the moment the Rebus bus is built. See [Modularity](/core/modularity) for the hook ordering. Because the transport is in-memory, only **one** process at a time can observe its own messages — useful for a smoke test, not for multi-node verification.
+
+## Why these aren't xUnit projects
+
+Three reasons:
+
+<CardGroup cols={3}>
+  <Card title="External infrastructure" icon="server">
+    RabbitMQ, Kafka, and a 3-node Mongo replica set don't bootstrap in an `[xUnit]` collection fixture cheaply. CI runs would either be flaky or spend minutes per fact spinning up containers.
+  </Card>
+  <Card title="Cross-process behavior" icon="network-wired">
+    The whole point of distributed events is that two **processes** exchange messages. xUnit runs assemblies in a single process. The DistEvents apps are designed to be launched twice and observed.
+  </Card>
+  <Card title="Outbox draining cadence" icon="hourglass">
+    The outbox worker polls on an interval and uses a distributed lock. Asserting "the message arrived within N seconds" is fragile. Manual inspection is a better fit.
+  </Card>
+</CardGroup>
+
+The framework-side guarantees (the outbox row is inserted in the same UoW as the entity, the inbox row gates duplicate delivery) are covered by `Volo.Abp.EventBus.Tests` (see [Framework test suite](/testing/framework-test-suite)). The DistEvents apps are the end-to-end smoke test.
+
+## How they relate to the rest of the test infrastructure
+
+<Note>
+These apps do **not** inherit from `AbpIntegratedTest<TStartupModule>` or any other test base. They're real ABP hosts built with `Host.CreateDefaultBuilder` and `.UseAutofac()`, identical in shape to a production console worker. That's intentional — they prove the same module graph an operator would deploy actually works against the actual brokers it would talk to.
+</Note>
+
+Each `Program.cs` is the same boilerplate (only the startup module changes):
+
+```csharp
+public class Program
+{
+    public static async Task<int> Main(string[] args)
+    {
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Debug()
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .Enrich.FromLogContext()
+            .WriteTo.Async(c => c.File("Logs/logs.txt"))
+            .WriteTo.Async(c => c.Console())
+            .CreateLogger();
+
+        try
+        {
+            Log.Information("Starting console host.");
+            await CreateHostBuilder(args).RunConsoleAsync();
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Host terminated unexpectedly!");
+            return 1;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
+    }
+
+    internal static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .UseAutofac()
+            .UseSerilog()
+            .ConfigureAppConfiguration((context, config) => { })
+            .ConfigureServices((hostContext, services) =>
+            {
+                services.AddApplication<DistDemoAppEfCoreRabbitMqModule>();
+            });
+}
+```
+
+The `services.AddApplication<TModule>()` call is exactly the same one `AbpIntegratedTest<TStartupModule>` uses inside its constructor — see [TestBase](/testing/testbase). The DistEvents apps are essentially "what an `AbpIntegratedTest` becomes when you take the test wrapper off and let it bind to a real host."
+
+## Cross-references
+
+- [Framework test suite](/testing/framework-test-suite) — the xUnit side of event-bus testing (`Volo.Abp.EventBus.Tests`).
+- [Modularity](/core/modularity) — `services.AddApplication<TModule>()`, `PreConfigure<TOptions>`, the hook order Rebus relies on.
+- [Unit of Work](/data/unit-of-work) — the outbox is written inside the same UoW as the aggregate insert; without UoW interception that guarantee breaks.
+- [TestBase](/testing/testbase) — the in-process counterpart of these manual apps; same `AddApplication<T>` + `Initialize` pattern.
+- [AspNetCore TestBase](/testing/aspnetcore-testbase) — for distributed-event tests that need an HTTP entry point in addition to a broker.

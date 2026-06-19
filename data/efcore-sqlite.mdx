@@ -1,0 +1,331 @@
+---
+title: "EF Core SQLite Adapter: UseSqlite and Test Connection"
+sidebarTitle: "EF Core: SQLite"
+description: "Volo.Abp.EntityFrameworkCore.Sqlite adapter: UseSqlite extension, SqliteConnectionStringChecker and AbpUnitTestSqliteConnection for parallel tests."
+---
+
+`Volo.Abp.EntityFrameworkCore.Sqlite` is ABP's SQLite adapter. SQLite is the framework's preferred test database — it runs in‑process, requires no service, and supports almost everything ABP needs (with caveats around concurrent writes). Source: `framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/`.
+
+The adapter contributes the same shape as the SQL Server / PostgreSQL ones plus one extra utility: `AbpUnitTestSqliteConnection`, a `SqliteConnection` subclass that serializes command construction so parallel xUnit collections don't crash.
+
+## Package contents
+
+```
+framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/
+├── Microsoft/EntityFrameworkCore/
+│   └── AbpSqliteModelBuilderExtensions.cs
+└── Volo/Abp/EntityFrameworkCore/
+    ├── AbpDbContextConfigurationContextSqliteExtensions.cs
+    ├── AbpDbContextOptionsSqliteExtensions.cs
+    ├── ConnectionStrings/SqliteConnectionStringChecker.cs
+    └── Sqlite/
+        ├── AbpEntityFrameworkCoreSqliteModule.cs
+        └── AbpUnitTestSqliteConnection.cs
+```
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/Volo/Abp/EntityFrameworkCore/Sqlite/AbpEntityFrameworkCoreSqliteModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreSqliteModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+Notice this module does **not** override `AbpSequentialGuidGeneratorOptions.DefaultSequentialGuidType` — SQLite stores GUIDs as `TEXT` and the framework default works fine.
+
+`UseDbFunction = true` is still set: EF Core's SQLite provider compiles ABP's filter functions to SQLite scalar functions, keeping plan caches hot.
+
+## UseSqlite extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsSqliteExtensions.cs
+public static class AbpDbContextOptionsSqliteExtensions
+{
+    public static void UseSqlite(
+        [NotNull] this AbpDbContextOptions options,
+        Action<SqliteDbContextOptionsBuilder>? sqliteOptionsAction = null)
+    {
+        options.Configure(context =>
+        {
+            context.UseSqlite(sqliteOptionsAction);
+        });
+    }
+
+    public static void UseSqlite<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<SqliteDbContextOptionsBuilder>? sqliteOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseSqlite(sqliteOptionsAction);
+        });
+    }
+}
+```
+
+## Connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/Volo/Abp/EntityFrameworkCore/ConnectionStrings/SqliteConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class SqliteConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            await using var conn = new SqliteConnection(connectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+A SQLite file is created on first `Open()` if it doesn't exist (default options). The checker therefore sets both flags after a successful open — for SQLite "the database exists if I can open it" is correct semantics.
+
+## AbpUnitTestSqliteConnection — parallel test safety
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/Volo/Abp/EntityFrameworkCore/Sqlite/AbpUnitTestSqliteConnection.cs
+/// <summary>
+/// This class is for unit testing purposes.
+/// It prevents exceptions in concurrent testing because Sqlite is not thread-safe.
+/// </summary>
+public class AbpUnitTestSqliteConnection : SqliteConnection
+{
+    public AbpUnitTestSqliteConnection(string connectionString) : base(connectionString) { }
+
+    public override SqliteCommand CreateCommand()
+    {
+        return new AbpSqliteCommand
+        {
+            Connection = this,
+            CommandTimeout = DefaultTimeout,
+            Transaction = Transaction
+        };
+    }
+}
+
+internal class AbpSqliteCommand : SqliteCommand
+{
+    private readonly static SemaphoreSlim Semaphore = new SemaphoreSlim(1, 1);
+
+    public override SqliteConnection? Connection
+    {
+        get => base.Connection;
+        set
+        {
+            using (Semaphore.Lock())
+            {
+                base.Connection = value;
+            }
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        using (Semaphore.Lock())
+        {
+            base.Dispose(disposing);
+        }
+    }
+}
+```
+
+The single static `SemaphoreSlim` serializes `Connection` set and `Dispose` across the entire process. That's enough to stop the native `e_sqlite3` library from being entered concurrently when xUnit runs collections in parallel against in‑memory SQLite databases.
+
+## Idiomatic in-memory test setup
+
+```csharp
+public class MyAppTestBase : AbpIntegratedTest<MyAppTestModule>
+{
+    protected override void SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options)
+    {
+        options.UseAutofac();
+    }
+}
+
+[DependsOn(
+    typeof(MyAppEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreSqliteModule)
+)]
+public class MyAppTestModule : AbpModule
+{
+    private SqliteConnection? _sqliteConnection;
+
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        _sqliteConnection = CreateDatabaseAndGetConnection();
+
+        context.Services.Configure<AbpDbContextOptions>(options =>
+        {
+            options.Configure(ctx => ctx.DbContextOptions.UseSqlite(_sqliteConnection));
+        });
+    }
+
+    private static SqliteConnection CreateDatabaseAndGetConnection()
+    {
+        var connection = new AbpUnitTestSqliteConnection("DataSource=:memory:");
+        connection.Open();
+
+        using var context = new MyAppDbContext(
+            new DbContextOptionsBuilder<MyAppDbContext>()
+                .UseSqlite(connection).Options);
+
+        context.GetService<IRelationalDatabaseCreator>().CreateTables();
+        return connection;
+    }
+}
+```
+
+`:memory:` SQLite databases live only as long as the connection is open, so the test module keeps `_sqliteConnection` alive for the lifetime of the test fixture.
+
+<Warning>
+With `:memory:` SQLite you must **share one connection across the entire test**. Don't put `UseSqlite("DataSource=:memory:")` directly in `AbpDbContextOptions` — every call to `OpenAsync` would yield a fresh, empty database. Hold a `SqliteConnection` and pass it as a parameter, as above.
+</Warning>
+
+## Transaction caveats
+
+SQLite supports only one writer at a time. ABP's UoW happily wraps writes in a transaction, but if your test code starts a second UoW while the outer one is uncommitted you may see `SQLite Error 5: 'database is locked'` instead of a graceful wait.
+
+Two mitigations:
+
+<AccordionGroup>
+  <Accordion title="Disable UoW transactions for tests">
+    ```csharp
+    Configure<AbpUnitOfWorkDefaultOptions>(options =>
+    {
+        options.TransactionBehavior = UnitOfWorkTransactionBehavior.Disabled;
+    });
+    ```
+    The UoW still calls `SaveChangesAsync` on each `IDatabaseApi`; it just skips `BeginTransaction`/`CommitAsync`.
+  </Accordion>
+  <Accordion title="Use AlwaysDisableTransactionsUnitOfWorkManager">
+    Replace `IUnitOfWorkManager`:
+    ```csharp
+    context.Services.Replace(
+        ServiceDescriptor.Singleton<IUnitOfWorkManager, AlwaysDisableTransactionsUnitOfWorkManager>());
+    ```
+    `AbpDbContext.Initialize` then sets `Database.AutoTransactionBehavior = AutoTransactionBehavior.Never` so EF Core never wraps individual `SaveChanges` in its own implicit transaction either.
+  </Accordion>
+</AccordionGroup>
+
+## A complete test fixture
+
+Putting it all together — a standard xUnit fixture every ABP integration test reuses:
+
+```csharp
+[CollectionDefinition("BooksTests")]
+public class BooksTestsCollection : ICollectionFixture<BooksTestFixture> { }
+
+public class BooksTestFixture : IDisposable
+{
+    public IAbpApplicationWithExternalServiceProvider App { get; }
+    public IServiceProvider ServiceProvider { get; }
+
+    public BooksTestFixture()
+    {
+        var services = new ServiceCollection();
+        var app = AbpApplicationFactory.Create<BooksTestModule>(services, opts => opts.UseAutofac());
+
+        ServiceProvider = services.BuildServiceProviderFromFactory(new AutofacServiceProviderFactory());
+        app.Initialize(ServiceProvider);
+        App = app;
+    }
+
+    public void Dispose() => App.Shutdown();
+}
+
+public abstract class BooksTestBase
+{
+    protected IServiceScope CreateScope() => Fixture.ServiceProvider.CreateScope();
+
+    public BooksTestFixture Fixture { get; }
+    protected BooksTestBase(BooksTestFixture fixture) { Fixture = fixture; }
+}
+
+[Collection("BooksTests")]
+public class BookAppService_Tests : BooksTestBase
+{
+    public BookAppService_Tests(BooksTestFixture f) : base(f) { }
+
+    [Fact]
+    public async Task Should_Create_A_Book()
+    {
+        using var scope = CreateScope();
+        var manager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+        using var uow = manager.Begin(new AbpUnitOfWorkOptions());
+        var svc = scope.ServiceProvider.GetRequiredService<IBookAppService>();
+
+        var created = await svc.CreateAsync(new CreateBookInput { Name = "Test" });
+
+        await uow.CompleteAsync();
+        created.Id.ShouldNotBe(Guid.Empty);
+    }
+}
+```
+
+The test module brings `AbpEntityFrameworkCoreSqliteModule`, creates an `AbpUnitTestSqliteConnection("DataSource=:memory:")`, calls `IRelationalDatabaseCreator.CreateTables()`, and registers the connection in `AbpDbContextOptions`. Each test uses the shared fixture's service provider; data persists for the duration of the fixture (one connection = one in‑memory DB).
+
+<Tip>
+For tests that need fresh state per test, use `Microsoft.Data.Sqlite`'s `Mode=Memory;Cache=Shared;` with a unique data source name per test (e.g. `DataSource=test-{Guid.NewGuid()}.db;Mode=Memory;Cache=Shared`). Then dispose the fixture between tests.
+</Tip>
+
+## SQLite-specific limitations
+
+<AccordionGroup>
+  <Accordion title="Schema migrations are limited">
+    SQLite can `CREATE TABLE` and `INSERT`, but it can't `ALTER TABLE DROP COLUMN` (pre‑3.35), `ALTER TABLE ALTER COLUMN`, or rename most constraints. EF Core's SQLite migration generator works around this by rebuilding the table — fine for tests, slow for big production tables (also not recommended).
+  </Accordion>
+  <Accordion title="Decimal precision">
+    SQLite has no native `DECIMAL`. EF Core stores `decimal` as `TEXT`. This means `ORDER BY` on a decimal column is lexical, not numeric, unless you cast. For tests this rarely matters; for production, again, don't.
+  </Accordion>
+  <Accordion title="No connection-level access control">
+    SQLite has no user/role concept. The connection string controls only the file path. Don't ship SQLite as a multi‑user store.
+  </Accordion>
+</AccordionGroup>
+
+## When SQLite is **not** a good fit
+
+<Note>
+SQLite is a great test driver and a fine single‑user desktop database. It is **not** a good drop‑in for production multi‑user web apps — there is no server, write concurrency is process‑local, and `JSON`/`COLLATE` semantics differ from server‑grade RDBMSes. For production use SQL Server, PostgreSQL, MySQL or Oracle.
+</Note>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    The base implementation everything sits on.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    `AlwaysDisableTransactionsUnitOfWorkManager` lives here.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    Where `SqliteConnectionStringChecker` plugs in.
+  </Card>
+  <Card title="SQL Server adapter" icon="server" href="/data/efcore-sqlserver">
+    Compare module shape.
+  </Card>
+  <Card title="MemoryDb" icon="memory" href="/data/memorydb">
+    The other test‑oriented provider.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The domain‑facing API.
+  </Card>
+</CardGroup>

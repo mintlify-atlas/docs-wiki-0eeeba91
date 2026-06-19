@@ -1,0 +1,406 @@
+---
+title: "Volo.Abp.AspNetCore.TestBase: TestServer and WebApplicationFactory"
+sidebarTitle: "AspNetCore TestBase"
+description: "How AbpWebApplicationFactoryIntegratedTest and the older AbpAspNetCoreIntegratedTestBase boot an in-memory ASP.NET Core host so HTTP tests can hit a real pipeline."
+---
+
+`framework/src/Volo.Abp.AspNetCore.TestBase/` adds an in-memory web host on top of [Volo.Abp.TestBase](/testing/testbase). It contains two base classes, three small infrastructure types, and two extension classes. The package's `AbpAspNetCoreTestBaseModule` ties it to Autofac and the dynamic HTTP client proxy stack:
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.TestBase/Volo/Abp/AspNetCore/TestBase/
+//   AbpAspNetCoreTestBaseModule.cs
+[DependsOn(typeof(AbpHttpClientModule))]
+[DependsOn(typeof(AbpAspNetCoreModule))]
+[DependsOn(typeof(AbpTestBaseModule))]
+[DependsOn(typeof(AbpAutofacModule))]
+public class AbpAspNetCoreTestBaseModule : AbpModule
+{
+}
+```
+
+Files in the folder:
+
+```
+framework/src/Volo.Abp.AspNetCore.TestBase/Volo/Abp/AspNetCore/TestBase/
+├── AbpAspNetCoreTestBaseModule.cs
+├── AbpAspNetCoreIntegratedTestBase.cs        // [Obsolete] generic Host pipeline
+├── AbpAspNetCoreAsyncIntegratedTestBase.cs   // [Obsolete] async variant
+├── AbpWebApplicationFactoryIntegratedTest.cs // current API — WebApplicationFactory<TProgram>
+├── AbpNoopHostLifetime.cs
+├── TestNoopHostLifetime.cs
+├── ITestServerAccessor.cs
+├── TestServerAccessor.cs
+├── TestStartup.cs                            // legacy IStartup adapter
+├── WebHostBuilderExtensions.cs               // UseAbpTestServer
+├── WebApplicationBuilderExtensions.cs        // RunAbpModuleAsync helper
+├── WebProjectPatchHelper.cs
+└── DynamicProxying/
+    └── AspNetCoreTestProxyHttpClientFactory.cs
+```
+
+## The current API: AbpWebApplicationFactoryIntegratedTest&lt;TProgram&gt;
+
+This is the recommended base class. It derives from `Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<TProgram>` so it works with the minimal-hosting `Program.cs` pattern that ASP.NET Core 6+ apps use:
+
+```csharp
+public abstract class AbpWebApplicationFactoryIntegratedTest<TProgram>
+    : WebApplicationFactory<TProgram>
+    where TProgram : class
+{
+    protected HttpClient Client { get; set; }
+
+    protected IServiceProvider ServiceProvider => Services;
+
+    protected AbpWebApplicationFactoryIntegratedTest()
+    {
+        Client = CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+    }
+
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        builder
+            .AddAppSettingsSecretsJson()
+            .ConfigureServices(ConfigureServices);
+        return base.CreateHost(builder);
+    }
+
+    protected virtual T? GetService<T>()  => Services.GetService<T>();
+    protected virtual T GetRequiredService<T>() where T : notnull => Services.GetRequiredService<T>();
+    // GetKeyedServices, GetRequiredKeyedService, GetUrl<TController>(...) follow
+    // — same shape as AbpTestBaseWithServiceProvider.
+
+    protected virtual void ConfigureServices(IServiceCollection services) { }
+}
+```
+
+### What you get for free
+
+- `Client` — an `HttpClient` already wired to the in-memory `TestServer`. Redirects are disabled (important for OAuth/identity tests that need to see the 302).
+- `Services` and `ServiceProvider` — the host's root provider, after `Program.cs` and every ABP module have initialized.
+- `ITestServerAccessor.Server` — set during the constructor so anything resolved later (like the proxy HTTP factory below) can grab the same in-memory server.
+
+### Typical test
+
+```csharp
+public class GreetingController_Tests
+    : AbpWebApplicationFactoryIntegratedTest<MyWebProgram>
+{
+    [Fact]
+    public async Task Should_return_greeting()
+    {
+        var response = await Client.GetAsync(GetUrl<GreetingController>("Hello"));
+        response.EnsureSuccessStatusCode();
+
+        var body = await response.Content.ReadAsStringAsync();
+        body.ShouldContain("hello");
+    }
+
+    [Fact]
+    public void Resolves_application_service_from_DI()
+    {
+        var service = GetRequiredService<IGreetingAppService>();
+        service.ShouldNotBeNull();
+    }
+}
+```
+
+`GetUrl<TController>("Hello")` is defined on the base; it strips controller-name suffixes (`Controller`, `AppService`, `Service`, ...) and concatenates the action — handy for tests that don't care about route name plumbing:
+
+```csharp
+protected virtual string GetUrl<TController>()
+{
+    return "/" + typeof(TController).Name.RemovePostFix(
+        "Controller", "AppService", "ApplicationService",
+        "IntService", "IntegrationService", "Service");
+}
+```
+
+### Configuration
+
+- `AddAppSettingsSecretsJson()` is called on the host builder, which loads `appsettings.secrets.json` if present. Use this for CI-secret-friendly local credentials.
+- Override `ConfigureServices(IServiceCollection)` to swap registrations *after* your `Program.cs` and modules have run.
+
+<Tip>
+The `TProgram` generic must be your actual application's `Program` class (or any class in the same assembly). `WebApplicationFactory` uses it to find the entry-point assembly via reflection.
+</Tip>
+
+## The older API: AbpAspNetCoreIntegratedTestBase&lt;TStartupModule&gt;
+
+Older module tests in the repo still use this. It is marked obsolete:
+
+```csharp
+[Obsolete("Use AbpWebApplicationFactoryIntegratedTest instead.")]
+public abstract class AbpAspNetCoreIntegratedTestBase<TStartupModule>
+    : AbpTestBaseWithServiceProvider, IDisposable
+    where TStartupModule : class
+{
+    protected TestServer Server { get; }
+    protected HttpClient Client { get; }
+
+    private readonly IHost _host;
+
+    protected AbpAspNetCoreIntegratedTestBase()
+    {
+        var builder = CreateHostBuilder();
+
+        _host = builder.Build();
+        _host.Start();
+
+        Server = _host.GetTestServer();
+        Client = _host.GetTestClient();
+
+        ServiceProvider = Server.Services;
+        ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+    }
+
+    protected virtual IHostBuilder CreateHostBuilder()
+    {
+        return Host.CreateDefaultBuilder()
+            .AddAppSettingsSecretsJson()
+            .ConfigureWebHostDefaults(webBuilder =>
+            {
+                if (typeof(TStartupModule).IsAssignableTo<IAbpModule>())
+                {
+                    webBuilder.UseStartup<TestStartup<TStartupModule>>();
+                }
+                else
+                {
+                    webBuilder.UseStartup<TStartupModule>();
+                }
+
+                webBuilder.UseAbpTestServer();
+            })
+            .UseAutofac()
+            .ConfigureServices(ConfigureServices);
+    }
+
+    protected virtual void ConfigureServices(
+        HostBuilderContext context, IServiceCollection services) { }
+
+    public void Dispose() => _host?.Dispose();
+}
+```
+
+Key differences from the WebApplicationFactory base:
+
+| Concern | `AbpWebApplicationFactoryIntegratedTest` | `AbpAspNetCoreIntegratedTestBase` |
+| --- | --- | --- |
+| Entry point | Your real `Program.cs` (or any class in the asm) | A module type **or** a classic `Startup` class |
+| Host builder | `WebApplicationFactory.CreateHost(IHostBuilder)` | `Host.CreateDefaultBuilder().ConfigureWebHostDefaults(...)` |
+| Autofac | Inherits from `Program.cs` | Explicitly `.UseAutofac()` |
+| TestServer wiring | `WebApplicationFactory` internals | `webBuilder.UseAbpTestServer()` |
+| Status | Recommended | `[Obsolete]` — kept for older module tests |
+
+### How TStartupModule becomes a Startup class
+
+If `TStartupModule` is an `IAbpModule`, the legacy base wraps it in a generated `TestStartup<TStartupModule>`:
+
+```csharp
+internal class TestStartup<TStartupModule>
+{
+    public void ConfigureServices(IServiceCollection services)
+    {
+        AsyncHelper.RunSync(() => services.AddApplicationAsync(typeof(TStartupModule)));
+    }
+
+    public void Configure(IApplicationBuilder app)
+    {
+        AsyncHelper.RunSync(app.InitializeApplicationAsync);
+    }
+}
+```
+
+This means you can give it either:
+
+- a module type directly (`AbpAspNetCoreIntegratedTestBase<MyMvcTestModule>`), or
+- an old-school `Startup` class (`AbpAspNetCoreIntegratedTestBase<MyStartup>`)
+
+and the base does the right thing.
+
+### UseAbpTestServer — swapping in the in-memory server
+
+```csharp
+public static class AbpWebHostBuilderExtensions
+{
+    public static IWebHostBuilder UseAbpTestServer(this IWebHostBuilder builder)
+    {
+        return builder.ConfigureServices(services =>
+        {
+            services.AddScoped<IHostLifetime, AbpNoopHostLifetime>();
+            services.AddScoped<IServer, TestServer>();
+        });
+    }
+}
+```
+
+Two replacements:
+
+- `IServer` becomes `Microsoft.AspNetCore.TestHost.TestServer` instead of Kestrel.
+- `IHostLifetime` becomes a no-op so the host's `Start` doesn't wait on Ctrl+C signaling — `AbpNoopHostLifetime` is:
+
+```csharp
+public class AbpNoopHostLifetime : IHostLifetime
+{
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task WaitForStartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+(`TestNoopHostLifetime` is the singleton variant used by the async base; same behavior.)
+
+## ITestServerAccessor — sharing the TestServer with ABP infrastructure
+
+```csharp
+public interface ITestServerAccessor
+{
+    TestServer Server { get; set; }
+}
+
+public class TestServerAccessor : ITestServerAccessor, ISingletonDependency
+{
+    public TestServer Server { get; set; } = default!;
+}
+```
+
+`TestServerAccessor` is registered as a singleton. Both test bases set its `Server` property in their constructor:
+
+```csharp
+ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+```
+
+This lets other ABP services that need an `HttpClient` against the in-memory server resolve `ITestServerAccessor`, call `Server.CreateClient()`, and stay inside the test pipeline.
+
+### The proxy HTTP client factory
+
+The most important consumer of `ITestServerAccessor` is the dynamic HTTP client proxy. ABP's `AbpHttpClientModule` lets you call a remote `IAppService` interface as if it were local — under the hood it generates a proxy that issues an HTTP request. In a test, you want that HTTP request to go to the in-memory server rather than to `localhost:5000`. The replacement is:
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.TestBase/Volo/Abp/AspNetCore/TestBase/
+//   DynamicProxying/AspNetCoreTestProxyHttpClientFactory.cs
+[Dependency(ReplaceServices = true)]
+public class AspNetCoreTestProxyHttpClientFactory
+    : IProxyHttpClientFactory, ITransientDependency
+{
+    private readonly ITestServerAccessor _testServerAccessor;
+
+    public AspNetCoreTestProxyHttpClientFactory(ITestServerAccessor testServerAccessor)
+    {
+        _testServerAccessor = testServerAccessor;
+    }
+
+    public HttpClient Create() => _testServerAccessor.Server.CreateClient();
+    public HttpClient Create(string name) => Create();
+}
+```
+
+`[Dependency(ReplaceServices = true)]` lets ABP swap out the production `IProxyHttpClientFactory` for this one whenever `AbpAspNetCoreTestBaseModule` is in the dependency graph. Net effect: HTTP-client proxies and integration tests automatically share the in-memory server. See [HTTP Client](/http/http-client) for the production side.
+
+## The async legacy base
+
+`AbpAspNetCoreAsyncIntegratedTestBase<TModule>` is the async variant of the legacy base. It is also marked `[Obsolete]` in favor of `AbpWebApplicationFactoryIntegratedTest`. It boots through `WebApplication.CreateBuilder()` and `WebApplication.StartAsync()`:
+
+```csharp
+public virtual async Task InitializeAsync()
+{
+    var builder = WebApplication.CreateBuilder();
+    builder.Host.ConfigureServices(services =>
+        {
+            services.AddSingleton<IHostLifetime, TestNoopHostLifetime>();
+            services.AddSingleton<IServer, TestServer>();
+        })
+        .UseAutofac();
+
+    await builder.Services.AddApplicationAsync<TModule>(options =>
+    {
+        options.Services.ReplaceConfiguration(builder.Configuration);
+    });
+
+    await ConfigureServicesAsync(builder.Services);
+    WebApplication = builder.Build();
+    await WebApplication.InitializeApplicationAsync();
+    await WebApplication.StartAsync();
+
+    Server = WebApplication.Services.GetRequiredService<IHost>().GetTestServer();
+    Client = Server.CreateClient();
+
+    ServiceProvider = Server.Services;
+    ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+}
+```
+
+Use it only if you have an existing test that depends on its hooks; otherwise prefer the `WebApplicationFactory` base.
+
+## RunAbpModuleAsync — a host-side helper
+
+`WebApplicationBuilderExtensions` ships a small helper used by the framework's own perf/sample apps to boot a module as a real host:
+
+```csharp
+public static class WebApplicationBuilderExtensions
+{
+    public async static Task RunAbpModuleAsync<TModule>(
+        this WebApplicationBuilder builder,
+        Action<AbpApplicationCreationOptions>? optionsAction = null,
+        string? applicationName = null)
+        where TModule : IAbpModule
+    {
+        applicationName = applicationName ?? typeof(TModule).Assembly.GetName()?.Name;
+        if (!applicationName.IsNullOrWhiteSpace())
+        {
+            builder.Environment.ApplicationName = applicationName;
+        }
+
+        builder.Host.UseAutofac();
+        await builder.AddApplicationAsync<TModule>(optionsAction);
+        var app = builder.Build();
+        await app.InitializeApplicationAsync();
+        await app.RunAsync();
+    }
+}
+```
+
+It is not part of the test boot, but lives in the same package because it shares the `WebApplicationBuilder` plumbing.
+
+## Putting it together: a module-style HTTP test
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreTestBaseModule),
+    typeof(MyMvcModule))]
+public class MyMvcTestModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAlwaysAllowAuthorization();
+    }
+}
+
+public abstract class MyMvcTestBase
+    : AbpAspNetCoreIntegratedTestBase<MyMvcTestModule>  // (legacy variant)
+{
+}
+
+public class GreetingController_Tests : MyMvcTestBase
+{
+    [Fact]
+    public async Task Should_return_greeting()
+    {
+        var response = await Client.GetAsync("/api/greeting/hello");
+        var body = await response.Content.ReadAsStringAsync();
+        body.ShouldContain("hello");
+    }
+}
+```
+
+Because `MyMvcTestModule` depends on `AbpAspNetCoreTestBaseModule`, the `AspNetCoreTestProxyHttpClientFactory` replacement is active, and any C# proxy `IGreetingAppService` you resolve will route through the same `TestServer`.
+
+## Cross-references
+
+- [TestBase](/testing/testbase) — the non-web layer this package sits on top of. Same hook model.
+- [Test Base (guide)](/aspnetcore/test-base) — the higher-level walkthrough for application authors.
+- [Modularity](/core/modularity) — `AddApplicationAsync<TModule>` and `InitializeApplicationAsync` are the same calls used here.
+- [HTTP Client](/http/http-client) — production side of the `IProxyHttpClientFactory` that the test factory replaces.
+- [Module test patterns](/testing/module-test-patterns) — how application/domain/HTTP tests are layered in real modules.

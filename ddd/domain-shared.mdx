@@ -1,0 +1,283 @@
+---
+title: "Volo.Abp.Ddd.Domain.Shared Package Deep Dive in ABP"
+sidebarTitle: "Domain.Shared"
+description: "ABP's lowest DDD layer: the home for enums, constants, error codes, and ETOs that both Domain and client-side projects can safely consume."
+---
+
+The `Volo.Abp.Ddd.Domain.Shared` package, defined under `framework/src/Volo.Abp.Ddd.Domain.Shared/`, is the smallest and most permissive DDD layer in ABP. Its single purpose is to host symbols — enums, constants, error codes, localization keys, and Entity Transfer Objects (ETOs) for distributed events — that **both** the server-side `Domain` layer and **client-side** projects (Blazor WASM, mobile, JavaScript SDKs through generated DTOs) need to share. Because clients reach this assembly transitively through `Application.Contracts`, anything you put here must be safe to ship to the browser: no `DbContext`, no `IRepository`, no `HttpClient`, no platform-specific dependencies.
+
+This page walks the package contents file by file, explains the rule "what belongs in `Domain.Shared`", and shows a worked example from the Identity module where the team stored error codes, constants, and ETOs.
+
+## Package summary
+
+The folder layout under `framework/src/Volo.Abp.Ddd.Domain.Shared/`:
+
+```
+Volo/Abp/Domain/
+├── AbpDddDomainSharedModule.cs
+└── Entities/Events/Distributed/
+    ├── AbpDistributedEntityEventOptions.cs
+    ├── AutoEntityDistributedEventSelectorList.cs
+    ├── EntityCreatedEto.cs
+    ├── EntityDeletedEto.cs
+    ├── EntityEto.cs
+    ├── EntityUpdatedEto.cs
+    ├── EtoMappingDictionary.cs
+    ├── EtoMappingDictionaryItem.cs
+    ├── IAutoEntityDistributedEventSelectorList.cs
+    ├── IEntityEto.cs
+    └── IEntityToEtoMapper.cs
+```
+
+Everything here is either:
+
+- A module class (`AbpDddDomainSharedModule`).
+- An option class wired through ABP's options system (`AbpDistributedEntityEventOptions`).
+- A pure DTO/ETO used to ship entity-related data over the distributed event bus.
+
+There are **no entities, no repositories, no domain services** in this package — those live one layer up in [Volo.Abp.Ddd.Domain](/ddd/domain).
+
+## The module class
+
+`AbpDddDomainSharedModule` (`framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/AbpDddDomainSharedModule.cs`) is intentionally trivial — it just chains the two abstraction modules every DDD module ultimately needs:
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/AbpDddDomainSharedModule.cs
+using Volo.Abp.EventBus.Abstractions;
+using Volo.Abp.Modularity;
+using Volo.Abp.MultiTenancy;
+
+namespace Volo.Abp.Domain;
+
+[DependsOn(
+    typeof(AbpMultiTenancyAbstractionsModule),
+    typeof(AbpEventBusAbstractionsModule)
+)]
+public class AbpDddDomainSharedModule : AbpModule
+{
+}
+```
+
+Because this module only depends on **abstraction** modules (`AbpMultiTenancyAbstractionsModule`, `AbpEventBusAbstractionsModule`), it stays shippable to clients without dragging server-side providers along. See the [Modularity](/core/modularity) page for the broader rules around `AbpModule` and `[DependsOn]`.
+
+## What belongs in `Domain.Shared`
+
+Use the following decision matrix when you create a new symbol in your own solution:
+
+| Kind of symbol | Belongs in `Domain.Shared`? | Why |
+| --- | --- | --- |
+| `enum` (e.g. status, role, claim type) | ✅ | Stable, value-only, safely consumed by clients. |
+| `static class XxxConsts` (max lengths, defaults) | ✅ | Same constants used by entity attributes and DTO validators. |
+| `static class XxxErrorCodes` | ✅ | Clients need to translate error codes to messages. |
+| Localization resources / JSON files | ✅ | Loaded by the `IStringLocalizer` factories on both sides. |
+| Distributed event ETOs (`EntityCreatedEto`, custom `UserNameChangedEto`) | ✅ | Subscribers in other microservices need the types. |
+| Entity (`AggregateRoot`) | ❌ | Behaviour and persistence belong in `Domain`. |
+| `IRepository` interfaces | ❌ | Repositories are server-side abstractions. |
+| `ApplicationService` / DTO request types | ❌ | DTOs go in `Application.Contracts` (see [Application.Contracts](/ddd/application-contracts)). |
+
+## The distributed entity ETOs
+
+Distributed event ETOs let one microservice publish "this entity changed" without leaking the full entity to subscribers. They sit in `framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/Entities/Events/Distributed/`.
+
+### IEntityEto and EntityEto
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/Entities/Events/Distributed/IEntityEto.cs
+public interface IEntityEto
+{
+}
+
+// EntityEto.cs
+public class EntityEto : IEntityEto
+{
+    public string EntityType { get; set; }
+    public string KeysAsString { get; set; }
+    public EntityEto(string entityType, string keysAsString) { ... }
+}
+```
+
+`EntityEto` carries just enough metadata (entity type name + serialized keys) for receivers to look up the entity in their own database.
+
+### Lifecycle wrappers
+
+`EntityCreatedEto<TEntityEto>`, `EntityUpdatedEto<TEntityEto>`, and `EntityDeletedEto<TEntityEto>` wrap any ETO so subscribers can fan out per-lifecycle:
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/Entities/Events/Distributed/EntityCreatedEto.cs
+[Serializable]
+[EventName("abp.entity.created")]
+[GenericEventName(Prefix = "abp.entity.created.")]
+public class EntityCreatedEto<TEntityEto>
+{
+    public TEntityEto Entity { get; set; }
+
+    public EntityCreatedEto(TEntityEto entity)
+    {
+        Entity = entity;
+    }
+}
+```
+
+`Updated` and `Deleted` follow the same shape. The `[EventName]` attribute is what ABP's distributed event bus uses to route messages, see the parent [Domain](/ddd/domain) page for the in-process counterparts (`EntityCreatedEventData<TEntity>` etc.).
+
+### IEntityToEtoMapper
+
+Server-side modules implement `IEntityToEtoMapper` to convert their `Entity` instances into ETOs before publishing. The contract lives in `Domain.Shared` so clients also expose the seam:
+
+```csharp
+public interface IEntityToEtoMapper
+{
+    object? Map(object entityObj);
+}
+```
+
+The actual mapping implementation is registered server-side and uses `EtoMappingDictionary` (also in this folder) to keep a `entityType -> etoType` lookup.
+
+### AbpDistributedEntityEventOptions
+
+`AbpDistributedEntityEventOptions` is the configuration class used in `services.Configure<AbpDistributedEntityEventOptions>(...)`. It exposes:
+
+- `EtoMappings`: a `EtoMappingDictionary` to register entity-to-ETO bindings.
+- `AutoEventSelectors`: an `IAutoEntityDistributedEventSelectorList` to opt-in/out specific aggregate roots for automatic publishing.
+
+Because the options class itself lives in `Domain.Shared`, both server and client can talk about the same shape — only the registration of values happens server-side.
+
+## Worked example: the Identity module
+
+The Identity module in `modules/identity/src/Volo.Abp.Identity.Domain.Shared/` is a textbook example of how to fill out a `Domain.Shared` project. Selected files:
+
+```
+modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/
+├── AbpIdentityDomainSharedModule.cs
+├── IdentityClaimValueType.cs         # enum
+├── IdentityErrorCodes.cs             # error code constants
+├── IdentityRoleConsts.cs             # max lengths
+├── IdentityUserConsts.cs             # max lengths
+├── IdentitySecurityLogActionConsts.cs
+├── IdentityRoleEto.cs                # distributed ETO
+├── IdentityRoleNameChangedEto.cs     # custom domain event ETO
+├── IdentityUserEmailChangedEto.cs
+├── IdentityUserUserNameChangedEto.cs
+├── OrganizationUnitEto.cs
+├── Settings/
+└── Localization/
+```
+
+### Error codes
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/IdentityErrorCodes.cs
+namespace Volo.Abp.Identity;
+
+public static class IdentityErrorCodes
+{
+    public const string UserSelfDeletion = "Volo.Abp.Identity:010001";
+    public const string MaxAllowedOuMembership = "Volo.Abp.Identity:010002";
+    public const string ExternalUserPasswordChange = "Volo.Abp.Identity:010003";
+    public const string DuplicateOrganizationUnitDisplayName = "Volo.Abp.Identity:010004";
+    public const string StaticRoleRenaming = "Volo.Abp.Identity:010005";
+    public const string StaticRoleDeletion = "Volo.Abp.Identity:010006";
+    public const string UsersCanNotChangeTwoFactor = "Volo.Abp.Identity:010007";
+    public const string CanNotChangeTwoFactor = "Volo.Abp.Identity:010008";
+    public const string YouCannotDelegateYourself = "Volo.Abp.Identity:010009";
+    public const string ClaimNameExist = "Volo.Abp.Identity:010021";
+    public const string CanNotUpdateStaticClaimType = "Volo.Abp.Identity:010022";
+    public const string CanNotDeleteStaticClaimType = "Volo.Abp.Identity:010023";
+}
+```
+
+The format `Volo.Abp.Identity:NNNNNN` is the ABP convention. When the domain throws `BusinessException(IdentityErrorCodes.UserSelfDeletion)`, the exception handler ([core/exception-handling](/core/exception-handling)) resolves the code through the localization resource shipped in this same package — and clients can do the same lookup because they also reference `Domain.Shared`.
+
+### Enums
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/IdentityClaimValueType.cs
+namespace Volo.Abp.Identity;
+
+public enum IdentityClaimValueType
+{
+    String,
+    Int,
+    Boolean,
+    DateTime
+}
+```
+
+Enums are the canonical "shared" type: they appear in `IdentityClaimType` entity properties **and** in DTOs returned to admin UIs.
+
+### Length constants
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/IdentityUserConsts.cs
+public static class IdentityUserConsts
+{
+    public static int MaxUserNameLength { get; set; } = AbpUserConsts.MaxUserNameLength;
+    public static int MaxNameLength { get; set; } = AbpUserConsts.MaxNameLength;
+    public static int MaxSurnameLength { get; set; } = AbpUserConsts.MaxSurnameLength;
+    public static int MaxEmailLength { get; set; } = AbpUserConsts.MaxEmailLength;
+    public static int MaxPhoneNumberLength { get; set; } = AbpUserConsts.MaxPhoneNumberLength;
+    public static int MaxPasswordLength { get; set; } = 128;
+    public static int MaxPasswordHashLength { get; set; } = 256;
+    public static int MaxSecurityStampLength { get; set; } = 256;
+    public static int MaxLoginProviderLength { get; set; } = 16;
+}
+```
+
+These constants drive `[StringLength(IdentityUserConsts.MaxUserNameLength)]` on entities, EF Core fluent API constraints (`b.Property(u => u.UserName).HasMaxLength(IdentityUserConsts.MaxUserNameLength)`), **and** DTO validation attributes — all from one source of truth.
+
+### Distributed-event ETOs
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain.Shared/Volo/Abp/Identity/IdentityUserUserNameChangedEto.cs
+[Serializable]
+public class IdentityUserUserNameChangedEto : EntityEto
+{
+    public string OldUserName { get; set; }
+    public string NewUserName { get; set; }
+}
+```
+
+A microservice that owns identity publishes `IdentityUserUserNameChangedEto` whenever an `IdentityUser.UserName` changes; subscribers (audit logging, CRM mirror, etc.) handle it without taking a dependency on `Volo.Abp.Identity.Domain`.
+
+## When `Domain.Shared` references should worry you
+
+Because the package transitively flows to all clients, accidentally pulling in a heavy dependency will balloon every client SDK. Guard rails:
+
+- Never `using` an EF Core type, MongoDB type, or ASP.NET Core type in a `Domain.Shared` file.
+- Never store a service or behaviour — keep classes pure data.
+- Localization resources are allowed because the `IStringLocalizer` they target ships as part of the abstraction modules already referenced.
+- Use embedded virtual file system declarations only when you ship JSON localization next to the module class, exactly as the Identity module does in its `Localization/Resources/AbpIdentity/` folder.
+
+## Hosting a localization resource
+
+If you need to attach a localization resource to your `Domain.Shared` module, the pattern is:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpVirtualFileSystemOptions>(options =>
+    {
+        options.FileSets.AddEmbedded<AbpIdentityDomainSharedModule>();
+    });
+
+    Configure<AbpLocalizationOptions>(options =>
+    {
+        options.Resources
+            .Add<IdentityResource>("en")
+            .AddVirtualJson("/Localization/Resources/AbpIdentity");
+    });
+}
+```
+
+The same pattern appears in `framework/src/Volo.Abp.Ddd.Application.Contracts/Volo/Abp/Application/AbpDddApplicationContractsModule.cs`, the next layer up — see [Application.Contracts](/ddd/application-contracts).
+
+## Cross-references
+
+- The behavioural counterpart of these ETOs (the in-process `EntityCreatedEventData<TEntity>` etc.) lives in [Domain → Entity events](/ddd/entities-and-aggregates#events).
+- Module dependency rules: [Modularity](/core/modularity).
+- Error code → localized message resolution: [Exception Handling](/core/exception-handling).
+- Multi-tenancy abstractions (referenced by `IEventDataMayHaveTenantId`): see the [Volo.Abp.Core](/core/volo-abp-core) overview.
+
+<Tip>
+A practical heuristic: if a type would compile in a `netstandard2.0` library with zero references besides ABP abstractions, it's a candidate for `Domain.Shared`.
+</Tip>

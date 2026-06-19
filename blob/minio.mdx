@@ -1,0 +1,300 @@
+---
+title: "MinIO BLOB Provider: S3-Compatible Self-Hosted Backend"
+sidebarTitle: "MinIO"
+description: "Use MinioBlobProvider to persist ABP blobs in MinIO or any S3-compatible object store with EndPoint, AccessKey, WithSSL and CreateBucketIfNotExists."
+---
+
+`Volo.Abp.BlobStoring.Minio` is the [MinIO](https://min.io/) backend for ABP's BLOB Storing system. It uses the official `Minio` .NET SDK and works with any S3‑compatible object store — MinIO itself, but also Wasabi, Backblaze B2 (S3 endpoint), Ceph RADOS Gateway, and DigitalOcean Spaces — by varying only the endpoint and credentials.
+
+Source: `framework/src/Volo.Abp.BlobStoring.Minio/Volo/Abp/BlobStoring/Minio/`. The relevant types are `MinioBlobProvider`, `MinioBlobProviderConfiguration`, `IMinioBlobNameCalculator` (with `DefaultMinioBlobNameCalculator`), and `MinioBlobNamingNormalizer`.
+
+## Module and configuration
+
+Add `AbpBlobStoringMinioModule` to `[DependsOn]` and call `UseMinio(...)`:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringModule),
+    typeof(AbpBlobStoringMinioModule)
+)]
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                container.UseMinio(minio =>
+                {
+                    minio.EndPoint = "minio.internal.mycompany.com";
+                    minio.AccessKey = "minioadmin";
+                    minio.SecretKey = "minioadmin";
+                    minio.BucketName = "myapp-default";
+                    minio.WithSSL = true;
+                    minio.CreateBucketIfNotExists = true;
+                });
+            });
+        });
+    }
+}
+```
+
+The extension method mirrors all other providers:
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Minio/Volo/Abp/BlobStoring/Minio/MinioBlobContainerConfigurationExtensions.cs"
+public static BlobContainerConfiguration UseMinio(
+    this BlobContainerConfiguration containerConfiguration,
+    Action<MinioBlobProviderConfiguration> minioConfigureAction)
+{
+    containerConfiguration.ProviderType = typeof(MinioBlobProvider);
+    containerConfiguration.NamingNormalizers.TryAdd<MinioBlobNamingNormalizer>();
+
+    minioConfigureAction(new MinioBlobProviderConfiguration(containerConfiguration));
+
+    return containerConfiguration;
+}
+```
+
+## `MinioBlobProviderConfiguration`
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Minio/Volo/Abp/BlobStoring/Minio/MinioBlobProviderConfiguration.cs"
+public class MinioBlobProviderConfiguration
+{
+    public string? BucketName { get; set; }
+
+    /// <summary>
+    /// endPoint is an URL, domain name, IPv4 address or IPv6 address.
+    /// </summary>
+    public string EndPoint { get; set; }
+
+    /// <summary>
+    /// accessKey is like user-id that uniquely identifies your account.
+    /// </summary>
+    public string AccessKey { get; set; }
+
+    /// <summary>
+    /// secretKey is the password to your account.
+    /// </summary>
+    public string SecretKey { get; set; }
+
+    /// <summary>
+    /// Use HTTPS for the MinIO endpoint instead of HTTP.
+    /// </summary>
+    public bool WithSSL { get; set; }
+
+    /// <summary>Default: false.</summary>
+    public bool CreateBucketIfNotExists { get; set; }
+}
+```
+
+- **`EndPoint`** — host name or IP, no scheme. The scheme is selected via `WithSSL`. Examples: `play.min.io`, `s3.eu-central-1.wasabisys.com`.
+- **`AccessKey` / `SecretKey`** — the only credential mode supported out of the box. For anonymous access on a public bucket, leave them blank — the SDK accepts that and skips signing.
+- **`BucketName`** — overrides the ABP container name when set. If `null`, the ABP container name is used directly.
+- **`WithSSL`** — true for `https://`, false for `http://`.
+- **`CreateBucketIfNotExists`** — `MakeBucketAsync` is called from `SaveAsync` when this is set.
+
+## `MinioBlobProvider`
+
+The provider builds a `MinioClient` per call and uses the modern `Args` request objects from the SDK.
+
+```csharp title="framework/src/Volo.Abp.BlobStoring.Minio/Volo/Abp/BlobStoring/Minio/MinioBlobProvider.cs"
+public async override Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var blobName = MinioBlobNameCalculator.Calculate(args);
+    var configuration = args.Configuration.GetMinioConfiguration();
+    var client = GetMinioClient(args);
+    var containerName = GetContainerName(args);
+
+    if (!args.OverrideExisting && await BlobExistsAsync(client, containerName, blobName))
+    {
+        throw new BlobAlreadyExistsException(
+            $"Saving BLOB '{args.BlobName}' does already exists in the container '{containerName}'! " +
+            $"Set {nameof(args.OverrideExisting)} if it should be overwritten.");
+    }
+
+    if (configuration.CreateBucketIfNotExists)
+    {
+        await CreateBucketIfNotExists(client, containerName);
+    }
+
+    await client.PutObjectAsync(new PutObjectArgs()
+        .WithBucket(containerName)
+        .WithObject(blobName)
+        .WithStreamData(args.BlobStream)
+        .WithObjectSize(args.BlobStream.Length));
+}
+```
+
+The MinIO SDK requires `WithObjectSize` for streamed uploads. Make sure the `Stream` you pass exposes a valid `Length` (`MemoryStream`, `FileStream`, etc.); for forward‑only streams without a length, wrap them in a `MemoryStream` first or pass `-1` and `WithPartSize` to enable multipart upload — that requires subclassing `MinioBlobProvider`.
+
+### Client construction
+
+```csharp
+protected virtual IMinioClient GetMinioClient(BlobProviderArgs args)
+{
+    var configuration = args.Configuration.GetMinioConfiguration();
+
+    var client = new MinioClient()
+        .WithEndpoint(configuration.EndPoint)
+        .WithCredentials(configuration.AccessKey, configuration.SecretKey);
+
+    if (configuration.WithSSL)
+    {
+        client.WithSSL();
+    }
+
+    return client.Build();
+}
+```
+
+The client is constructed for each call. The SDK is designed for that — there are no eagerly opened sockets — and the cost is dominated by the network call, not by object allocation. Override this method to add custom `HttpClient` handlers (proxies, mTLS) or to inject a cached client.
+
+### Existence check
+
+```csharp
+protected virtual async Task<bool> BlobExistsAsync(IMinioClient client, string containerName, string blobName)
+{
+    if (await client.BucketExistsAsync(new BucketExistsArgs().WithBucket(containerName)))
+    {
+        try
+        {
+            await client.StatObjectAsync(new StatObjectArgs().WithBucket(containerName).WithObject(blobName));
+        }
+        catch (Exception e)
+        {
+            if (e is ObjectNotFoundException) return false;
+            throw;
+        }
+        return true;
+    }
+    return false;
+}
+```
+
+Same shape as the other providers: bucket‑then‑object, with `ObjectNotFoundException` mapped to `false`.
+
+### Get
+
+```csharp
+public async override Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args)
+{
+    var blobName = MinioBlobNameCalculator.Calculate(args);
+    var client = GetMinioClient(args);
+    var containerName = GetContainerName(args);
+
+    if (!await BlobExistsAsync(client, containerName, blobName))
+    {
+        return null;
+    }
+
+    var memoryStream = new MemoryStream();
+    await client.GetObjectAsync(new GetObjectArgs().WithBucket(containerName).WithObject(blobName).WithCallbackStream(stream =>
+    {
+        if (stream != null)
+        {
+            stream.CopyTo(memoryStream);
+            memoryStream.Seek(0, SeekOrigin.Begin);
+        }
+        else
+        {
+            memoryStream = null;
+        }
+    }));
+
+    return memoryStream;
+}
+```
+
+`GetOrNullAsync` uses the SDK's callback‑style API, copying the response stream into a fresh `MemoryStream` rewound to `0`. This buffers the whole object in memory; for very large blobs, override with a streaming variant that copies directly to your `HttpResponse.Body`.
+
+## Tenant naming — `DefaultMinioBlobNameCalculator`
+
+Same `host/` and `tenants/<tenantId>/` prefix pattern as the other cloud providers. Combined with `BlobContainerConfiguration.IsMultiTenant`, you get free per‑tenant logical folders inside one bucket. See [/tenancy/multi-tenancy-core](/tenancy/multi-tenancy-core) for `ICurrentTenant` mechanics.
+
+## `MinioBlobNamingNormalizer`
+
+S3‑compatible bucket naming rules apply: 3–63 characters, lowercase letters/digits/hyphens, no underscores, no IP‑looking names. `MinioBlobNamingNormalizer` enforces them on container names; object keys are mostly passed through.
+
+## Operational guidance
+
+<AccordionGroup>
+  <Accordion title="Network endpoint" icon="globe">
+    `EndPoint` is a host (no scheme). Configure HTTPS via `WithSSL = true`. For MinIO in Kubernetes, point at the Service name and use TLS via cert‑manager.
+  </Accordion>
+  <Accordion title="Multi-cluster setups" icon="sitemap">
+    Use a different `EndPoint`/`AccessKey`/`SecretKey` per container if you want to spread containers across multiple MinIO clusters — just call `UseMinio` separately for each.
+  </Accordion>
+  <Accordion title="Bucket creation" icon="cubes-stacked">
+    `CreateBucketIfNotExists = true` triggers `MakeBucketAsync`. Make sure the access key has `s3:CreateBucket` permission; otherwise turn it off and provision buckets out of band.
+  </Accordion>
+  <Accordion title="Upload size" icon="cloud-arrow-up">
+    The default `PutObjectAsync` call uses `WithObjectSize`, which requires the stream to expose a length. For streamed uploads without a length, wrap them with `MemoryStream` or subclass to use multipart uploads.
+  </Accordion>
+  <Accordion title="S3-compatible services" icon="boxes-stacked">
+    The provider works with any S3 API‑compatible service. For Wasabi, set `EndPoint = "s3.<region>.wasabisys.com"`, `WithSSL = true`. For DigitalOcean Spaces, set `EndPoint = "<region>.digitaloceanspaces.com"`. The credentials and bucket model are the same.
+  </Accordion>
+</AccordionGroup>
+
+## Usage example
+
+```csharp
+[BlobContainerName("user-uploads")]
+public class UserUploadContainer { }
+
+public class UploadAppService : ApplicationService
+{
+    private readonly IBlobContainer<UserUploadContainer> _blobs;
+
+    public UploadAppService(IBlobContainer<UserUploadContainer> blobs)
+    {
+        _blobs = blobs;
+    }
+
+    public Task SaveAsync(string fileName, Stream content)
+        => _blobs.SaveAsync(fileName, content, overrideExisting: true);
+}
+```
+
+With the module configuration shown above, an upload by tenant `xyz` lands at:
+
+```text
+MinIO bucket:  myapp-default
+Object key:    tenants/<tenantId>/<fileName>
+```
+
+## Migrating between MinIO and other S3 providers
+
+Because MinIO speaks S3, you can migrate to / from the [AWS provider](/blob/aws) at any time by re‑pointing the container with `UseAws(...)` and copying objects via `mc mirror` (MinIO Client) or `aws s3 sync`. The application code does not change, and the tenant prefix layout is identical, so existing keys remain valid.
+
+## Provider package structure
+
+| File | Purpose |
+| --- | --- |
+| `AbpBlobStoringMinioModule.cs` | ABP module; depends on `AbpBlobStoringModule`. |
+| `MinioBlobProvider.cs` | `IBlobProvider` implementation. |
+| `MinioBlobProviderConfiguration.cs` | Typed view (`EndPoint`, `AccessKey`, `SecretKey`, `BucketName`, `WithSSL`, `CreateBucketIfNotExists`). |
+| `MinioBlobProviderConfigurationNames.cs` | Constants for the property bag. |
+| `MinioBlobContainerConfigurationExtensions.cs` | `UseMinio(...)` + `GetMinioConfiguration()`. |
+| `MinioBlobNamingNormalizer.cs` | S3‑style bucket name rules. |
+| `DefaultMinioBlobNameCalculator.cs` | `host/` / `tenants/{id}/` prefix logic. |
+
+## Comparison with AWS
+
+| Aspect | [MinIO](/blob/minio) | [AWS](/blob/aws) |
+| --- | --- | --- |
+| SDK | `Minio` (official) | `AWSSDK.S3` |
+| Credentials | Static (AccessKey + SecretKey) | Static / profile / STS / federated |
+| Endpoint | Custom (`EndPoint` + `WithSSL`) | Region‑based (`Region`) |
+| Bucket auto-create | `CreateBucketIfNotExists` | `CreateContainerIfNotExists` |
+| Tenant prefix | `host/`, `tenants/{id}/` | `host/`, `tenants/{id}/` |
+
+The two providers are wire‑compatible — switching from MinIO to AWS S3 (or vice versa) for an existing container only requires `UseAws(...)` instead of `UseMinio(...)`, plus a data copy preserving keys.
+
+## Related
+
+- [BLOB Storing abstractions](/blob/abstractions) — `IBlobProvider`, `BlobProviderArgs`.
+- [Multi-tenancy core](/tenancy/multi-tenancy-core) — `ICurrentTenant.Id` drives the blob name calculator.
+- [AWS provider](/blob/aws) — full‑featured S3 if you are on AWS.
+- [Aliyun provider](/blob/aliyun) — Alibaba Cloud OSS.
+- [Blob Storing Database module](/modules/blob-storing-database/overview) — when blobs should live with your domain data.

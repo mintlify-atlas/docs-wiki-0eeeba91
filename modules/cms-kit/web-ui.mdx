@@ -1,0 +1,377 @@
+---
+title: "Web UI"
+description: "Razor Pages for CMS Kit: admin back-office CRUD under /CmsKit/* (Volo.CmsKit.Admin.Web), public reading views under /Public/CmsKit/* (Volo.CmsKit.Public.Web), shared view components in Volo.CmsKit.Common.Web, and the meta-bundle Volo.CmsKit.Web."
+---
+
+CMS Kit ships ready-to-use Razor Pages and view components for both the admin back-office and the public-facing site. There are four web projects, each with a specific role:
+
+| Project | Role | Folder root |
+| --- | --- | --- |
+| `Volo.CmsKit.Admin.Web` | Admin CRUD Razor Pages | [`Pages/CmsKit/*`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Admin.Web/Pages/CmsKit) |
+| `Volo.CmsKit.Public.Web` | Public reading pages + shared view components | [`Pages/Public/CmsKit/*`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Public.Web/Pages/Public/CmsKit) |
+| `Volo.CmsKit.Common.Web` | Reaction icons, markdown renderer, shared infrastructure | [`Volo.CmsKit.Common.Web`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Common.Web) |
+| `Volo.CmsKit.Web` | Meta-bundle depending on all three | [`Volo.CmsKit.Web`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Web) |
+
+## Module dependency graph
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Web/CmsKitWebModule.cs
+[DependsOn(
+    typeof(CmsKitPublicWebModule),
+    typeof(CmsKitAdminWebModule),
+    typeof(CmsKitApplicationContractsModule))]
+public class CmsKitWebModule : AbpModule
+{
+}
+```
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Web/CmsKitAdminWebModule.cs
+[DependsOn(
+    typeof(CmsKitAdminApplicationContractsModule),
+    typeof(CmsKitCommonWebModule),
+    typeof(AbpSettingManagementWebModule))]
+public class CmsKitAdminWebModule : AbpModule { /* ... */ }
+```
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Public.Web/CmsKitPublicWebModule.cs
+[DependsOn(
+    typeof(CmsKitPublicApplicationContractsModule),
+    typeof(CmsKitCommonWebModule))]
+public class CmsKitPublicWebModule : AbpModule { /* ... */ }
+```
+
+Both Admin and Public depend on Common; Web depends on both.
+
+## Admin Razor Pages — `Volo.CmsKit.Admin.Web/Pages/CmsKit/`
+
+```
+Pages/CmsKit/
+├── BlogPosts/
+│   ├── Index.cshtml             # GET  /CmsKit/BlogPosts            (grid)
+│   ├── Create.cshtml            # GET/POST /CmsKit/BlogPosts/Create
+│   └── Update.cshtml            # GET/POST /CmsKit/BlogPosts/Update?id=
+├── Blogs/
+│   ├── Index.cshtml             # GET  /CmsKit/Blogs                (grid)
+│   ├── CreateModal.cshtml       # Bootstrap modal
+│   ├── UpdateModal.cshtml
+│   ├── DeleteBlogModal.cshtml
+│   └── FeaturesModal.cshtml     # per-blog feature toggles
+├── Comments/
+│   ├── Index.cshtml             # GET  /CmsKit/Comments             (moderation queue)
+│   ├── Details.cshtml           # GET  /CmsKit/Comments/Details?id=
+│   └── Approve/Index.cshtml     # bulk-approve queue
+├── Contents/
+│   └── AddWidgetModal.cshtml    # embed CMS widgets into pages
+├── GlobalResources/
+│   └── Index.cshtml             # GET/POST /CmsKit/GlobalResources  (site CSS/JS editor)
+├── Menus/MenuItems/
+│   ├── Index.cshtml             # tree view + drag-to-reorder
+│   ├── CreateModal.cshtml
+│   └── UpdateModal.cshtml
+├── Pages/
+│   ├── Index.cshtml             # GET  /CmsKit/Pages                (grid)
+│   ├── Create.cshtml
+│   └── Update.cshtml
+├── Tags/
+│   ├── Index.cshtml             # GET  /CmsKit/Tags
+│   ├── CreateModal.cshtml
+│   ├── EditModal.cshtml
+│   └── Components/TagEditor/Default.cshtml   # reusable tag-input ViewComponent
+└── Shared/Components/Comments/Default.cshtml # admin comment-list widget
+```
+
+Each `.cshtml` has a sibling `.cshtml.cs` `PageModel`. The pattern is:
+
+```csharp
+public class CreateModel : CmsKitAdminPageModel
+{
+    public CreatePageInputDto ViewModel { get; set; }
+    private readonly IPageAdminAppService _pageAdminAppService;
+
+    public CreateModel(IPageAdminAppService pageAdminAppService)
+    {
+        _pageAdminAppService = pageAdminAppService;
+    }
+
+    public void OnGet() => ViewModel = new CreatePageInputDto();
+
+    public async Task<IActionResult> OnPostAsync()
+    {
+        await _pageAdminAppService.CreateAsync(ViewModel);
+        return RedirectToPage("./Index");
+    }
+}
+```
+
+The page model holds the app service and delegates. Forms post the DTO; `RedirectToPage` issues the PRG (Post-Redirect-Get).
+
+### `CmsKitAdminPageModel`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Web/Pages/CmsKitAdminPageModel.cs
+public abstract class CmsKitAdminPageModel : AbpPageModel
+{
+    protected CmsKitAdminPageModel()
+    {
+        LocalizationResourceType = typeof(CmsKitResource);
+        ObjectMapperContext = typeof(CmsKitAdminWebModule);
+    }
+}
+```
+
+A trivial base class — sets the localization resource and the object-mapper context so all admin pages share the same translation files and AutoMapper profile.
+
+### Bundled assets
+
+`CmsKitAdminWebModule` registers JS/CSS bundles:
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.StyleBundles.Configure(StandardBundles.Styles.Global,
+        bundle => bundle.AddContributors(typeof(CmsKitAdminStyleContributor)));
+
+    options.ScriptBundles.Configure(StandardBundles.Scripts.Global,
+        bundle => bundle.AddContributors(typeof(CmsKitAdminScriptContributor)));
+});
+```
+
+The contributors pull in `markdown-it` and `Prism.js` for the rich content editor on blog-post and page screens.
+
+### Menu
+
+`CmsKitAdminMenuContributor` adds a top-level "CMS" menu group to the admin navbar with sub-items: Pages, Blogs, Blog Posts, Comments, Tags, Menus, Global Resources. Each menu item is permission-gated by `CmsKitAdminPermissions.*` so users see only what they can manage.
+
+## Public Razor Pages — `Volo.CmsKit.Public.Web/Pages/Public/CmsKit/`
+
+```
+Pages/Public/CmsKit/
+├── Blogs/
+│   ├── Index.cshtml             # GET /blogs/{blogSlug}              (post list)
+│   └── BlogPost.cshtml          # GET /blogs/{blogSlug}/{blogPostSlug}
+├── Pages/
+│   └── Index.cshtml             # rendered via CmsKitPageRouteValueTransformer
+└── _ViewStart.cshtml
+```
+
+### Dynamic routing for pages
+
+Because pages have user-defined slugs (`/about`, `/docs/getting-started`, etc.) — and the same URL might or might not be a CMS page — the public web project uses an ASP.NET Core **dynamic route value transformer** to decide at runtime whether a given URL maps to a page:
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Public.Web/Pages/CmsKitPageRouteValueTransformer.cs
+public class CmsKitPageRouteValueTransformer : CmsKitDynamicRouteValueTransformerBase
+{
+    protected IFeatureChecker FeatureChecker { get; }
+    protected IPagePublicAppService PagePublicAppService { get; }
+    protected IDistributedCache<PageCacheItem> PageCache { get; }
+
+    public CmsKitPageRouteValueTransformer(
+        ICurrentTenant currentTenant,
+        ITenantConfigurationProvider tenantConfigurationProvider,
+        IFeatureChecker featureChecker,
+        IPagePublicAppService pagePublicAppService,
+        IDistributedCache<PageCacheItem> pageCache)
+        : base(currentTenant, tenantConfigurationProvider)
+    {
+        FeatureChecker = featureChecker;
+        PagePublicAppService = pagePublicAppService;
+        PageCache = pageCache;
+    }
+
+    protected async override ValueTask<RouteValueDictionary> DoTransformAsync(
+        HttpContext httpContext, RouteValueDictionary values)
+    {
+        if (values.TryGetValue("slug", out var slugParameter) && slugParameter is not null)
+        {
+            // ... lookup page, set values["page"] = "/Public/CmsKit/Pages/Index", values["slug"] = slug
+        }
+        return values;
+    }
+}
+```
+
+The host wires this up in `Startup`:
+
+```csharp
+endpoints.MapDynamicPageRoute<CmsKitPageRouteValueTransformer>("/{slug:minlength(1)}");
+endpoints.MapDynamicPageRoute<CmsKitHomePageRouteValueTransformer>("/");
+```
+
+For the root URL `/`, `CmsKitHomePageRouteValueTransformer` looks up the default home page through `IPagePublicAppService.FindDefaultHomePageAsync()` and rewrites the route to `/Public/CmsKit/Pages/Index?slug={homePage.Slug}`.
+
+### `CmsKitPublicPageBase` and `CmsKitPublicPageModelBase`
+
+Public pages derive from these bases:
+
+```csharp
+public abstract class CmsKitPublicPageModelBase : AbpPageModel
+{
+    protected CmsKitPublicPageModelBase()
+    {
+        LocalizationResourceType = typeof(CmsKitResource);
+    }
+}
+```
+
+The base classes don't add much beyond localization wiring — public pages are simple, mostly anonymous, and rely on view components for the interactive parts.
+
+## Public view components — `Volo.CmsKit.Public.Web/Pages/CmsKit/Shared/Components/`
+
+This is the reusable widget library. Each component is a folder with `Default.cshtml` plus a `*ViewComponent.cs` C# class.
+
+```
+Pages/CmsKit/Shared/Components/
+├── Blogs/BlogPostComment/Default.cshtml         # comment thread on a blog post
+├── Commenting/Default.cshtml                    # generic comment thread (any entity)
+├── GlobalResources/
+│   ├── Script/Default.cshtml                    # injects site-wide <script>
+│   └── Style/Default.cshtml                     # injects site-wide <style>
+├── MarkedItemToggle/Default.cshtml              # heart/bookmark toggle button
+├── PopularTags/Default.cshtml                   # tag cloud
+├── Rating/Default.cshtml                        # 1–5 star widget
+├── ReactionSelection/Default.cshtml             # 👍/❤/😂 picker
+└── Tags/Default.cshtml                          # tag chips on an entity
+```
+
+To embed a widget into your own Razor Page:
+
+```cshtml
+@await Component.InvokeAsync(typeof(CommentingViewComponent), new
+{
+    entityType = "BlogPost",
+    entityId = Model.BlogPost.Id.ToString()
+})
+
+@await Component.InvokeAsync(typeof(RatingViewComponent), new
+{
+    entityType = "BlogPost",
+    entityId = Model.BlogPost.Id.ToString()
+})
+
+@await Component.InvokeAsync(typeof(ReactionSelectionViewComponent), new
+{
+    entityType = "BlogPost",
+    entityId = Model.BlogPost.Id.ToString()
+})
+```
+
+The components fetch their own data via the public app services on render. Each component has client-side JS in `wwwroot/` that POSTs back to the matching public HTTP endpoint when a user interacts.
+
+### Modal: login prompt
+
+```
+Pages/CmsKit/Shared/Modals/Login/LoginModal.cshtml
+```
+
+When an anonymous visitor clicks "rate" or "comment", a Bootstrap modal pops up prompting login. The modal is shared by every interactive component so the visual is consistent.
+
+## Common Web — `Volo.CmsKit.Common.Web`
+
+The Common project is small but important: it carries cross-cutting Razor infrastructure.
+
+```
+Volo.CmsKit.Common.Web/
+├── CmsKitCommonWebModule.cs
+├── CmsKitUiOptions.cs            # ReactionIcons map, CommentOptions
+├── CmsKitUiCommentOptions.cs
+├── Controllers/
+│   └── CmsKitCommonWidgetsController.cs   # /api/cms-kit-common/widgets/*
+├── Icons/                         # IconDictionaryHelper, LocalizableIconDictionary
+├── MarkedItems/MarkedItemIconDictionary.cs
+├── Reactions/                     # standard reaction icons + names
+├── Renderers/                     # Markdown → HTML helpers
+└── Pages/CmsKit/Components/ContentPreview/   # content widget preview
+```
+
+### Reaction icons
+
+```csharp
+// CmsKitCommonWebModule.ConfigureServices
+Configure<CmsKitUiOptions>(options =>
+{
+    options.ReactionIcons[StandardReactions.Smile]     = new LocalizableIconDictionary("fas fa-smile text-warning");
+    options.ReactionIcons[StandardReactions.ThumbsUp]  = new LocalizableIconDictionary("fa fa-thumbs-up text-primary");
+    options.ReactionIcons[StandardReactions.Heart]     = new LocalizableIconDictionary("fa fa-heart text-danger");
+    options.ReactionIcons[StandardReactions.Wink]      = new LocalizableIconDictionary("fas fa-grin-wink text-warning");
+    options.ReactionIcons[StandardReactions.Eyes]      = new LocalizableIconDictionary("fas fa-meh-rolling-eyes text-warning");
+    options.ReactionIcons[StandardReactions.Pray]      = new LocalizableIconDictionary("fas fa-praying-hands text-info");
+    options.ReactionIcons[StandardReactions.Rocket]    = new LocalizableIconDictionary("fa fa-rocket text-success");
+    options.ReactionIcons[StandardReactions.ThumbsDown]= new LocalizableIconDictionary("fa fa-thumbs-down text-secondary");
+    // ...
+});
+```
+
+Hosts can override any of these to swap Font Awesome for a different icon set, or add new reactions defined by `CmsKitReactionOptions` in the domain layer.
+
+### Markdown rendering
+
+```csharp
+context.Services.AddSingleton(_ => new MarkdownPipelineBuilder()
+    .UseAutoLinks()
+    .UseBootstrap()
+    .UseGridTables()
+    .UsePipeTables()
+    .Build());
+```
+
+A single Markdig pipeline is registered as a singleton and used by both the admin content preview and the public blog-post renderer to turn Markdown into HTML.
+
+### Embedded virtual files
+
+```csharp
+Configure<AbpVirtualFileSystemOptions>(options =>
+{
+    options.FileSets.AddEmbedded<CmsKitCommonWebModule>();
+});
+```
+
+All `.cshtml` files, JS, CSS, and images in the Common project are embedded into the assembly and served through ABP's virtual file system — so a host doesn't need to copy them into its `wwwroot`.
+
+## Route map summary
+
+```mermaid
+flowchart LR
+    URL["/about"]
+    Root["/"]
+    Admin["/CmsKit/Pages"]
+
+    URL -->|matches /{slug}| PageTransform[CmsKitPageRouteValueTransformer]
+    Root -->|matches /| HomeTransform[CmsKitHomePageRouteValueTransformer]
+    PageTransform --> PublicPage["/Public/CmsKit/Pages/Index?slug=about"]
+    HomeTransform --> PublicPage
+    Admin --> AdminPage["/CmsKit/Pages/Index<br/>(IPageAdminAppService)"]
+
+    PublicPage -->|server-side fetch| PublicApi["IPagePublicAppService"]
+    AdminPage -->|server-side fetch| AdminApi["IPageAdminAppService"]
+```
+
+Admin pages use server-side `PageModel.OnGetAsync` to fetch data via the admin app services. Public pages either delegate to the dynamic route transformer (for arbitrary slugs) or use a static path (for blog routes like `/blogs/{blogSlug}`).
+
+## Customizing the UI
+
+Two common customizations:
+
+**Override a view component** — register your own implementation against the same component name:
+
+```csharp
+[ViewComponent(Name = "Rating")]
+public class MyRatingViewComponent : AbpViewComponent
+{
+    public IViewComponentResult Invoke(string entityType, string entityId)
+        => View("~/Views/Shared/Components/MyRating.cshtml");
+}
+```
+
+**Override a Razor Page** — drop a file with the same path into your host project; ABP's virtual file system gives the host's filesystem priority over the embedded copy. `Pages/CmsKit/Blogs/Index.cshtml` in your host replaces the embedded one.
+
+## Cross-references
+
+- App services consumed by these pages: [Admin Application](/modules/cms-kit/admin-application), [Public Application](/modules/cms-kit/public-application).
+- HTTP endpoints the view-component JS calls: [HTTP API](/modules/cms-kit/http-api).
+- Domain entities surfaced: [Blogs](/modules/cms-kit/blogs), [Pages](/modules/cms-kit/pages), [Comments](/modules/cms-kit/comments), [Tags & Ratings](/modules/cms-kit/tags-and-ratings), [Menus & Media](/modules/cms-kit/menus-and-media).
+- The `MediaContainer` blobs rendered as `<img src="/api/cms-kit/media/{id}">` come from [Blob Storing Database](/modules/blob-storing-database/overview).
+- For localized page titles and blog content, see [Multi-lingual objects](/localization/multi-lingual-objects).
+- The older [Blogging module](/modules/blogging/overview) ships a completely separate set of Razor Pages — they don't share view components with CMS Kit. New projects should standardize on the CMS Kit widget library.

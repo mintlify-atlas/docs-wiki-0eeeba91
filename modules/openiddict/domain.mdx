@@ -1,0 +1,536 @@
+---
+title: "OpenIddict Domain — Entities, Managers, Stores"
+sidebarTitle: "Domain"
+description: "Volo.Abp.OpenIddict.Domain and Domain.Shared: the four aggregate roots (Application / Authorization / Scope / Token), the AbpApplicationManager / AbpAuthorizationManager / AbpScopeManager / AbpTokenManager replacements, and the AbpOpenIddict*Store implementations that bridge OpenIddict to ABP repositories."
+---
+
+The domain layer is where ABP **takes over** OpenIddict. Two packages — `Volo.Abp.OpenIddict.Domain.Shared` and `Volo.Abp.OpenIddict.Domain` — define four aggregate roots, four `Abp*Manager` classes that derive from the corresponding OpenIddict manager, and four `AbpOpenIddict*Store` classes that implement OpenIddict's store contracts against ABP repositories. The result: when OpenIddict's pipeline calls `IOpenIddictApplicationManager.FindByClientIdAsync(...)`, the call lands in `IOpenIddictApplicationRepository` and goes through the ABP unit of work, distributed cache, audit log, and extensible object machinery.
+
+Folders covered:
+
+- `modules/openiddict/src/Volo.Abp.OpenIddict.Domain.Shared/Volo/Abp/OpenIddict/` — constants and module‑extension keys.
+- `modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/` — aggregate roots, managers, stores, caches, background workers.
+
+## Module wiring
+
+`AbpOpenIddictDomainModule` is the entry point. It depends on `AbpDddDomainModule`, `AbpIdentityDomainModule`, `AbpOpenIddictDomainSharedModule`, `AbpDistributedLockingAbstractionsModule`, `AbpCachingModule`, and `AbpGuidsModule`, and it configures OpenIddict's core so every manager and store is replaced with the ABP version:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/AbpOpenIddictDomainModule.cs
+private void AddOpenIddictCore(IServiceCollection services)
+{
+    var openIddictBuilder = services.AddOpenIddict()
+        .AddCore(builder =>
+        {
+            builder
+                .SetDefaultApplicationEntity<OpenIddictApplicationModel>()
+                .SetDefaultAuthorizationEntity<OpenIddictAuthorizationModel>()
+                .SetDefaultScopeEntity<OpenIddictScopeModel>()
+                .SetDefaultTokenEntity<OpenIddictTokenModel>();
+
+            builder
+                .ReplaceApplicationStore<OpenIddictApplicationModel, AbpOpenIddictApplicationStore>()
+                .ReplaceAuthorizationStore<OpenIddictAuthorizationModel, AbpOpenIddictAuthorizationStore>()
+                .ReplaceScopeStore<OpenIddictScopeModel, AbpOpenIddictScopeStore>()
+                .ReplaceTokenStore<OpenIddictTokenModel, AbpOpenIddictTokenStore>();
+
+            builder.ReplaceApplicationManager<OpenIddictApplicationModel, AbpApplicationManager>();
+            builder.ReplaceAuthorizationManager<OpenIddictAuthorizationModel, AbpAuthorizationManager>();
+            builder.ReplaceScopeManager<OpenIddictScopeModel, AbpScopeManager>();
+            builder.ReplaceTokenManager<OpenIddictTokenModel, AbpTokenManager>();
+
+            builder.Services.TryAddScoped(provider =>
+                (IAbpApplicationManager)provider.GetRequiredService<IOpenIddictApplicationManager>());
+
+            services.ExecutePreConfiguredActions(builder);
+        });
+
+    services.ExecutePreConfiguredActions(openIddictBuilder);
+}
+```
+
+The matching `PostConfigureServices` method registers each of the four entities (and their `*Model` counterparts) with the ABP extensible‑object system, so module‑extension consumers can append columns to `OpenIddictApplication`, `OpenIddictScope`, etc. and have them flow through to the OpenIddict model as well.
+
+## The four aggregate roots
+
+All four aggregate roots live under `Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/{Applications, Authorizations, Scopes, Tokens}/` and derive from ABP's standard base classes.
+
+### OpenIddictApplication
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Applications/OpenIddictApplication.cs
+public class OpenIddictApplication : FullAuditedAggregateRoot<Guid>
+{
+    public virtual string ApplicationType { get; set; }
+    public virtual string ClientId { get; set; }
+    public virtual string ClientSecret { get; set; }   // hashed by AbpApplicationManager
+    public string ClientType { get; set; }
+    public virtual string ConsentType { get; set; }
+    public virtual string DisplayName { get; set; }
+    public virtual string DisplayNames { get; set; }   // JSON dictionary (culture -> name)
+    public virtual string JsonWebKeySet { get; set; }  // serialized JWKS
+    public virtual string Permissions { get; set; }    // JSON array
+    public virtual string PostLogoutRedirectUris { get; set; } // JSON array
+    public virtual string Properties { get; set; }     // JSON bag
+    public virtual string RedirectUris { get; set; }   // JSON array
+    public virtual string Requirements { get; set; }   // JSON array
+    public virtual string Settings { get; set; }       // JSON object
+    public virtual string FrontChannelLogoutUri { get; set; }
+    public virtual string ClientUri { get; set; }
+    public virtual string LogoUri { get; set; }
+}
+```
+
+It is a `FullAuditedAggregateRoot<Guid>`, so creation / modification timestamps, deleter id, and soft‑delete are stamped automatically by the ABP audit property setter.
+
+`OpenIddictApplicationConsts` (in `Domain.Shared`) holds the max‑length values used by the EF Core model builder:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain.Shared/Volo/Abp/OpenIddict/Applications/OpenIddictApplicationConsts.cs
+public class OpenIddictApplicationConsts
+{
+    public static int ApplicationTypeMaxLength { get; set; } = 50;
+    public static int ClientIdMaxLength { get; set; } = 100;
+    public static int ConsentTypeMaxLength { get; set; } = 50;
+    public static int ClientTypeMaxLength { get; set; } = 50;
+}
+```
+
+You can mutate the static fields at startup (before `ConfigureOpenIddict` runs against `ModelBuilder`) to widen columns for a customized schema.
+
+### OpenIddictAuthorization
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Authorizations/OpenIddictAuthorization.cs
+public class OpenIddictAuthorization : AggregateRoot<Guid>
+{
+    public virtual Guid? ApplicationId { get; set; }
+    [DisableDateTimeNormalization]
+    public virtual DateTime? CreationDate { get; set; }
+    public virtual string Properties { get; set; }
+    public virtual string Scopes { get; set; }   // JSON array
+    public virtual string Status { get; set; }
+    public virtual string Subject { get; set; }
+    public virtual string Type { get; set; }
+}
+```
+
+Authorizations are not full‑audited (OpenIddict already tracks its own `CreationDate`). `[DisableDateTimeNormalization]` tells the ABP date‑time normalizer to leave `CreationDate` in its original kind — important because OpenIddict pins it to UTC.
+
+### OpenIddictScope
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Scopes/OpenIddictScope.cs
+public class OpenIddictScope : FullAuditedAggregateRoot<Guid>
+{
+    public virtual string Description { get; set; }
+    public virtual string Descriptions { get; set; }  // localized JSON
+    public virtual string DisplayName { get; set; }
+    public virtual string DisplayNames { get; set; }
+    public virtual string Name { get; set; }
+    public virtual string Properties { get; set; }
+    public virtual string Resources { get; set; }     // JSON array of resource identifiers
+}
+```
+
+### OpenIddictToken
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Tokens/OpenIddictToken.cs
+public class OpenIddictToken : AggregateRoot<Guid>
+{
+    public virtual Guid? ApplicationId { get; set; }
+    public virtual Guid? AuthorizationId { get; set; }
+    [DisableDateTimeNormalization]
+    public virtual DateTime? CreationDate { get; set; }
+    [DisableDateTimeNormalization]
+    public virtual DateTime? ExpirationDate { get; set; }
+    public virtual string Payload { get; set; }
+    public virtual string Properties { get; set; }
+    [DisableDateTimeNormalization]
+    public virtual DateTime? RedemptionDate { get; set; }
+    public virtual string ReferenceId { get; set; }
+    public virtual string Status { get; set; }
+    public virtual string Subject { get; set; }
+    public virtual string Type { get; set; }
+}
+```
+
+`Payload` is set only for reference tokens; for self‑contained JWT access tokens, OpenIddict stores just the metadata and discards the body after issuance.
+
+## The Abp* managers
+
+Every OpenIddict manager has an ABP subclass that lives next to the entity in `Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/{Applications,Authorizations,Scopes,Tokens}/`.
+
+### AbpApplicationManager
+
+`AbpApplicationManager` derives from `OpenIddictApplicationManager<OpenIddictApplicationModel>`, adds a few ABP‑specific properties (`FrontChannelLogoutUri`, `ClientUri`, `LogoUri`) and overrides `UpdateAsync` to invalidate the distributed cache:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Applications/AbpApplicationManager.cs
+public class AbpApplicationManager
+    : OpenIddictApplicationManager<OpenIddictApplicationModel>, IAbpApplicationManager
+{
+    protected AbpOpenIddictIdentifierConverter IdentifierConverter { get; }
+
+    public AbpApplicationManager(
+        IOpenIddictApplicationCache<OpenIddictApplicationModel> cache,
+        ILogger<AbpApplicationManager> logger,
+        IOptionsMonitor<OpenIddictCoreOptions> options,
+        IOpenIddictApplicationStore<OpenIddictApplicationModel> resolver,
+        AbpOpenIddictIdentifierConverter identifierConverter)
+        : base(cache, logger, options, resolver)
+    {
+        IdentifierConverter = identifierConverter;
+    }
+
+    public async override ValueTask UpdateAsync(
+        OpenIddictApplicationModel application, CancellationToken cancellationToken = default)
+    {
+        if (!Options.CurrentValue.DisableEntityCaching)
+        {
+            var entity = await Store.FindByIdAsync(
+                IdentifierConverter.ToString(application.Id), cancellationToken);
+            if (entity != null)
+            {
+                await Cache.RemoveAsync(entity, cancellationToken);
+            }
+        }
+
+        await base.UpdateAsync(application, cancellationToken);
+    }
+    // ... PopulateAsync, GetFrontChannelLogoutUriAsync, GetClientUriAsync, GetLogoUriAsync
+}
+```
+
+Two `PopulateAsync` overloads copy the ABP‑specific properties between `OpenIddictApplicationModel` and `AbpApplicationDescriptor` (an ABP subclass of `OpenIddictApplicationDescriptor`). The `IsImplicitFileUri` helper rejects ambiguous file:// URIs that could become a security issue if interpreted as web URIs.
+
+<Tip>
+`IAbpApplicationManager` is registered separately as a scoped service that resolves through `IOpenIddictApplicationManager`, so you can inject either contract:
+
+```csharp
+builder.Services.TryAddScoped(provider =>
+    (IAbpApplicationManager)provider.GetRequiredService<IOpenIddictApplicationManager>());
+```
+</Tip>
+
+### AbpAuthorizationManager
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Authorizations/AbpAuthorizationManager.cs
+public class AbpAuthorizationManager
+    : OpenIddictAuthorizationManager<OpenIddictAuthorizationModel>
+{
+    protected AbpOpenIddictIdentifierConverter IdentifierConverter { get; }
+
+    public AbpAuthorizationManager(
+        IOpenIddictAuthorizationCache<OpenIddictAuthorizationModel> cache,
+        ILogger<OpenIddictAuthorizationManager<OpenIddictAuthorizationModel>> logger,
+        IOptionsMonitor<OpenIddictCoreOptions> options,
+        IOpenIddictAuthorizationStore<OpenIddictAuthorizationModel> resolver,
+        AbpOpenIddictIdentifierConverter identifierConverter)
+        : base(cache, logger, options, resolver) { ... }
+
+    public async override ValueTask UpdateAsync(
+        OpenIddictAuthorizationModel authorization, CancellationToken cancellationToken = default)
+    {
+        // Same cache‑invalidation pattern as AbpApplicationManager
+    }
+}
+```
+
+### AbpScopeManager
+
+Same shape — invalidates the scope cache on update, delegates everything else to OpenIddict's base.
+
+### AbpTokenManager
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Tokens/AbpTokenManager.cs
+public class AbpTokenManager : OpenIddictTokenManager<OpenIddictTokenModel>
+{
+    public AbpTokenManager(
+        IOpenIddictTokenCache<OpenIddictTokenModel> cache,
+        ILogger<OpenIddictTokenManager<OpenIddictTokenModel>> logger,
+        IOptionsMonitor<OpenIddictCoreOptions> options,
+        IOpenIddictTokenStore<OpenIddictTokenModel> resolver,
+        AbpOpenIddictIdentifierConverter identifierConverter)
+        : base(cache, logger, options, resolver) { ... }
+
+    public async override ValueTask UpdateAsync(
+        OpenIddictTokenModel token, CancellationToken cancellationToken = default)
+    {
+        if (!Options.CurrentValue.DisableEntityCaching)
+        {
+            var entity = await Store.FindByIdAsync(IdentifierConverter.ToString(token.Id), cancellationToken);
+            if (entity != null)
+            {
+                await Cache.RemoveAsync(entity, cancellationToken);
+            }
+        }
+        await base.UpdateAsync(token, cancellationToken);
+    }
+}
+```
+
+The recurring pattern: **resolve the persisted entity by id, evict the cache entry, then delegate to `base.UpdateAsync`**. OpenIddict's own caching strategy keys on the persisted entity identity, so the eviction has to happen *before* the base updates the row.
+
+## The Abp* stores
+
+The store layer is where OpenIddict abstractions meet ABP repositories. Each store derives from `AbpOpenIddictStoreBase<TRepository>`, which centralizes the repository, unit of work manager, guid generator, identifier converter, concurrency handler, and `AbpOpenIddictStoreOptions`:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/AbpOpenIddictStoreBase.cs
+public abstract class AbpOpenIddictStoreBase<TRepository>
+    where TRepository : IRepository
+{
+    public ILogger<AbpOpenIddictStoreBase<TRepository>> Logger { get; set; }
+
+    protected TRepository Repository { get; }
+    protected IUnitOfWorkManager UnitOfWorkManager { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+    protected AbpOpenIddictIdentifierConverter IdentifierConverter { get; }
+    protected IOpenIddictDbConcurrencyExceptionHandler ConcurrencyExceptionHandler { get; }
+    protected IOptions<AbpOpenIddictStoreOptions> StoreOptions { get; }
+
+    protected AbpOpenIddictStoreBase(
+        TRepository repository,
+        IUnitOfWorkManager unitOfWorkManager,
+        IGuidGenerator guidGenerator,
+        AbpOpenIddictIdentifierConverter identifierConverter,
+        IOpenIddictDbConcurrencyExceptionHandler concurrencyExceptionHandler,
+        IOptions<AbpOpenIddictStoreOptions> storeOptions)
+    { ... }
+
+    protected virtual Guid ConvertIdentifierFromString(string identifier) { ... }
+}
+```
+
+### AbpOpenIddictApplicationStore
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Applications/AbpOpenIddictApplicationStore.cs
+public class AbpOpenIddictApplicationStore
+    : AbpOpenIddictStoreBase<IOpenIddictApplicationRepository>, IAbpOpenIdApplicationStore
+{
+    protected IOpenIddictTokenRepository TokenRepository { get; }
+
+    public AbpOpenIddictApplicationStore(
+        IOpenIddictApplicationRepository repository,
+        IUnitOfWorkManager unitOfWorkManager,
+        IOpenIddictTokenRepository tokenRepository,
+        IGuidGenerator guidGenerator,
+        AbpOpenIddictIdentifierConverter identifierConverter,
+        IOpenIddictDbConcurrencyExceptionHandler concurrencyExceptionHandler,
+        IOptions<AbpOpenIddictStoreOptions> storeOptions)
+        : base(repository, unitOfWorkManager, guidGenerator, identifierConverter,
+               concurrencyExceptionHandler, storeOptions)
+    {
+        TokenRepository = repository;
+    }
+
+    public virtual async ValueTask CreateAsync(
+        OpenIddictApplicationModel application, CancellationToken cancellationToken)
+    {
+        Check.NotNull(application, nameof(application));
+        await Repository.InsertAsync(application.ToEntity(), autoSave: true,
+            cancellationToken: cancellationToken);
+    }
+
+    public virtual async ValueTask DeleteAsync(
+        OpenIddictApplicationModel application, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using (var uow = UnitOfWorkManager.Begin(
+                requiresNew: true,
+                isTransactional: true,
+                isolationLevel: StoreOptions.Value.DeleteIsolationLevel))
+            {
+                await TokenRepository.DeleteManyByApplicationIdAsync(
+                    application.Id, cancellationToken: cancellationToken);
+                await Repository.DeleteAsync(application.Id, cancellationToken: cancellationToken);
+                await uow.CompleteAsync(cancellationToken);
+            }
+        }
+        catch (AbpDbConcurrencyException e)
+        {
+            Logger.LogException(e);
+            await ConcurrencyExceptionHandler.HandleAsync(e);
+            throw new OpenIddictExceptions.ConcurrencyException(e.Message, e.InnerException);
+        }
+    }
+    // ... CountAsync, FindByIdAsync, FindByClientIdAsync, FindByPostLogoutRedirectUriAsync,
+    //     FindByRedirectUriAsync, GetAsync, GetClientIdAsync, GetClientSecretAsync,
+    //     GetDisplayNameAsync, GetPermissionsAsync, GetRedirectUrisAsync, GetRequirementsAsync,
+    //     GetSettingsAsync, ListAsync, UpdateAsync ...
+}
+```
+
+Two ABP integration points stand out:
+
+- **Cascading delete.** Deleting an application also deletes its tokens, in a single explicit `IUnitOfWorkManager.Begin` scope with `isTransactional: true` and the configured isolation level (defaults to `Serializable`). Cascading is *not* delegated to the database — it happens in the repository so it works on both EF Core and MongoDB.
+- **Concurrency handling.** `AbpDbConcurrencyException` is translated into OpenIddict's own `OpenIddictExceptions.ConcurrencyException` so upstream code keeps working unchanged.
+
+### AbpOpenIddictAuthorizationStore
+
+`AbpOpenIddictAuthorizationStore : AbpOpenIddictStoreBase<IOpenIddictAuthorizationRepository>` follows the same pattern. It also cascades deletes to the token repository (an authorization's tokens go away with it) and exposes `PruneAsync(threshold, ct)` so `TokenCleanupService` can wipe old, ad‑hoc, and rejected authorizations on the configured schedule.
+
+The store contract has the full set of OpenIddict methods: `CountAsync`, `CreateAsync`, `DeleteAsync`, `FindAsync`, `FindByApplicationIdAsync`, `FindByIdAsync`, `FindBySubjectAsync`, `GetApplicationIdAsync`, `GetCreationDateAsync`, `GetIdAsync`, `GetPropertiesAsync`, `GetScopesAsync`, `GetStatusAsync`, `GetSubjectAsync`, `GetTypeAsync`, `InstantiateAsync`, `ListAsync`, `PruneAsync`, `RevokeAsync`, `RevokeByApplicationIdAsync`, `RevokeBySubjectAsync`, `SetApplicationIdAsync`, `SetCreationDateAsync`, `SetPropertiesAsync`, `SetScopesAsync`, `SetStatusAsync`, `SetSubjectAsync`, `SetTypeAsync`, `UpdateAsync`.
+
+### AbpOpenIddictScopeStore
+
+`AbpOpenIddictScopeStore : AbpOpenIddictStoreBase<IOpenIddictScopeRepository>` is the simplest of the four — scopes have no related entities, so no cascade, no extra repository injection. It still goes through `AbpDbConcurrencyException` translation.
+
+### AbpOpenIddictTokenStore
+
+`AbpOpenIddictTokenStore : AbpOpenIddictStoreBase<IOpenIddictTokenRepository>` is the heaviest. In addition to the standard CRUD methods, it exposes `PruneAsync(threshold, ct)`, `RevokeAsync(...)`, `RevokeByApplicationIdAsync`, `RevokeByAuthorizationIdAsync`, `RevokeBySubjectAsync`, and supports the reference‑token lookup path used by introspection.
+
+## AbpOpenIddictStoreOptions
+
+The two writes that span multiple rows (`DeleteAsync` of an application/authorization, and `PruneAsync` of authorizations/tokens) honour configurable isolation levels:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/AbpOpenIddictStoreOptions.cs
+public class AbpOpenIddictStoreOptions
+{
+    public IsolationLevel? PruneIsolationLevel { get; set; }
+    public IsolationLevel? DeleteIsolationLevel { get; set; }
+
+    public AbpOpenIddictStoreOptions()
+    {
+        PruneIsolationLevel = IsolationLevel.RepeatableRead;
+        DeleteIsolationLevel = IsolationLevel.Serializable;
+    }
+}
+```
+
+Lower these (e.g. to `ReadCommitted`) if your provider does not support serializable, or raise them if you are seeing dirty reads under heavy concurrent load.
+
+## Distributed caches
+
+`AbpOpenIddictApplicationCache : AbpOpenIddictCacheBase<OpenIddictApplicationModel>` (and three siblings for authorization / scope / token) implement OpenIddict's `IOpenIddictApplicationCache<TModel>` against ABP's `IDistributedCache`. The base class also takes an `IAbpDistributedLock` so cache writes are serialized across nodes.
+
+What you get for free:
+
+- Result caching of every `FindBy…` call OpenIddict makes during a request.
+- Cluster‑wide invalidation when an entity is updated through `AbpApplicationManager.UpdateAsync` (which calls `Cache.RemoveAsync(entity, ...)` before delegating to the base).
+- Optional master switch via `OpenIddictCoreOptions.DisableEntityCaching` — set it to `true` if you'd rather rely solely on first‑level EF Core change‑tracker caching.
+
+## Identifier conversion
+
+`AbpOpenIddictIdentifierConverter` translates between OpenIddict's `string` ids and ABP's `Guid` ids:
+
+```csharp
+// Used by every store and manager that has to cross the OpenIddict boundary.
+var idStr = IdentifierConverter.ToString(application.Id);   // Guid -> "00000000-0000-…"
+var idGuid = ConvertIdentifierFromString(idStr);            // back to Guid
+```
+
+`FindByIdAsync(string identifier, CancellationToken ct)` lives in every store and is the single hottest call into this converter.
+
+## Concurrency exception handler
+
+`IOpenIddictDbConcurrencyExceptionHandler` is provider‑specific (EF Core ships one that does row‑level retries, MongoDB ships one that's a no‑op). When `AbpDbConcurrencyException` bubbles out of the repository, every Abp store catches it, hands it to the handler, logs, and rethrows as `OpenIddictExceptions.ConcurrencyException` so the OpenIddict pipeline keeps working with the exception type it expects.
+
+```csharp
+catch (AbpDbConcurrencyException e)
+{
+    Logger.LogException(e);
+    await ConcurrencyExceptionHandler.HandleAsync(e);
+    throw new OpenIddictExceptions.ConcurrencyException(e.Message, e.InnerException);
+}
+```
+
+The EF Core handler lives at `Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EfCoreOpenIddictDbConcurrencyExceptionHandler.cs`; see [efcore](/modules/openiddict/efcore).
+
+## Token cleanup
+
+`TokenCleanupBackgroundWorker` runs on the `IBackgroundWorkerManager` interval and delegates to `TokenCleanupService`. The worker itself is a thin wrapper:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/Tokens/TokenCleanupBackgroundWorker.cs
+public class TokenCleanupBackgroundWorker : AsyncPeriodicBackgroundWorkerBase
+{
+    public TokenCleanupBackgroundWorker(
+        AbpAsyncTimer timer,
+        IServiceScopeFactory serviceScopeFactory,
+        IOptions<TokenCleanupOptions> options)
+        : base(timer, serviceScopeFactory)
+    {
+        Timer.Period = options.Value.CleanupPeriod;
+    }
+
+    protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
+    {
+        await workerContext.ServiceProvider
+            .GetRequiredService<TokenCleanupService>()
+            .StartAsync();
+    }
+}
+```
+
+`TokenCleanupService` prunes (a) authorizations older than the cutoff with status `Inactive` / `Valid` and type `AdHoc`, and (b) tokens that are expired, revoked, or redeemed. The cut‑off is `DateTime.UtcNow.AddMilliseconds(-options.CleanupPeriod * 2)` — i.e. two cleanup periods of grace.
+
+Flip individual prunes off:
+
+```csharp
+Configure<TokenCleanupOptions>(options =>
+{
+    options.DisableAuthorizationPruning = true; // keep history forever
+    options.DisableTokenPruning = false;
+    options.CleanupPeriod = 30 * 60 * 1000;     // every 30 minutes
+});
+```
+
+## Module‑extension consts
+
+`OpenIddictModuleExtensionConsts` (in `Domain.Shared`) is the key‑set used by ABP's extensible‑object system. `AbpOpenIddictDomainModule.PostConfigureServices` calls `ModuleExtensionConfigurationHelper.ApplyEntityConfigurationToEntity` for each pair of `(entity, model)` so a single configuration block in your `DomainSharedModule` applies to both the persisted entity and the in‑memory model:
+
+```csharp
+ObjectExtensionManager.Instance.Modules()
+    .ConfigureOpenIddict(openIddict =>
+    {
+        openIddict.ConfigureApplication(app =>
+        {
+            app.AddOrUpdateProperty<string>("Department");
+        });
+    });
+```
+
+Anything you register here surfaces as `OpenIddictApplication.GetProperty<string>("Department")` *and* on the OpenIddict model.
+
+## Quick reference
+
+| Concept | Type | File |
+| --- | --- | --- |
+| Aggregate | `OpenIddictApplication` | `Applications/OpenIddictApplication.cs` |
+| Aggregate | `OpenIddictAuthorization` | `Authorizations/OpenIddictAuthorization.cs` |
+| Aggregate | `OpenIddictScope` | `Scopes/OpenIddictScope.cs` |
+| Aggregate | `OpenIddictToken` | `Tokens/OpenIddictToken.cs` |
+| Manager | `AbpApplicationManager` (`IAbpApplicationManager`) | `Applications/AbpApplicationManager.cs` |
+| Manager | `AbpAuthorizationManager` | `Authorizations/AbpAuthorizationManager.cs` |
+| Manager | `AbpScopeManager` | `Scopes/AbpScopeManager.cs` |
+| Manager | `AbpTokenManager` | `Tokens/AbpTokenManager.cs` |
+| Store base | `AbpOpenIddictStoreBase<TRepository>` | `AbpOpenIddictStoreBase.cs` |
+| Store | `AbpOpenIddictApplicationStore` (`IAbpOpenIdApplicationStore`) | `Applications/AbpOpenIddictApplicationStore.cs` |
+| Store | `AbpOpenIddictAuthorizationStore` | `Authorizations/AbpOpenIddictAuthorizationStore.cs` |
+| Store | `AbpOpenIddictScopeStore` | `Scopes/AbpOpenIddictScopeStore.cs` |
+| Store | `AbpOpenIddictTokenStore` | `Tokens/AbpOpenIddictTokenStore.cs` |
+| Cache | `AbpOpenIddictApplicationCache` | `Applications/AbpOpenIddictApplicationCache.cs` |
+| Cache | `AbpOpenIddictAuthorizationCache` | `Authorizations/AbpOpenIddictAuthorizationCache.cs` |
+| Cache | `AbpOpenIddictScopeCache` | `Scopes/AbpOpenIddictScopeCache.cs` |
+| Cache | `AbpOpenIddictTokenCache` | `Tokens/AbpOpenIddictTokenCache.cs` |
+| Options | `AbpOpenIddictStoreOptions` | `AbpOpenIddictStoreOptions.cs` |
+| Options | `TokenCleanupOptions` | `Tokens/TokenCleanupOptions.cs` |
+| Worker | `TokenCleanupBackgroundWorker` + `TokenCleanupService` | `Tokens/TokenCleanupBackgroundWorker.cs` |
+| Conversion | `AbpOpenIddictIdentifierConverter` | `AbpOpenIddictIdentifierConverter.cs` |
+
+## See also
+
+- ASP.NET Core wiring on top of these classes: [/modules/openiddict/aspnetcore-integration](/modules/openiddict/aspnetcore-integration)
+- EF Core repository / DbContext: [/modules/openiddict/efcore](/modules/openiddict/efcore)
+- MongoDB repository / DbContext: [/modules/openiddict/mongodb](/modules/openiddict/mongodb)
+- Login UI: [/modules/account/openiddict-host](/modules/account/openiddict-host)
+- Where the subjects come from: [/modules/identity/overview](/modules/identity/overview)
+- Granting permissions to clients: [/security/permissions](/security/permissions)

@@ -1,0 +1,399 @@
+---
+title: "Environment variables and deployment configuration"
+sidebarTitle: "Environment variables"
+description: "The .NET env-var contract ASP.NET Core honours (ASPNETCORE_ENVIRONMENT, ConnectionStrings__Default), the ABP CLI's environment and on-disk paths, and the Dapr-related variables AbpDaprModule reads."
+---
+
+ABP applications are .NET applications, so the **environment-variable contract is .NET's** — colons-as-double-underscore, `ASPNETCORE_ENVIRONMENT`, the standard precedence. On top of that ABP adds three concrete pieces: a CLI tool that uses a fixed on-disk root, an `AbpDaprModule` that reads Dapr's sidecar env vars, and a documented `appsettings.secrets.json` hook for local secrets. This page is the operator's reference for all three.
+
+## The .NET env-var contract
+
+ASP.NET Core's `Host.CreateApplicationBuilder` (and every ABP template uses it) wires three environment-variable providers into `IConfiguration` by default:
+
+| Provider | Prefix | Purpose |
+| --- | --- | --- |
+| `EnvironmentVariablesConfigurationProvider` | `DOTNET_` | Generic-host knobs (`DOTNET_ENVIRONMENT`, `DOTNET_RUNNING_IN_CONTAINER`, …) |
+| `EnvironmentVariablesConfigurationProvider` | `ASPNETCORE_` | Web-host knobs (`ASPNETCORE_ENVIRONMENT`, `ASPNETCORE_URLS`, …) |
+| `EnvironmentVariablesConfigurationProvider` | *(none)* | Everything else, with `__` → `:` translation |
+
+Two rules cover 95% of operational overrides:
+
+- **The double underscore `__` replaces the section separator `:`** so that an env-var name is a legal POSIX identifier.
+- **The prefixed providers strip their prefix** before pushing into `IConfiguration`. So `ASPNETCORE_ENVIRONMENT=Production` lands as `IConfiguration["Environment"] == "Production"` *and* updates `IHostEnvironment.EnvironmentName`.
+
+### The headline env vars
+
+The variables every ABP deployment cares about:
+
+| Env var | Maps to | Typical value |
+| --- | --- | --- |
+| `ASPNETCORE_ENVIRONMENT` | `IHostEnvironment.EnvironmentName`; selects `appsettings.{Environment}.json` overlay | `Development`, `Staging`, `Production` |
+| `DOTNET_ENVIRONMENT` | Same, for non-web hosts (worker services, DbMigrator) | `Production` |
+| `ASPNETCORE_URLS` | Kestrel bind URLs | `http://+:80;https://+:443` |
+| `DOTNET_RUNNING_IN_CONTAINER` | Set automatically by the official `mcr.microsoft.com/dotnet/*` images; used by `IsContainer()` helpers | `true` |
+| `ConnectionStrings__Default` | `IConfiguration["ConnectionStrings:Default"]` → `ConnectionStrings.Default` | a SQL/Mongo connection string |
+| `App__SelfUrl` | `IConfiguration["App:SelfUrl"]` | `https://api.mycompany.com` |
+| `AuthServer__Authority` | `IConfiguration["AuthServer:Authority"]` | `https://auth.mycompany.com` |
+| `Redis__Configuration` | `IConfiguration["Redis:Configuration"]` | `redis-master:6379` |
+| `Settings__Abp.Mailing.Smtp.Host` | Setting Management read; see [`/config/settings-system`](/config/settings-system) | `smtp.mailgun.org` |
+
+The same rules apply to any nested JSON shape. A section like:
+
+```json
+{
+  "OpenIddict": {
+    "Applications": {
+      "MyProjectName_Web": { "ClientSecret": "…" }
+    }
+  }
+}
+```
+
+…is overridden in production by:
+
+```sh
+export OpenIddict__Applications__MyProjectName_Web__ClientSecret="real-secret"
+```
+
+### Precedence
+
+The order in which providers are added to the `ConfigurationBuilder` determines who wins. The `Host.CreateApplicationBuilder` default chain (later providers win):
+
+1. `appsettings.json`
+2. `appsettings.{Environment}.json`
+3. User Secrets (Development only)
+4. Environment variables (`DOTNET_`, `ASPNETCORE_`, unprefixed)
+5. Command-line arguments
+
+So **environment variables always beat `appsettings.json`** and **command-line arguments beat env vars**. ABP doesn't change this order.
+
+## `appsettings.secrets.json`
+
+ABP adds one .NET-host extension method that exists for the same job as User Secrets but works in non-Development environments too: `AddAppSettingsSecretsJson`.
+
+```csharp
+// framework/src/Volo.Abp.Core/Microsoft/Extensions/Hosting/AbpHostingHostBuilderExtensions.cs
+public static class AbpHostingHostBuilderExtensions
+{
+    public const string AppSettingsSecretJsonPath = "appsettings.secrets.json";
+
+    public static IHostBuilder AddAppSettingsSecretsJson(
+        this IHostBuilder hostBuilder,
+        bool optional = true,
+        bool reloadOnChange = true,
+        string path = AppSettingsSecretJsonPath)
+    {
+        return hostBuilder.ConfigureAppConfiguration((_, builder) =>
+        {
+            builder.AddJsonFile(
+                path: path,
+                optional: optional,
+                reloadOnChange: reloadOnChange
+            );
+        });
+    }
+}
+```
+
+Wire it in `Program.cs`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+builder.Host.AddAppSettingsSecretsJson();
+```
+
+The file is `.gitignore`d in every ABP template. Operators add it to a deployed container via a mounted secret. Keys override `appsettings.json` (the file is added *after* the main `appsettings.{Environment}.json`).
+
+## ABP CLI environment
+
+The ABP CLI is a separate dotnet-tool process, not part of your runtime container. It uses a fixed on-disk root and a small set of files:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliPaths.cs
+public static class CliPaths
+{
+    public static string TemplateCache => Path.Combine(AbpRootPath, "templates");
+    public static string Log           => Path.Combine(AbpRootPath, "cli", "logs");
+    public static string Root          => Path.Combine(AbpRootPath, "cli");
+    public static string AccessToken   => Path.Combine(AbpRootPath, "cli", "access-token.bin");
+    public static string ComputerId    => Path.Combine(AbpRootPath, "cli", "computer-id.bin");
+    public static string Memory        => Path.Combine(Path.GetDirectoryName(
+        System.Reflection.Assembly.GetExecutingAssembly().Location)!, "memory.bin");
+    public static string Build         => Path.Combine(AbpRootPath, "build");
+    public static string Lic           => Path.Combine(Path.GetTempPath(),
+        Encoding.ASCII.GetString(new byte[] { 65, 98, 112, 76, 105, 99, 101, 110, 115, 101, 46, 98, 105, 110 }));
+
+    public static readonly string AbpRootPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".abp");
+}
+```
+
+The root is **always `~/.abp/`** (or `%USERPROFILE%\.abp\` on Windows) — the CLI does not currently honour an environment variable to relocate it. If you need to share template caches between CI agents, mount/symlink `~/.abp/templates` into a shared volume.
+
+Sibling constants from `CliConsts.cs`:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliConsts.cs
+public static class CliConsts
+{
+    public static string Command                  = "AbpCliCommand";
+    public static string BranchPrefix             = "branch@";
+    public static string DocsLink                 = "https://abp.io/docs";
+    public static string HttpClientName           = "AbpHttpClient";
+    public static string GithubHttpClientName     = "GithubHttpClient";
+    public static string LicenseCodePlaceHolder   = @"<LICENSE_CODE/>";
+    public static string AppSettingsJsonFileName        = "appsettings.json";
+    public static string AppSettingsSecretJsonFileName  = "appsettings.secrets.json";
+    // …
+}
+```
+
+And the matching options shape:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliOptions.cs
+public class AbpCliOptions
+{
+    public Dictionary<string, Type> Commands { get; }
+    public List<string> DisabledModulesToAddToSolution { get; set; }
+
+    /// <summary> Default value: true. </summary>
+    public bool CacheTemplates { get; set; } = true;
+
+    /// <summary> Default value: "CLI". </summary>
+    public string ToolName { get; set; } = "CLI";
+
+    public bool AlwaysHideExternalCommandOutput { get; set; }
+}
+```
+
+Container-relevant note: in CI you almost always want `CacheTemplates = false` (or to volume-mount `~/.abp/templates`) so that a fresh agent does not re-download every template on every job.
+
+## Dapr environment variables
+
+The Dapr integration module reads sidecar configuration from `IConfiguration` *and* falls back to process environment variables for the API tokens. The source pattern (slightly abbreviated):
+
+```csharp
+// framework/src/Volo.Abp.Dapr/Volo/Abp/Dapr/AbpDaprModule.cs
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpMultiTenancyAbstractionsModule),
+    typeof(AbpHttpClientModule)
+)]
+public class AbpDaprModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        ConfigureDaprOptions(configuration);
+    }
+
+    private void ConfigureDaprOptions(IConfiguration configuration)
+    {
+        Configure<AbpDaprOptions>(configuration.GetSection("Dapr"));
+        Configure<AbpDaprOptions>(options =>
+        {
+            if (options.DaprApiToken.IsNullOrWhiteSpace())
+            {
+                var confEnv = configuration["DAPR_API_TOKEN"];
+                if (!confEnv.IsNullOrWhiteSpace())
+                {
+                    options.DaprApiToken = confEnv!;
+                }
+                else
+                {
+                    var env = Environment.GetEnvironmentVariable("DAPR_API_TOKEN");
+                    if (!env.IsNullOrWhiteSpace())
+                    {
+                        options.DaprApiToken = env!;
+                    }
+                }
+            }
+
+            if (options.AppApiToken.IsNullOrWhiteSpace())
+            {
+                var confEnv = configuration["APP_API_TOKEN"];
+                if (!confEnv.IsNullOrWhiteSpace())
+                {
+                    options.AppApiToken = confEnv!;
+                }
+                else
+                {
+                    var env = Environment.GetEnvironmentVariable("APP_API_TOKEN");
+                    if (!env.IsNullOrWhiteSpace())
+                    {
+                        options.AppApiToken = env!;
+                    }
+                }
+            }
+        });
+    }
+}
+```
+
+The full options class:
+
+```csharp
+// framework/src/Volo.Abp.Dapr/Volo/Abp/Dapr/AbpDaprOptions.cs
+public class AbpDaprOptions
+{
+    public string? HttpEndpoint { get; set; }
+    public string? GrpcEndpoint { get; set; }
+    public string? DaprApiToken { get; set; }
+    public string? AppApiToken { get; set; }
+}
+```
+
+This produces the following operational contract for an ABP-on-Dapr deployment:
+
+| Env var | Read by | Notes |
+| --- | --- | --- |
+| `DAPR_HTTP_PORT` | Dapr SDK's `DaprClient` (not ABP directly) | Set by `daprd` when it launches the app via `dapr run`. Default `3500`. |
+| `DAPR_GRPC_PORT` | Dapr SDK's `DaprClient` | Set by `daprd`. Default `50001`. |
+| `DAPR_API_TOKEN` | `AbpDaprModule.ConfigureDaprOptions` → `AbpDaprOptions.DaprApiToken` | If set, every Dapr API call sends the `dapr-api-token` header. |
+| `APP_API_TOKEN` | `AbpDaprModule.ConfigureDaprOptions` → `AbpDaprOptions.AppApiToken` | If set, ABP validates the `dapr-api-token` header on incoming Dapr-originated requests. |
+| `Dapr__HttpEndpoint` | `configuration.GetSection("Dapr")` → `AbpDaprOptions.HttpEndpoint` | Override Dapr's default `http://localhost:<DAPR_HTTP_PORT>` URL. |
+| `Dapr__GrpcEndpoint` | Same | Override Dapr's default gRPC endpoint. |
+
+The lookup order for the two API tokens is:
+
+1. `IConfiguration["Dapr:DaprApiToken"]` (i.e. `appsettings.json` → `Dapr:DaprApiToken`, or `Dapr__DaprApiToken` env var)
+2. `IConfiguration["DAPR_API_TOKEN"]` (the env var, read through the unprefixed `IConfiguration` env provider — works because there is no colon)
+3. `Environment.GetEnvironmentVariable("DAPR_API_TOKEN")` (the raw env var, in case the configuration provider chain didn't pick it up)
+
+The same three-step fallback applies to `APP_API_TOKEN`.
+
+For the broader Dapr integration (pub/sub, state store, distributed lock backend) see [`/distributed/dapr-integration`](/distributed/dapr-integration).
+
+## Docker
+
+A typical `Dockerfile` for an ABP API host does nothing special with configuration — env vars flow through the usual `-e` / `environment:` mechanism:
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /publish .
+EXPOSE 80
+EXPOSE 443
+ENV ASPNETCORE_ENVIRONMENT=Production
+ENTRYPOINT ["dotnet", "MyCompanyName.MyProjectName.HttpApi.Host.dll"]
+```
+
+A typical `docker-compose.yml` slice for the API host:
+
+```yaml
+services:
+  api:
+    image: myorg/myapp-api:latest
+    ports:
+      - "5000:80"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ConnectionStrings__Default: "Server=db;Database=MyApp;User Id=sa;Password=${DB_PWD};TrustServerCertificate=True"
+      Redis__Configuration: "redis:6379"
+      AuthServer__Authority: "https://auth.myapp.example"
+      AuthServer__RequireHttpsMetadata: "true"
+      StringEncryption__DefaultPassPhrase: "${STRING_ENCRYPTION_PWD}"
+      App__CorsOrigins: "https://app.myapp.example"
+      App__RedirectAllowedUrls: "https://app.myapp.example"
+      # Bridge a Setting Management value via Settings:* prefix:
+      Settings__Abp.Mailing.Smtp.Host: "smtp.mailgun.org"
+      Settings__Abp.Mailing.Smtp.Port: "587"
+    depends_on:
+      - db
+      - redis
+```
+
+The `${DB_PWD}` and `${STRING_ENCRYPTION_PWD}` shell expansions are Compose-level — the values come from a `.env` file or a CI secret store, not from `appsettings.json`.
+
+When running with the **Dapr sidecar** the `dapr run` (or the Dapr-Kubernetes operator) injects `DAPR_HTTP_PORT`, `DAPR_GRPC_PORT`, and optionally `DAPR_API_TOKEN` into the application container automatically. You only need to set `DAPR_API_TOKEN` explicitly if you have configured Dapr API-token middleware on the sidecar.
+
+## Kubernetes / Helm
+
+The same env vars project cleanly into a Helm chart's `values.yaml`:
+
+```yaml
+# values.yaml fragment
+api:
+  image: myorg/myapp-api:1.2.3
+  replicas: 3
+  env:
+    ASPNETCORE_ENVIRONMENT: Production
+    Redis__Configuration: "{{ .Release.Name }}-redis-master:6379"
+    AuthServer__Authority: "https://auth.{{ .Values.domain }}"
+    App__SelfUrl: "https://api.{{ .Values.domain }}"
+    App__CorsOrigins: "https://{{ .Values.domain }}"
+  envFromSecret:
+    name: myapp-api-secrets
+    keys:
+      - ConnectionStrings__Default
+      - StringEncryption__DefaultPassPhrase
+      - Settings__Abp.Mailing.Smtp.Password
+```
+
+…rendered into a deployment manifest as a mix of literal `env:` entries and `envFrom:` references:
+
+```yaml
+# rendered Deployment fragment
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: myorg/myapp-api:1.2.3
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: Redis__Configuration
+              value: myapp-redis-master:6379
+          envFrom:
+            - secretRef:
+                name: myapp-api-secrets
+```
+
+The `envFrom: secretRef` pattern is the recommended way to inject `ConnectionStrings__Default`, `StringEncryption__DefaultPassPhrase`, and any `Settings__*` values that carry credentials — the secret stays out of the chart values and out of the rendered manifest.
+
+For **multi-tenant** deployments the tenant-specific connection string overrides still live in the `AbpTenants` table (see [`/data/connection-strings`](/data/connection-strings)); env vars only set the host-level default.
+
+## Operational checklist
+
+<AccordionGroup>
+  <Accordion title="Always set ASPNETCORE_ENVIRONMENT explicitly">
+    A missing `ASPNETCORE_ENVIRONMENT` defaults to `Production` in modern .NET hosts, which **disables the developer exception page and User Secrets** while still loading `appsettings.json`. That's usually what you want — but be explicit so future you doesn't get surprised.
+  </Accordion>
+  <Accordion title="Don't put secrets in appsettings.json">
+    Secrets belong in env vars (with `__` separators) or in `appsettings.secrets.json` mounted as a Kubernetes secret. The template-shipped `StringEncryption.DefaultPassPhrase` value `"gsKnGZ041HLL4IM8"` is **not** a secret — it is a placeholder. Override it for every non-dev environment.
+  </Accordion>
+  <Accordion title="Set DAPR_API_TOKEN if your sidecar requires it">
+    The default `daprd` invocation does not require an API token. If you enable the API-token middleware on Dapr, set `DAPR_API_TOKEN` in the app container — `AbpDaprModule` will pick it up automatically and attach the `dapr-api-token` header to every outbound Dapr API call.
+  </Accordion>
+  <Accordion title="Mind the ABP CLI's home directory in CI">
+    Each fresh CI agent re-downloads templates into `~/.abp/templates`. To avoid the per-job download cost, cache `~/.abp/templates` between jobs, or run the CLI with `--template-source` pointing at a pre-populated mirror.
+  </Accordion>
+  <Accordion title="Settings__* vs Configure<>">
+    Env vars under `Settings__*` reach `ConfigurationSettingValueProvider` — they become **settings**, not Options. Use them for values you would normally edit in the [Setting Management UI](/modules/setting-management/overview). For startup knobs like `AbpDistributedCacheOptions.KeyPrefix`, prefer the direct `Configure<>` call site in the module, possibly bound from a normal `IConfiguration` section.
+  </Accordion>
+</AccordionGroup>
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Configuration overview" icon="map" href="/config/overview">
+    The three-layer model and how env vars feed into all three.
+  </Card>
+  <Card title="Settings bridge" icon="bridge" href="/config/settings-system">
+    How `Settings__*` env vars become `ISettingProvider` answers.
+  </Card>
+  <Card title="appsettings.json catalogue" icon="file-code" href="/config/appsettings">
+    The JSON shape that env vars override.
+  </Card>
+  <Card title="Connection strings" icon="database" href="/data/connection-strings">
+    `ConnectionStrings__Default`, named slots, per-tenant overrides.
+  </Card>
+  <Card title="Dapr integration" icon="cubes" href="/distributed/dapr-integration">
+    The full Dapr story: pub/sub, state, distributed lock — the env vars on this page are the entry point.
+  </Card>
+  <Card title="Options-pattern internals" icon="gears" href="/core/options-and-configuration">
+    What `Configure<>` does with the values that reach it from `IConfiguration`.
+  </Card>
+</CardGroup>

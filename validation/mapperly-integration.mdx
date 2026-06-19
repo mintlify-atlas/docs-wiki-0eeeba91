@@ -1,0 +1,411 @@
+---
+title: "Volo.Abp.Mapperly and the Validation Pipeline"
+sidebarTitle: "Mapperly Integration"
+description: "AbpMapperlyModule, MapperBase<TSource, TDestination>, IAbpMapperlyMapper, MapperlyAutoObjectMappingProvider — a generator-driven mapper that integrates with the validation pipeline through the same IAutoObjectMappingProvider seam as AutoMapper."
+---
+
+This page is a **recap** focused on Mapperly's interaction with the validation pipeline. For the full Mapperly integration (decoration patterns, partial mapping methods, custom converters), read [`/ddd/mapperly`](/ddd/mapperly) first. Here we cover: what Mapperly brings to the validation story (compile-time errors, no reflection, source-only mapping), how `IObjectMapper.Map<,>` reaches a generated mapper through `MapperlyAutoObjectMappingProvider`, and how extra properties survive thanks to `[MapExtraProperties]`.
+
+## Why Mapperly matters for a validation discussion
+
+The validation pipeline does not change. The interceptor, the contributors, and `IObjectValidator` are identical whether your host uses AutoMapper or Mapperly. What changes is the *failure mode* on the mapping side:
+
+- **AutoMapper:** failures surface at runtime when `IMapper.Map` is called. `AssertConfigurationIsValid` lets you front-load some of this, but it is still a runtime check.
+- **Mapperly:** failures surface at **compile time** as Roslyn diagnostics. A missing destination member breaks the build, not the request.
+
+For a system where validation rejects bad *input* and the domain enforces invariants on *entities*, removing mapping bugs at compile time leaves the validation pipeline with the *only* class of errors it has to care about: business rules and input shape.
+
+## Folder map
+
+```
+framework/src/Volo.Abp.Mapperly/
+├── Microsoft/Extensions/DependencyInjection/
+│   └── AbpAutoMapperServiceCollectionExtensions.cs
+└── Volo/Abp/Mapperly/
+    ├── AbpMapperlyConventionalRegistrar.cs
+    ├── AbpMapperlyModule.cs
+    ├── IAbpMapperlyMapper.cs
+    ├── MapExtraPropertiesAttribute.cs
+    ├── MapperBase.cs
+    └── MapperlyAutoObjectMappingProvider.cs
+```
+
+The folder is small because Mapperly itself is a source generator (a separate NuGet package, `Riok.Mapperly`) that lives in the consumer assembly. ABP's responsibility is just the seam: a base class, an interface, a provider that knows how to find the generated mappers in DI, and a conventional registrar that exposes them.
+
+## Source-only dependency
+
+Mapperly is shipped as a **source-only analyzer/generator package**. The runtime artifact in your consumer assembly is the *generated code* — there is no Mapperly runtime library to load, no reflection, no extra `IL` linker hops.
+
+For the host this means:
+
+- Mapping is *direct method calls* on a generated `partial class`. No `IMapper` dispatch, no expression caching, no `MapperConfiguration` startup cost.
+- Trimming and AOT publishing keep working — there is nothing reflective to trim away.
+- A missing `CreateMap<,>` equivalent does not exist; you either declared a partial mapping method that the generator filled in or the host does not compile.
+
+The downside is that you write one method per pair you want to map. The generator does flattening, nested-object mapping and collection mapping automatically, but you have to declare the *shape* — there is no AutoMapper-style "discover all maps from this assembly" fallback. That trade-off (explicit declarations, compile-time errors) is the whole point.
+
+## AbpMapperlyModule
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/AbpMapperlyModule.cs
+[DependsOn(
+    typeof(AbpObjectMappingModule),
+    typeof(AbpObjectExtendingModule),
+    typeof(AbpAuditingModule)
+)]
+public class AbpMapperlyModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpMapperlyConventionalRegistrar());
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper();
+    }
+}
+```
+
+Same pattern as `AbpAutoMapperModule`: install a conventional registrar that recognises Mapperly mappers, and replace the `IAutoObjectMappingProvider` registration with `MapperlyAutoObjectMappingProvider`. Notice the absence of a global configuration step — there is nothing for the host to configure because Mapperly does its work in the consumer assembly's `partial class`.
+
+## AbpMapperlyConventionalRegistrar
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/AbpMapperlyConventionalRegistrar.cs
+public class AbpMapperlyConventionalRegistrar : DefaultConventionalRegistrar
+{
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+    {
+        return !type.GetInterfaces().Any(x => x.IsGenericType && typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition()) ||
+               base.IsConventionalRegistrationDisabled(type);
+    }
+
+    protected override List<Type> GetExposedServiceTypes(Type type)
+    {
+        var exposedServiceTypes = base.GetExposedServiceTypes(type);
+        var mapperlyInterfaces = type.GetInterfaces().Where(x =>
+            x.IsGenericType && (typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition() ||
+                                typeof(IAbpReverseMapperlyMapper<,>) == x.GetGenericTypeDefinition()));
+        return exposedServiceTypes
+            .Union(mapperlyInterfaces)
+            .Distinct()
+            .ToList();
+    }
+}
+```
+
+The pattern mirrors `AbpFluentValidationConventionalRegistrar` — only register types that implement the mapper interface, and expose them both under the concrete type *and* the generic interface(s). `MapperlyAutoObjectMappingProvider` then resolves `IAbpMapperlyMapper<TSource, TDestination>` from DI.
+
+## IAbpMapperlyMapper / MapperBase
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/IAbpMapperlyMapper.cs
+public interface IAbpMapperlyMapper<in TSource, TDestination>
+{
+    TDestination Map(TSource source);
+    void Map(TSource source, TDestination destination);
+    void BeforeMap(TSource source);
+    void AfterMap(TSource source, TDestination destination);
+}
+
+public interface IAbpReverseMapperlyMapper<TSource, TDestination> : IAbpMapperlyMapper<TSource, TDestination>
+{
+    TSource ReverseMap(TDestination destination);
+    void ReverseMap(TDestination destination, TSource source);
+    void BeforeReverseMap(TDestination destination);
+    void AfterReverseMap(TDestination destination, TSource source);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperBase.cs
+public abstract class MapperBase<TSource, TDestination> : IAbpMapperlyMapper<TSource, TDestination>, ITransientDependency
+{
+    public abstract TDestination Map(TSource source);
+    public abstract void Map(TSource source, TDestination destination);
+
+    public virtual void BeforeMap(TSource source) { }
+    public virtual void AfterMap(TSource source, TDestination destination) { }
+}
+
+public abstract class TwoWayMapperBase<TSource, TDestination> : MapperBase<TSource, TDestination>, IAbpReverseMapperlyMapper<TSource, TDestination>
+{
+    public abstract TSource ReverseMap(TDestination destination);
+    public abstract void ReverseMap(TDestination destination, TSource source);
+
+    public virtual void BeforeReverseMap(TDestination destination) { }
+    public virtual void AfterReverseMap(TDestination destination, TSource source) { }
+}
+```
+
+The `BeforeMap` / `AfterMap` hooks exist for **post-validation normalisation**. By the time `BeforeMap(source)` runs, the source DTO has already cleared the validation interceptor. You can safely trim strings, set defaults, or short-circuit a domain-side projection without re-validating.
+
+## Writing a Mapperly mapper
+
+A Mapperly mapper is a `partial class` inheriting from `MapperBase<,>` that uses the `[Mapper]` attribute from `Riok.Mapperly.Abstractions`. The generator fills in `Map` for you.
+
+```csharp
+using Riok.Mapperly.Abstractions;
+using Volo.Abp.Mapperly;
+
+[Mapper]
+public partial class ProductMapper : MapperBase<CreateProductDto, Product>
+{
+    public override partial Product Map(CreateProductDto source);
+    public override partial void Map(CreateProductDto source, Product destination);
+
+    public override void BeforeMap(CreateProductDto source)
+    {
+        // source.Name is non-null thanks to [Required] running upstream;
+        // safe to normalise.
+        source.Name = source.Name.Trim();
+    }
+}
+```
+
+The generator inspects the partial method signatures and emits the body. Public properties whose names match get assigned; type conversions are emitted; nested objects trigger recursive map emission. If `Product` has a member that has no matching source on `CreateProductDto`, the **build fails** with a Mapperly diagnostic.
+
+This is precisely the property that makes Mapperly attractive in a validation-heavy codebase: the only way an invalid mapping can reach a request handler is if the build is broken. The validation pipeline does not need to defend against missing mappings.
+
+## MapperlyAutoObjectMappingProvider
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperlyAutoObjectMappingProvider.cs (excerpt)
+public class MapperlyAutoObjectMappingProvider : IAutoObjectMappingProvider
+{
+    protected IServiceProvider ServiceProvider { get; }
+
+    public virtual TDestination Map<TSource, TDestination>(object source)
+    {
+        if (TryToMapCollection<TSource, TDestination>((TSource)source, default, out var collectionResult))
+        {
+            return collectionResult;
+        }
+
+        var mapper = ServiceProvider.GetService<IAbpMapperlyMapper<TSource, TDestination>>();
+        if (mapper != null)
+        {
+            mapper.BeforeMap((TSource)source);
+            var destination = mapper.Map((TSource)source);
+            TryMapExtraProperties(mapper.GetType().GetSingleAttributeOrNull<MapExtraPropertiesAttribute>(), (TSource)source, destination, GetExtraProperties(destination));
+            mapper.AfterMap((TSource)source, destination);
+            return destination;
+        }
+
+        var reverseMapper = ServiceProvider.GetService<IAbpReverseMapperlyMapper<TDestination, TSource>>();
+        if (reverseMapper != null)
+        {
+            reverseMapper.BeforeReverseMap((TSource)source);
+            var destination = reverseMapper.ReverseMap((TSource)source);
+            TryMapExtraProperties(reverseMapper.GetType().GetSingleAttributeOrNull<MapExtraPropertiesAttribute>(), (TSource)source, destination, GetExtraProperties(destination));
+            reverseMapper.AfterReverseMap((TSource)source, destination);
+            return destination;
+        }
+
+        throw GetNoMapperFoundException<TSource, TDestination>();
+    }
+}
+```
+
+The provider is the choreographer:
+
+1. **Collection short-circuit** — if both ends are collections of types that have a mapper, map element-by-element.
+2. **Forward mapper resolution** — ask DI for `IAbpMapperlyMapper<TSource, TDestination>`. The conventional registrar exposed it for you.
+3. **Reverse mapper fallback** — if no forward mapper exists, look for a reverse mapper (`IAbpReverseMapperlyMapper<TDestination, TSource>`) and invoke `ReverseMap`.
+4. **Extra-properties bridge** — read `[MapExtraProperties]` off the mapper class, then copy the dictionary using `ExtensibleObjectMapper.MapExtraPropertiesTo`.
+5. **Friendly failure** — if nothing matches, throw an `AbpException` with a multi-line message pointing at the relevant ABP doc.
+
+The lifecycle hooks — `BeforeMap` → generated `Map` → `TryMapExtraProperties` → `AfterMap` — give you a clear post-validation seam. Anything you want to do *after* validation but *before* the entity is built goes in `BeforeMap`. Anything you want to inspect *after* the entity exists goes in `AfterMap`.
+
+### Failure message
+
+```
+No object mapping was found for the specified source and destination types.
+
+Mapping attempted:
+CreateBlogDto -> Blog
+MyApp.Blogs.CreateBlogDto -> MyApp.Blogs.Blog
+
+How to fix:
+Define a mapping class for these types:
+   - Use MapperBase<TSource, TDestination> for one-way mapping.
+   - Use TwoWayMapperBase<TDestination, TSource> for two-way mapping.
+
+For details, see the Mapperly integration document https://abp.io/docs/latest/framework/infrastructure/object-to-object-mapping#mapperly-integration
+```
+
+This is what callers see if you forgot to write the mapper class. It is *not* an `AbpValidationException` — the request body, not the input shape, is the cause.
+
+## MapExtraPropertiesAttribute
+
+```csharp
+// framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapExtraPropertiesAttribute.cs
+[AttributeUsage(AttributeTargets.Class)]
+public class MapExtraPropertiesAttribute : Attribute
+{
+    public MappingPropertyDefinitionChecks DefinitionChecks { get; set; } = MappingPropertyDefinitionChecks.Null;
+    public string[]? IgnoredProperties { get; set; }
+    public bool MapToRegularProperties { get; set; }
+}
+```
+
+Place this attribute on the mapper class to enable extra-property propagation:
+
+```csharp
+[Mapper]
+[MapExtraProperties(
+    DefinitionChecks = MappingPropertyDefinitionChecks.Required,
+    IgnoredProperties = new[] { "InternalNote" })]
+public partial class ProductMapper : MapperBase<Product, ProductDto>
+{
+    public override partial ProductDto Map(Product source);
+    public override partial void Map(Product source, ProductDto destination);
+}
+```
+
+What `MapperlyAutoObjectMappingProvider` does at runtime (excerpt):
+
+```csharp
+protected virtual void TryMapExtraProperties<TSource, TDestination>(
+    MapExtraPropertiesAttribute? mapExtraPropertiesAttribute,
+    TSource source,
+    TDestination destination,
+    ExtraPropertyDictionary destinationExtraProperty)
+{
+    if (source is not IHasExtraProperties sourceHasExtraProperties) return;
+    if (destination is not IHasExtraProperties destinationHasExtraProperties) return;
+
+    if (sourceHasExtraProperties.ExtraProperties != null && sourceHasExtraProperties.ExtraProperties ==
+        destinationHasExtraProperties.ExtraProperties)
+    {
+        ObjectHelper.TrySetProperty(destinationHasExtraProperties,
+            x => x.ExtraProperties,
+            () => new ExtraPropertyDictionary(destinationHasExtraProperties.ExtraProperties));
+    }
+
+    if (mapExtraPropertiesAttribute != null)
+    {
+        MapExtraProperties<TSource, TDestination>(
+            sourceHasExtraProperties,
+            destinationHasExtraProperties,
+            destinationExtraProperty,
+            mapExtraPropertiesAttribute.DefinitionChecks,
+            mapExtraPropertiesAttribute.IgnoredProperties,
+            mapExtraPropertiesAttribute.MapToRegularProperties);
+    }
+}
+```
+
+Two things to notice:
+
+- **Reference-equal extra-prop dictionaries are deep-cloned.** Mapperly's generated `Map` can produce a destination that *shares* the source dictionary instance; the provider clones it so mutating the destination cannot retroactively change the source.
+- **`DefinitionChecks`** is honoured. If you set `DefinitionChecks = Required`, only properties known to the extension-property registry on the destination side are copied. That is the closest thing to runtime *validation* of dynamic input — but again, by the time this runs, the static DTO has already cleared the validation interceptor.
+
+## Validation interplay summary
+
+| Phase | What runs | Owns the failure |
+| --- | --- | --- |
+| Compile time | Mapperly source generator | Build error if a destination member is unmappable. |
+| Inbound interceptor | `MethodInvocationValidator` → contributors | Throws `AbpValidationException` (HTTP 400). |
+| App-service body | `IObjectMapper.Map<,>` → `DefaultObjectMapper` → `MapperlyAutoObjectMappingProvider` → generated `Map` | Throws `AbpException` if no mapper is registered for the pair. |
+
+Note the absence of a "module-init configuration validation" row compared to AutoMapper — Mapperly does that work at compile time, not at startup.
+
+## A complete CRUD pair
+
+```csharp
+// Domain.Shared / DTOs
+public class CreateBlogDto : IHasExtraProperties
+{
+    [Required, StringLength(120)] public string Name { get; set; } = default!;
+    [Required, StringLength(120)] public string Slug { get; set; } = default!;
+    public ExtraPropertyDictionary ExtraProperties { get; set; } = new();
+}
+
+public class BlogDto : IHasExtraProperties
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = default!;
+    public string Slug { get; set; } = default!;
+    public ExtraPropertyDictionary ExtraProperties { get; set; } = new();
+}
+
+// Application module
+[Mapper]
+[MapExtraProperties]
+public partial class CreateBlogMapper : MapperBase<CreateBlogDto, Blog>
+{
+    public override partial Blog Map(CreateBlogDto source);
+    public override partial void Map(CreateBlogDto source, Blog destination);
+
+    public override void BeforeMap(CreateBlogDto source)
+    {
+        // [Required] already ran; .Trim() is safe.
+        source.Name = source.Name.Trim();
+        source.Slug = source.Slug.Trim().ToLowerInvariant();
+    }
+}
+
+[Mapper]
+[MapExtraProperties]
+public partial class BlogToDtoMapper : MapperBase<Blog, BlogDto>
+{
+    public override partial BlogDto Map(Blog source);
+    public override partial void Map(Blog source, BlogDto destination);
+}
+```
+
+The application service is identical to the AutoMapper version:
+
+```csharp
+public class BlogAppService : ApplicationService, IBlogAppService
+{
+    private readonly IRepository<Blog, Guid> _repo;
+
+    public BlogAppService(IRepository<Blog, Guid> repo) => _repo = repo;
+
+    public async Task<BlogDto> CreateAsync(CreateBlogDto input)
+    {
+        var blog = ObjectMapper.Map<CreateBlogDto, Blog>(input);
+        await _repo.InsertAsync(blog);
+        return ObjectMapper.Map<Blog, BlogDto>(blog);
+    }
+}
+```
+
+`IObjectMapper.Map` does not know — and does not care — that Mapperly is on the other end. Validation, mapping, and the application service are decoupled through the same `IAutoObjectMappingProvider` seam covered in [Object mapping (core)](/ddd/object-mapping).
+
+## Pitfalls
+
+<AccordionGroup>
+  <Accordion title="Build errors after upgrading a DTO">
+    Adding a new property to `BlogDto` without giving it a source breaks the build. That is the feature, not a bug — fix the mapper, then ship.
+  </Accordion>
+  <Accordion title="Two-way mapping picks the wrong direction">
+    If you only need one-way `DTO → Entity`, use `MapperBase`. Use `TwoWayMapperBase` only when you genuinely want `ReverseMap`. The provider's `Map` first tries `IAbpMapperlyMapper<TSource, TDestination>` and *then* falls back to `IAbpReverseMapperlyMapper<TDestination, TSource>`, so a stray reverse mapper can shadow a missing forward mapper.
+  </Accordion>
+  <Accordion title="Extra properties did not survive">
+    Check three things: both endpoints implement `IHasExtraProperties`, the mapper class carries `[MapExtraProperties]`, and you are not setting `IgnoredProperties` too aggressively. `MapperlyAutoObjectMappingProvider.TryMapExtraProperties` short-circuits silently if either endpoint lacks the interface.
+  </Accordion>
+  <Accordion title="Mixing AutoMapper and Mapperly in the same host">
+    The provider registration is a `Replace` — calling `AddAutoMapperObjectMapper()` after `AddMapperlyObjectMapper()` swaps the active provider back. Pick one at the host level. To use both, keep one as the default and put the other behind manual `IObjectMapper<TSource, TDestination>` registrations.
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Mapperly (full integration)" href="/ddd/mapperly">
+    The complete Mapperly + ABP guide.
+  </Card>
+  <Card title="Object mapping core" href="/ddd/object-mapping">
+    The seam Mapperly plugs into.
+  </Card>
+  <Card title="Mapping in validation" href="/validation/object-mapping-core">
+    The validation-side recap of the same seam.
+  </Card>
+  <Card title="AutoMapper integration" href="/validation/automapper-integration">
+    The reflection-based alternative.
+  </Card>
+</CardGroup>

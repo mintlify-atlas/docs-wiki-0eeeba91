@@ -1,0 +1,304 @@
+---
+title: "WPF Template"
+description: "Tour of templates/wpf/ — the Windows-only WPF client template that bootstraps an ABP application from App.xaml.cs."
+---
+
+The `wpf` template under [`templates/wpf/`](https://github.com/abpframework/abp/tree/dev/templates/wpf) is the **Windows desktop sibling** of the [MAUI template](/templates/maui-template). It produces a single .NET WPF project with the ABP runtime — modularity, DI, Serilog, Autofac — bootstrapped from `App.xaml.cs`'s `OnStartup` override.
+
+Generate it with:
+
+```bash
+abp new Acme.BookstoreDesktop -t wpf
+```
+
+When to pick WPF over MAUI:
+
+- You only target **Windows** and want WPF-native controls (DevExpress, Telerik, the broader WPF ecosystem).
+- You need MVVM frameworks like CommunityToolkit.Mvvm or Prism.
+- You're migrating an existing WPF app onto ABP without rewriting the UI layer.
+
+## Solution layout
+
+```
+templates/wpf/
+├── MyCompanyName.MyProjectName.slnx
+├── common.props
+└── src/
+    └── MyCompanyName.MyProjectName/
+        ├── App.xaml / App.xaml.cs           # Bootstrap (no Program.cs)
+        ├── AssemblyInfo.cs
+        ├── HelloWorldService.cs
+        ├── MainWindow.xaml / MainWindow.xaml.cs
+        ├── MyCompanyName.MyProjectName.csproj
+        ├── MyProjectNameModule.cs           # The ABP module
+        └── appsettings.json
+```
+
+One project, no `Platforms/` (Windows-only), no `Program.cs` (WPF generates an entry point from `App.xaml`).
+
+## `.csproj`
+
+```xml templates/wpf/src/MyCompanyName.MyProjectName/MyCompanyName.MyProjectName.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <Import Project="..\..\common.props" />
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <Nullable>enable</Nullable>
+        <UseWPF>true</UseWPF>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\..\..\framework\src\Volo.Abp.Autofac\Volo.Abp.Autofac.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+        <PackageReference Include="Serilog.Extensions.Hosting" Version="9.0.0" />
+        <PackageReference Include="Serilog.Extensions.Logging" Version="9.0.2" />
+        <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
+        <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Remove="appsettings.json" />
+      <Content Include="appsettings.json">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+
+</Project>
+```
+
+Key MSBuild bits:
+
+- **`<OutputType>WinExe</OutputType>`** — Windows-subsystem executable (no console window).
+- **`<TargetFramework>net10.0-windows</TargetFramework>`** — Windows-only TFM; you can't multi-target WPF the way MAUI does.
+- **`<UseWPF>true</UseWPF>`** — pulls in PresentationFramework, WindowsBase, etc.
+- **`Volo.Abp.Autofac`** — same Autofac requirement as every other ABP host.
+- **No `Serilog.Sinks.Console`** — WPF apps don't have a console; logs go to file only.
+
+## `App.xaml.cs` — bootstrap
+
+WPF apps start in `App.OnStartup`. The template overrides it to bring up ABP **before** any window is shown:
+
+```csharp templates/wpf/src/MyCompanyName.MyProjectName/App.xaml.cs
+public partial class App : Application
+{
+    private IAbpApplicationWithInternalServiceProvider? _abpApplication;
+
+    protected override async void OnStartup(StartupEventArgs e)
+    {
+        Log.Logger = new LoggerConfiguration()
+#if DEBUG
+            .MinimumLevel.Debug()
+#else
+            .MinimumLevel.Information()
+#endif
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+            .Enrich.FromLogContext()
+            .WriteTo.Async(c => c.File("Logs/logs.txt"))
+            .CreateLogger();
+
+        try
+        {
+            Log.Information("Starting WPF host.");
+
+            _abpApplication = await AbpApplicationFactory.CreateAsync<MyProjectNameModule>(options =>
+            {
+                options.UseAutofac();
+                options.Services.AddLogging(loggingBuilder => loggingBuilder.AddSerilog(dispose: true));
+            });
+
+            await _abpApplication.InitializeAsync();
+
+            _abpApplication.Services.GetRequiredService<MainWindow>()?.Show();
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Host terminated unexpectedly!");
+        }
+    }
+
+    protected override async void OnExit(ExitEventArgs e)
+    {
+        if (_abpApplication != null)
+        {
+            await _abpApplication.ShutdownAsync();
+        }
+        Log.CloseAndFlush();
+    }
+}
+```
+
+Things to call out:
+
+1. **`AbpApplicationFactory.CreateAsync<TModule>`** — the lowest-level ABP entry point. There's no host builder, no `Build()`, just a factory that returns an `IAbpApplicationWithInternalServiceProvider`. ABP owns the `IServiceProvider` here (unlike MAUI's *external* provider).
+2. **`options.UseAutofac()`** — the same call the web template makes against `WebApplicationBuilder.Host`. It's available here on the factory's `AbpApplicationCreationOptions`.
+3. **`InitializeAsync()`** runs every module's `OnApplicationInitializationAsync`.
+4. **`_abpApplication.Services.GetRequiredService<MainWindow>()?.Show()`** — `MainWindow` is registered in DI by `MyProjectNameModule` (see below), so the resolved instance has its constructor parameters injected.
+5. **`OnExit`** calls `ShutdownAsync` so modules can flush, close, dispose. Forgetting this leaks resources in long-running scenarios.
+
+<Info>
+The `_abpApplication` field is *internal* (note the `IAbpApplicationWithInternalServiceProvider` type, not `External`). In MAUI it's external because MAUI created the service provider; in WPF nothing else owns one, so ABP creates it.
+</Info>
+
+## `MainWindow.xaml.cs` — DI-friendly window
+
+`MainWindow` accepts its dependencies through the constructor:
+
+```csharp templates/wpf/src/MyCompanyName.MyProjectName/MainWindow.xaml.cs
+public partial class MainWindow : Window
+{
+    private readonly HelloWorldService _helloWorldService;
+
+    public MainWindow(HelloWorldService helloWorldService)
+    {
+        _helloWorldService = helloWorldService;
+        InitializeComponent();
+    }
+
+    protected override void OnContentRendered(EventArgs e)
+    {
+        HelloLabel.Content = _helloWorldService.SayHello();
+    }
+}
+```
+
+This works because the module **registers `MainWindow` in DI as a singleton** (see below). When `App.OnStartup` calls `GetRequiredService<MainWindow>()`, Autofac instantiates the window and threads in `HelloWorldService`.
+
+<Warning>
+**Do not** remove the `x:Class="…MainWindow"` binding in `App.xaml`'s `StartupUri` — the template removes the default `StartupUri` from `App.xaml` so WPF doesn't try to construct `MainWindow` with the parameterless constructor it doesn't have. If you re-add `StartupUri`, you'll get a runtime error before ABP has a chance to resolve the window.
+</Warning>
+
+## `HelloWorldService.cs`
+
+The same transient-with-logger pattern as the [console template](/templates/console-template):
+
+```csharp templates/wpf/src/MyCompanyName.MyProjectName/HelloWorldService.cs
+public class HelloWorldService : ITransientDependency
+{
+    public ILogger<HelloWorldService> Logger { get; set; }
+
+    public HelloWorldService()
+    {
+        Logger = NullLogger<HelloWorldService>.Instance;
+    }
+
+    public string SayHello()
+    {
+        Logger.LogInformation("Call SayHello");
+        return "Hello world!";
+    }
+}
+```
+
+`ITransientDependency` auto-registers, `Logger` is filled in by property injection. `NullLogger<T>.Instance` keeps unit tests simple.
+
+## `MyProjectNameModule.cs` — registers `MainWindow`
+
+```csharp templates/wpf/src/MyCompanyName.MyProjectName/MyProjectNameModule.cs
+[DependsOn(typeof(AbpAutofacModule))]
+public class MyProjectNameModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton<MainWindow>();
+    }
+}
+```
+
+The single explicit registration is `MainWindow`. Anything that's `ITransientDependency` / `ISingletonDependency` / `IScopedDependency` registers itself; `MainWindow` doesn't (it's a `Window`, conceptually framework-owned), so the template wires it explicitly.
+
+## `appsettings.json`
+
+Empty out of the box — `{}` — but copied to the output via the `<Content Include="appsettings.json" />` block in the csproj so `Microsoft.Extensions.Configuration` finds it next to the exe at runtime.
+
+## Running it
+
+<Steps>
+  <Step title="Restore and build">
+    ```bash
+    dotnet build src/Acme.BookstoreDesktop
+    ```
+  </Step>
+  <Step title="Run">
+    ```bash
+    dotnet run --project src/Acme.BookstoreDesktop
+    ```
+    A WPF window appears with the label "Hello world!" — that's `HelloLabel.Content = _helloWorldService.SayHello()` in action.
+  </Step>
+  <Step title="Inspect logs">
+    Logs are written to `Logs/logs.txt` next to the exe (Serilog file sink). There's no console window.
+  </Step>
+</Steps>
+
+See [Project building](/cli/project-building) for publishing (`dotnet publish -r win-x64 --self-contained`) and packaging notes.
+
+## Extending the template
+
+<CardGroup cols={2}>
+  <Card title="Add MVVM" icon="diagram-project">
+    Bring in `CommunityToolkit.Mvvm` or `Prism.Wpf`. Register your `ViewModel`s with `ITransientDependency` and `[ObservableProperty]` works as usual — Autofac will inject services.
+  </Card>
+  <Card title="Call a layered backend" icon="cloud">
+    Reference the backend's `Application.Contracts` and `HttpApi.Client` packages and `[DependsOn(typeof(MyHttpApiClientModule))]`. Now any window can constructor-inject an `IBookAppService`.
+  </Card>
+  <Card title="Add OpenIddict client" icon="lock">
+    Drop in `Volo.Abp.OpenIddict.Authentication` plus a browser-based auth code flow (WebView2) and store refresh tokens in the Windows Credential Manager.
+  </Card>
+  <Card title="Resolve windows from DI" icon="window-restore">
+    Register every `Window` with `AddTransient<TWindow>()` and resolve via an `IServiceScopeFactory` so each window gets its own scope.
+  </Card>
+</CardGroup>
+
+## Differences vs. the other client templates
+
+| Aspect | Console | MAUI | WPF |
+| --- | --- | --- | --- |
+| Bootstrap entry | `Program.Main` | `MauiProgram.CreateMauiApp` | `App.OnStartup` |
+| Builder type | `IHostApplicationBuilder` | `MauiAppBuilder` | None — `AbpApplicationFactory.CreateAsync` directly |
+| DI factory | `AddAutofacServiceProviderFactory` | `ConfigureContainer(new AbpAutofacServiceProviderFactory(...))` | `options.UseAutofac()` |
+| Service provider ownership | Generic host | MAUI | ABP (`IAbpApplicationWithInternalServiceProvider`) |
+| Initialize | `host.InitializeAsync()` | `IAbpApplicationWithExternalServiceProvider.Initialize(app.Services)` | `_abpApplication.InitializeAsync()` |
+| Shutdown | Host handles | MAUI handles | Manual `_abpApplication.ShutdownAsync()` in `OnExit` |
+| Logging sinks | Console + File | (none — add Serilog yourself) | File only |
+| Target framework | `net10.0` | `net10.0` + `-android`/`-ios`/`-maccatalyst`/`-windows10.0.*` | `net10.0-windows` |
+
+## Publishing
+
+WPF apps are usually distributed as self-contained EXEs. The `<PublishSingleFile>` / `<PublishTrimmed>` properties from the .NET SDK work normally on top of the ABP host. A typical CI publish command:
+
+```bash
+dotnet publish src/Acme.BookstoreDesktop \
+  -c Release \
+  -r win-x64 \
+  --self-contained true \
+  -p:PublishSingleFile=true \
+  -p:IncludeNativeLibrariesForSelfExtract=true
+```
+
+<Warning>
+**Trimming**: ABP's heavy use of Autofac reflection and conventional registration is not trim-safe. Leave `<PublishTrimmed>false</PublishTrimmed>` unless you've verified your module graph with `dotnet publish -p:PublishTrimmed=true -p:TrimmerSingleWarn=false` and addressed every warning.
+</Warning>
+
+For Windows Store distribution, wrap the published output in MSIX with `MakeAppx.exe` or use the [Windows Application Packaging Project](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-packaging-dot-net) template — neither requires any ABP-specific changes.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    `-t wpf` and combinations.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    Publish, self-contained, MSIX packaging.
+  </Card>
+  <Card title="MAUI template" icon="mobile-screen" href="/templates/maui-template">
+    Cross-platform alternative.
+  </Card>
+  <Card title="Layered backend" icon="layer-group" href="/templates/app-template-aspnet-core">
+    Most likely backend this client talks to.
+  </Card>
+</CardGroup>

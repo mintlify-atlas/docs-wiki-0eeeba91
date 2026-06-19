@@ -1,0 +1,310 @@
+---
+title: "Http.Abstractions — Shared Error & Stream Contracts"
+sidebarTitle: "Http Abstractions"
+description: "Marker module and shared types used by HTTP servers and clients: RemoteServiceErrorInfo, validation errors, status code finder, IRemoteStreamContent."
+---
+
+`Volo.Abp.Http.Abstractions` is intentionally tiny — a marker module plus a couple of options classes. The wire-level error types (`RemoteServiceErrorInfo`, `RemoteServiceErrorResponse`, `RemoteServiceValidationErrorInfo`) and the file-streaming abstraction (`IRemoteStreamContent`) live in `Volo.Abp.ExceptionHandling` and `Volo.Abp.Core` respectively but are documented here because they are the contract that every HTTP server, every dynamic client proxy, and every IdentityModel-authenticated call agrees on.
+
+Module path: `framework/src/Volo.Abp.Http.Abstractions/Volo/Abp/Http/`.
+
+## `AbpHttpAbstractionsModule`
+
+A pure marker; no DI registrations. It exists so server-side modules (`Volo.Abp.AspNetCore.Mvc`) and client-side modules (`Volo.Abp.Http`) can both `[DependsOn(typeof(AbpHttpAbstractionsModule))]` and share whatever common DTOs end up here later.
+
+```csharp
+using Volo.Abp.Modularity;
+
+namespace Volo.Abp.Http;
+
+public class AbpHttpAbstractionsModule : AbpModule
+{
+
+}
+```
+
+## `RemoteServiceErrorInfo`
+
+This is the shape the dynamic proxy expects in the body of any non-2xx response. The server-side `AbpExceptionFilter` builds it from the thrown `BusinessException` / `UserFriendlyException`; the client deserializes it and rebuilds an exception with the same `Code` / `Message` / `Details`.
+
+```csharp
+[Serializable]
+public class RemoteServiceErrorInfo
+{
+    public string? Code { get; set; }
+    public string? Message { get; set; }
+    public string? Details { get; set; }
+    public IDictionary? Data { get; set; }
+    public RemoteServiceValidationErrorInfo[]? ValidationErrors { get; set; }
+
+    public RemoteServiceErrorInfo() { }
+
+    public RemoteServiceErrorInfo(string message, string? details = null,
+        string? code = null, IDictionary? data = null)
+    {
+        Message = message;
+        Details = details;
+        Code = code;
+        Data = data;
+    }
+}
+```
+
+(Source: `framework/src/Volo.Abp.ExceptionHandling/Volo/Abp/Http/RemoteServiceErrorInfo.cs`.)
+
+<Note>
+`Code` is the localization key the server resolved the exception with — clients can re-localize it. `Details` typically holds the formatted stack trace **only** when `IExceptionToErrorInfoConverter` is asked to include it (development mode by default).
+</Note>
+
+## `RemoteServiceValidationErrorInfo`
+
+Used inside `RemoteServiceErrorInfo.ValidationErrors` for `AbpValidationException`. `Members` are the property names that failed validation.
+
+```csharp
+[Serializable]
+public class RemoteServiceValidationErrorInfo
+{
+    public string Message { get; set; } = default!;
+    public string[] Members { get; set; } = default!;
+
+    public RemoteServiceValidationErrorInfo() { }
+
+    public RemoteServiceValidationErrorInfo(string message)
+    {
+        Message = message;
+    }
+
+    public RemoteServiceValidationErrorInfo(string message, string[] members)
+        : this(message) { Members = members; }
+
+    public RemoteServiceValidationErrorInfo(string message, string member)
+        : this(message, new[] { member }) { }
+}
+```
+
+## `RemoteServiceErrorResponse`
+
+The envelope. ABP servers emit `{ "error": { ... } }` rather than a bare `RemoteServiceErrorInfo`:
+
+```csharp
+namespace Volo.Abp.Http;
+
+public class RemoteServiceErrorResponse
+{
+    public RemoteServiceErrorInfo Error { get; set; }
+
+    public RemoteServiceErrorResponse(RemoteServiceErrorInfo error)
+    {
+        Error = error;
+    }
+}
+```
+
+Clients that want to "unwrap" responses from non-ABP backends can intercept earlier in the pipeline — see [Http.Client → DynamicHttpProxyInterceptor](/http/http-client).
+
+## `IHttpExceptionStatusCodeFinder`
+
+The server-side hook that maps an exception type to an HTTP status code. Lives in `Volo.Abp.AspNetCore` but is consumed alongside the abstractions:
+
+```csharp
+namespace Volo.Abp.AspNetCore.ExceptionHandling;
+
+public interface IHttpExceptionStatusCodeFinder
+{
+    HttpStatusCode GetStatusCode(HttpContext httpContext, Exception exception);
+}
+```
+
+The default `DefaultHttpExceptionStatusCodeFinder` returns:
+
+| Exception | Status |
+| --- | --- |
+| `AbpAuthorizationException` (anonymous user) | `401 Unauthorized` |
+| `AbpAuthorizationException` (authenticated) | `403 Forbidden` |
+| `AbpValidationException` | `400 Bad Request` |
+| `EntityNotFoundException` | `404 Not Found` |
+| Other | `500 Internal Server Error` |
+
+Override the registration to add your own mappings — clients will see the new status code reflected in the `HttpResponseMessage` that flows through `DynamicHttpProxyInterceptor`.
+
+## `IRemoteStreamContent`
+
+The abstraction that lets an application service return a file without leaking `Stream`, `IFormFile`, or `FileResult` into the contract. Both `Volo.Abp.AspNetCore.Mvc` and `Volo.Abp.Http.Client` understand it.
+
+```csharp
+namespace Volo.Abp.Content;
+
+public interface IRemoteStreamContent : IDisposable
+{
+    string? FileName { get; }
+    string ContentType { get; }
+    long? ContentLength { get; }
+    Stream GetStream();
+}
+```
+
+A typical service signature:
+
+```csharp
+public interface IInvoiceAppService : IApplicationService
+{
+    Task<IRemoteStreamContent> DownloadAsync(Guid id);
+}
+```
+
+On the server, MVC sees the `IRemoteStreamContent` return type and produces a `FileStreamResult`. On the client, the dynamic proxy reads `response.Content` into a stream-backed implementation and exposes the same interface.
+
+## ProxyScripting attributes & options
+
+ProxyScripting is the legacy server-side feature that generates jQuery (and other) proxies from `ApplicationApiDescriptionModel`. The configuration lives in `Volo.Abp.Http`:
+
+```csharp
+namespace Volo.Abp.Http.ProxyScripting.Configuration;
+
+public class AbpApiProxyScriptingOptions
+{
+    public IDictionary<string, Type> Generators { get; }
+
+    public AbpApiProxyScriptingOptions()
+    {
+        Generators = new Dictionary<string, Type>();
+    }
+}
+```
+
+The generators dictionary is keyed by name (`"jquery"`) and points at a `IProxyScriptGenerator` implementation. `JQueryProxyScriptGenerator` is registered by default in `AbpHttpModule.ConfigureServices`:
+
+```csharp
+Configure<AbpApiProxyScriptingOptions>(options =>
+{
+    options.Generators[JQueryProxyScriptGenerator.Name] = typeof(JQueryProxyScriptGenerator);
+});
+```
+
+### `DynamicJavaScriptProxyOptions`
+
+Lives in `Volo.Abp.Http/Volo/Abp/Http/ProxyScripting/Generators/JQuery/DynamicJavaScriptProxyOptions.cs` and controls which modules / controllers get included in the generated `abp.services.*` JS proxy. Apply via `Configure<DynamicJavaScriptProxyOptions>(...)`.
+
+<Warning>
+ProxyScripting is server-side and predates the C# client proxies described on the rest of this page. New code should prefer typed client proxies (see [Http.Client](/http/http-client)); ProxyScripting remains for jQuery-era UIs.
+</Warning>
+
+## `AbpApiDescriptionModelOptions`
+
+Lives in `Volo.Abp.Http.Abstractions/Volo/Abp/Http/Modeling/`. It controls which interfaces the API description builder *ignores* when computing the implemented interface set of a controller — without this, every service would advertise `ITransientDependency` as a "remote service".
+
+```csharp
+public class AbpApiDescriptionModelOptions
+{
+    public HashSet<Type> IgnoredInterfaces { get; }
+
+    public AbpApiDescriptionModelOptions()
+    {
+        IgnoredInterfaces = new HashSet<Type>
+        {
+            typeof(ITransientDependency),
+            typeof(ISingletonDependency),
+            typeof(IDisposable),
+            typeof(IAvoidDuplicateCrossCuttingConcerns)
+        };
+    }
+}
+```
+
+Add your own infrastructure interfaces to `IgnoredInterfaces` if you implement them on your application services and don't want them advertised over `GET /api/abp/api-definition`.
+
+## `ClientProxyExceptionEventData`
+
+When the dynamic proxy receives a non-2xx response it raises a local event so observers can react (e.g. open a sign-in dialog on 401):
+
+```csharp
+public class ClientProxyExceptionEventData
+{
+    public int? StatusCode { get; set; }
+    public string? ReasonPhrase { get; set; }
+    public string? Error { get; set; }
+    public string? ErrorDescription { get; set; }
+    public string? ErrorUri { get; set; }
+}
+```
+
+Subscribe via `ILocalEventBus.Subscribe<ClientProxyExceptionEventData>(...)`.
+
+## Wire format reference
+
+The dynamic proxy and the server-side `AbpExceptionFilter` agree on a small, stable JSON shape for error responses. Knowing the shape is useful when you write a non-ABP client (Postman, a mobile app, a Python CLI) that must still understand ABP errors.
+
+### Success response (Application Service Output Type)
+
+A typed app-service method that returns `Task<PagedResultDto<BookDto>>` produces JSON shaped exactly like the DTO — no envelope:
+
+```json
+{
+  "totalCount": 42,
+  "items": [
+    { "id": "8a2…", "name": "The Pragmatic Programmer", "price": 39.95 }
+  ]
+}
+```
+
+This is why a non-ABP client can call ABP APIs without taking any dependency on the framework.
+
+### Error response (`RemoteServiceErrorResponse`)
+
+Any non-2xx response carries the envelope:
+
+```json
+{
+  "error": {
+    "code": "Volo.Books:010002",
+    "message": "Book name cannot be empty",
+    "details": null,
+    "data": { "bookId": "8a2…" },
+    "validationErrors": null
+  }
+}
+```
+
+`validationErrors` only appears for `AbpValidationException`:
+
+```json
+{
+  "error": {
+    "code": "Volo.AbpValidationException",
+    "message": "Your request is not valid!",
+    "validationErrors": [
+      { "message": "The Name field is required.", "members": ["name"] },
+      { "message": "The Price field must be > 0.", "members": ["price"] }
+    ]
+  }
+}
+```
+
+### Headers worth knowing
+
+| Header | Direction | Purpose |
+| --- | --- | --- |
+| `_AbpErrorFormat` | request | Tells the server "I speak `RemoteServiceErrorResponse`" — set automatically by `DynamicHttpProxyInterceptor`. |
+| `Abp-Tenant-Resolve-Error` | response | The server failed to resolve the requested tenant. The client throws a tenant-resolution exception. |
+| `X-Requested-With: XMLHttpRequest` | request | Triggers JSON-shaped error responses on MVC views that would otherwise redirect. |
+| `Authorization: Bearer …` | request | Attached by `IRemoteServiceHttpClientAuthenticator`. |
+
+## Reconstructing exceptions on the client
+
+`DynamicHttpProxyInterceptor` translates a `RemoteServiceErrorResponse` back into the closest ABP exception type, using `Code` to disambiguate:
+
+| Code prefix / exact value | Exception thrown on the client |
+| --- | --- |
+| `Volo.AbpValidationException` | `AbpValidationException` with `ValidationErrors` populated |
+| `Volo.AbpAuthorizationException` | `AbpAuthorizationException` |
+| `Volo.EntityNotFoundException` | `EntityNotFoundException` |
+| Anything else | `AbpRemoteCallException` with `Code`/`Message`/`Details`/`Data` populated |
+
+`AbpRemoteCallException` is the safety net — your callers can either catch the specific type *or* `AbpRemoteCallException` to access the raw `Code`. Combined with [`IBusinessException`](/core/exception-handling), localized messages survive a network hop unchanged.
+
+## Where to go next
+
+- [Http module](/http/http-module) — registers the ProxyScripting generators and exposes the API description model types used over the wire.
+- [Http.Client](/http/http-client) — the dynamic proxy that consumes the abstractions above.
+- [Auth — JWT Bearer](/aspnetcore/auth-jwt-bearer) — the resource-server side that returns `RemoteServiceErrorResponse` on auth failures.
+- [MVC Controllers and Conventions](/aspnetcore/mvc-controllers-and-conventions) — how server-side conventions surface the same model the abstractions describe.

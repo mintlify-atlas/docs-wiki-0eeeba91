@@ -1,0 +1,593 @@
+---
+title: "Docs Web UI: Reader Razor Pages and Admin Back Office"
+sidebarTitle: "Web UI"
+description: "ABP Docs Razor Pages: project / document / search reader pages, sidebar navigation, in-page TOC, version + language switchers, and the admin back office."
+---
+
+The Docs **Web** layer is the only part of the module readers ever touch. It is a set of Razor Pages that translate URLs like `/documents/abp/latest/en/Tutorials/Index.md` into a rendered page with a sidebar (from the project's navigation JSON), an in-page TOC (from the rendered Markdown), and switchers for project / version / language. A second project, `Volo.Docs.Admin.Web`, ships the back office where administrators register projects, pull documents from their source, generate PDFs, and clear caches.
+
+Both projects live under [`modules/docs/src/`](https://github.com/abpframework/abp/tree/dev/modules/docs/src):
+
+- `Volo.Docs.Web` — public reader UI, layouts, bundles, Markdig renderer, section renderer, TOC view.
+- `Volo.Docs.Admin.Web` — admin pages, menu contributors, AutoMappers.
+
+## Page map
+
+| URL | Razor page | Calls |
+| --- | --- | --- |
+| `/Documents` | `Pages/Documents/Index.cshtml` | `IProjectAppService.GetListAsync` |
+| `/Documents/{ProjectName}/{Version}/{LanguageCode}/{*DocumentName}` | `Pages/Documents/Project/Index.cshtml` | `IProjectAppService`, `IDocumentAppService`, `ITocGeneratorService` |
+| `/Documents/Search` | `Pages/Documents/Search.cshtml` | `IDocumentAppService.SearchAsync` |
+| `/Docs/Admin/Projects` | `Pages/Docs/Admin/Projects/Index.cshtml` | `IProjectAdminAppService.GetListAsync` |
+| `/Docs/Admin/Projects/Create` | `.../Create.cshtml` | `IProjectAdminAppService.CreateAsync` |
+| `/Docs/Admin/Projects/Edit/{id}` | `.../Edit.cshtml` | `IProjectAdminAppService.UpdateAsync` |
+| `/Docs/Admin/Projects/Pull/{id}` | `.../Pull.cshtml` | `IDocumentAdminAppService.PullAllAsync` |
+| `/Docs/Admin/Projects/ManagePdfFiles/{id}` | `.../ManagePdfFiles.cshtml` | `IDocumentPdfAdminAppService` |
+| `/Docs/Admin/Projects/GeneratePdf/{id}` | `.../GeneratePdf.cshtml` | `IDocumentPdfAdminAppService.GenerateAsync` |
+| `/Docs/Admin/Documents` | `Pages/Docs/Admin/Documents/Index.cshtml` | `IDocumentAdminAppService.GetAllAsync` |
+
+## Reader pages
+
+### Projects landing
+
+When the visitor lands on `/Documents` with no project selected, `Pages/Documents/Index.cshtml.cs` enumerates projects and decides what to do:
+
+```csharp
+public class IndexModel : PageModel
+{
+    public string DocumentsUrlPrefix { get; set; }
+    public IReadOnlyList<ProjectDto> Projects { get; set; }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        if (_uiOptions.SingleProjectMode.Enable)
+        {
+            return Redirect($"/Documents/Project/Index?version={DocsAppConsts.Latest}");
+        }
+
+        var listResult = await _projectAppService.GetListAsync();
+
+        if (listResult.Items.Count == 1)
+        {
+            return Redirect($"/Documents/{listResult.Items[0].ShortName}");
+        }
+        // ... renders the project list ...
+    }
+}
+```
+
+Three modes fall out of `DocsUiOptions`:
+
+<CardGroup cols={3}>
+  <Card title="Single project" icon="file">
+    `DocsUiOptions.SingleProjectMode.Enable = true`. The landing page skips straight to the only project's latest version. The project combobox is hidden.
+  </Card>
+  <Card title="Single result" icon="circle-1">
+    Multiple projects allowed, but only one exists. Redirect to that project's `ShortName` so the URL is clean.
+  </Card>
+  <Card title="List" icon="list">
+    Renders the project list (`Pages/Documents/Index.cshtml`). Each entry links into the project's reader page.
+  </Card>
+</CardGroup>
+
+### Project reader
+
+`Volo.Docs.Web/Pages/Documents/Project/Index.cshtml.cs` is the heart of the module — ~600 lines of route binding, redirect logic, version negotiation, language negotiation, and rendering. File: [`Volo.Docs.Web/Pages/Documents/Project/Index.cshtml.cs`](https://github.com/abpframework/abp/blob/dev/modules/docs/src/Volo.Docs.Web/Pages/Documents/Project/Index.cshtml.cs).
+
+```csharp
+public class IndexModel : AbpPageModel
+{
+    [BindProperty(SupportsGet = true)] public string ProjectName { get; set; }
+    [BindProperty(SupportsGet = true)] public string Version { get; set; } = "";
+    [BindProperty(SupportsGet = true)] public string DocumentName { get; set; }
+    [BindProperty(SupportsGet = true)] public string LanguageCode { get; set; }
+
+    public bool DocumentFound { get; set; } = true;
+    public bool ProjectFound  { get; set; } = true;
+    public bool LoadSuccess   => DocumentFound && ProjectFound;
+
+    public ProjectDto                  Project          { get; set; }
+    public LanguageConfig              LanguageConfig   { get; set; }
+    public List<SelectListItem>        LanguageSelectListItems { get; set; }
+    public DocumentWithDetailsDto      Document         { get; private set; }
+    public List<SelectListItem>        VersionSelectItems { get; private set; }
+    public List<SelectListItem>        ProjectSelectItems { get; private set; }
+    public NavigationNode              Navigation       { get; private set; }
+    public VersionInfoViewModel        LatestVersionInfo { get; private set; }
+    public List<TocItem>               TocItems         { get; set; } = [];
+    public DocumentNavigationsDto      DocumentNavigationsDto { get; private set; }
+    public bool                        FullSearchEnabled { get; set; }
+    public bool                        HasDownloadPdf   { get; set; }
+}
+```
+
+#### Constructor injection
+
+```csharp
+public IndexModel(
+    IDocumentAppService             documentAppService,
+    IDocumentToHtmlConverterFactory documentToHtmlConverterFactory,
+    IProjectAppService              projectAppService,
+    IOptions<DocsUiOptions>         options,
+    IWebDocumentSectionRenderer     webDocumentSectionRenderer,
+    IPermissionChecker              permissionChecker,
+    IDocumentPdfAppService          documentPdfAppService,
+    ITocGeneratorService            tocGeneratorService)
+```
+
+Every page render needs **all eight** services. The PDF button, search box, and section rendering are each gated on a separate concern (permission, options flag, opt-in feature).
+
+#### Request pipeline
+
+The `OnGetAsync` method drives a chain of "negotiate, redirect if wrong, render if right":
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    var displayUrl = Request.GetDisplayUrl();
+    var decodedUrl = HttpUtility.UrlDecode(displayUrl);
+    if (decodedUrl != displayUrl) return Redirect(decodedUrl);    // 1
+
+    var redirectUrl = _uiOptions.GetRedirectUrlIfNeeded(displayUrl);
+    if (redirectUrl != null) return RedirectPermanent(redirectUrl); // 2
+
+    return await SetPageAsync();
+}
+
+private async Task<IActionResult> SetPageAsync()
+{
+    DocumentsUrlPrefix  = _uiOptions.RoutePrefix;
+    FullSearchEnabled   = await _documentAppService.FullSearchEnabledAsync();
+
+    await SetProjectAsync();                                          // 3
+    if (Project == null) { ProjectFound = false; return Page(); }
+
+    if (ShowProjectsCombobox) await SetProjectsAsync();                // 4
+    if (!await TrySetVersionAsync()) return RedirectToDefaultVersion(); // 5
+    await SetLanguageList();                                           // 6
+
+    if (IsDefaultDocument()) return RedirectToDefaultDocument();        // 7
+
+    if (!_uiOptions.MultiLanguageMode == false && !CheckLanguage())
+        return RedirectToDefaultLanguage();                             // 8
+
+    if (IsDocumentCultureDifferentThanCurrent())
+        return ReloadPageWithCulture();                                 // 9
+
+    if (!await TrySetDocumentAsync()) { DocumentFound = false; return Page(); } // 10
+
+    await SetNavigationAsync();                                         // 11
+    SetLanguageSelectListItems();                                       // 12
+    return Page();
+}
+```
+
+<Steps>
+  <Step title="Decode + redirect">
+    Steps 1–2 collapse double-encoded URLs and apply user-defined redirect rules from `DocsUiOptions`.
+  </Step>
+  <Step title="Resolve the project">
+    Step 3 calls `ProjectAppService.GetAsync(ProjectName)`. Single-project mode short-circuits this to the configured project.
+  </Step>
+  <Step title="Negotiate version">
+    Step 5 calls `ProjectAppService.GetVersionsAsync(ProjectName)` and decides whether the requested `Version` is `latest`, a known version, or unknown (→ redirect to latest). `LatestVersionInfo` carries the resolved `VersionInfoViewModel`.
+  </Step>
+  <Step title="Negotiate language">
+    Steps 6–9 call `ProjectAppService.GetLanguageListAsync`, check the requested `LanguageCode` exists, and redirect to the default if missing. When the user's culture doesn't match, the page hops through `/Abp/Languages/Switch?culture=...` so subsequent server-side localization picks up the new culture.
+  </Step>
+  <Step title="Fetch the document">
+    Step 10 calls `IDocumentAppService.GetAsync` (or `GetDefaultAsync` for the root). The DTO carries raw `Content`; the page then runs it through `IDocumentToHtmlConverterFactory.Create(project.Format).Convert(...)` and through `IWebDocumentSectionRenderer` (Scriban) if `DocsUiOptions.SectionRendering = true`.
+  </Step>
+  <Step title="Sidebar + TOC + switchers">
+    Steps 11–12 fetch the navigation tree, build the language `<select>`, and the page itself wires `TocItems = _tocGeneratorService.GenerateTocItems(content, TocLevelCount)` for the right-rail TOC.
+  </Step>
+</Steps>
+
+#### Version switcher
+
+`TrySetVersionAsync` produces the `VersionSelectItems` list bound to the version dropdown:
+
+```csharp
+VersionSelectItems = versions.Select(v => new SelectListItem
+{
+    Text     = v.DisplayText,
+    Value    = CreateVersionLink(LatestVersionInfo, v.Version, DocumentName),
+    Selected = v.IsSelected
+}).ToList();
+
+IsLatestVersion = Version == LatestVersionInfo.Version;
+```
+
+The trick is that `CreateVersionLink` produces a URL using the literal string `latest` when the chosen version *is* `LatestVersionInfo`, so the visible URL stays stable as new releases ship — a `/abp/latest/...` link keeps pointing to "whatever is current".
+
+When the project uses `GithubVersionProviderSource.Branches`, `GetLatestVersionInfo` walks `LatestVersionBranchNameWithoutPrefix` (stripping the project's `VersionBranchPrefix` — see [Domain.Project.GetFullVersion](/modules/docs/domain#version-prefix-helper)) and marks the matching `VersionInfoViewModel` as latest.
+
+#### Language switcher
+
+`SetLanguageSelectListItems` mirrors the version logic but for languages:
+
+```csharp
+private void SetLanguageSelectListItems()
+{
+    LanguageSelectListItems = new List<SelectListItem>();
+    if (!_uiOptions.MultiLanguageMode) return;
+
+    foreach (var language in LanguageConfig.Languages)
+    {
+        LanguageSelectListItems.Add(new SelectListItem(
+            language.DisplayName,
+            DocsLinkGenerator.GenerateLink(
+                ProjectName,
+                language.Code,
+                LatestVersionInfo.IsSelected ? DocsAppConsts.Latest : Version,
+                DocumentName),
+            language.Code.Equals(LanguageCode, StringComparison.OrdinalIgnoreCase)));
+    }
+}
+```
+
+`MultiLanguageMode = false` collapses to a single-language site — the dropdown is empty and never rendered. See [Multi-lingual objects](/localization/multi-lingual-objects) for ABP's broader cross-cutting translation primitives; the Docs module uses a much simpler "one document per language code" model that maps directly onto file/folder layout.
+
+<Note>
+**Culture vs language code.** `LanguageCode` is the *content* language (`en`, `tr`, `zh-Hans`). When it differs from `CultureInfo.CurrentCulture.Name`, the page jumps through `/Abp/Languages/Switch` so resource strings, dates, and numbers match the document — important when the back-office chrome and the document body should agree.
+</Note>
+
+### TableOfContents component
+
+The in-page TOC ships as a Razor partial. File: [`Pages/Documents/Project/TableOfContents.cshtml`](https://github.com/abpframework/abp/blob/dev/modules/docs/src/Volo.Docs.Web/Pages/Documents/Project/TableOfContents.cshtml).
+
+```cshtml
+@using Volo.Docs.TableOfContents
+@model List<TocItem>
+@{
+    if (Model == null || Model.Count == 0) { return; }
+}
+
+<ul class="nav nav-pills flex-column">
+    @foreach (var item in Model)
+    {
+        <li class="nav-item @(item.Children.Any() ? "toc-item-has-children" : "")">
+            <a class="nav-link" href="#@item.Heading.Id">@item.Heading.Text</a>
+
+            @if (item.Children.Any())
+            {
+                RenderChildrenRecursive(item.Children, 1);
+            }
+        </li>
+    }
+</ul>
+
+@{
+    void RenderChildrenRecursive(List<TocItem> children, int depth)
+    {
+        <ul class="nav nav-pills flex-column toc-depth-@depth">
+            @foreach (var child in children)
+            {
+                <li class="nav-item @(child.Children.Any() ? "toc-item-has-children" : "")">
+                    <a class="nav-link" href="#@child.Heading.Id">@child.Heading.Text</a>
+                    @if (child.Children.Any())
+                    {
+                        RenderChildrenRecursive(child.Children, depth + 1);
+                    }
+                </li>
+            }
+        </ul>
+    }
+}
+```
+
+The model is the same `List<TocItem>` produced by [`TocGeneratorService.GenerateTocItems`](/modules/docs/application#tocgeneratorservice). The page binds `Model.TocItems` and the partial walks the tree, emitting `toc-depth-N` CSS classes for the per-level indent that `Pages/Documents/Project/index.css` styles.
+
+### Section rendering & document preferences
+
+For projects that opt into `DocsUiOptions.SectionRendering = true`, the page runs the raw Markdown through `IWebDocumentSectionRenderer` (`ScribanWebDocumentSectionRenderer`) before handing it to the HTML converter:
+
+```csharp
+private async Task ConvertDocumentContentToHtmlAsync()
+{
+    if (_uiOptions.SectionRendering)
+    {
+        await SetDocumentPreferencesAsync();
+        SetAlternativeOptionLinksAsync();
+        SetUserPreferences();
+
+        var partialTemplates = await GetDocumentPartialTemplatesAsync();
+        DocumentNavigationsDto = await _webDocumentSectionRenderer
+            .GetDocumentNavigationsAsync(Document.Content);
+
+        Document.Content = await _webDocumentSectionRenderer.RenderAsync(
+            Document.Content, UserPreferences, partialTemplates);
+    }
+    // ... else pass through ...
+}
+```
+
+This is what powers per-section tabs ("MVC | Blazor | Angular", "EF Core | MongoDB") inside an ABP doc. The user's last selection is persisted in cookies and re-applied on every render.
+
+### Markdown → HTML
+
+The conversion runs through `IDocumentToHtmlConverterFactory.Create(project.Format)`. The Markdown path uses Markdig:
+
+```csharp
+public class MarkdownDocumentToHtmlConverter
+    : IDocumentToHtmlConverter<DocumentToHtmlConverterContext>, ITransientDependency
+{
+    public const string Type = "md";
+
+    private readonly IMarkdownConverter _markdownConverter;
+    private readonly DocsUiOptions      _uiOptions;
+    private readonly IDocsLinkGenerator _docsLinkGenerator;
+
+    public virtual string Convert(DocumentToHtmlConverterContext context)
+    {
+        if (context.Document.Content.IsNullOrEmpty())
+        {
+            return context.Document.Content;
+        }
+        var content = NormalizeLinks(context.Document.Content, /* ... */);
+        return _markdownConverter.Convert(content);
+    }
+}
+```
+
+`NormalizeLinks` rewrites relative Markdown links (`[Tutorials](Tutorials/Index.md)`) into absolute, version-aware reader URLs using `IDocsLinkGenerator`. The Markdig pipeline itself enables `UseAdvancedExtensions` and a custom `HighlightedCodeBlockExtension` that defers code-block highlighting to Prism.js on the client.
+
+## Admin pages
+
+The admin UI lives in `Volo.Docs.Admin.Web`. Every page is guarded by the corresponding permission from [`DocsAdminPermissions`](/modules/docs/application#permissions).
+
+### Projects index
+
+File: [`Pages/Docs/Admin/Projects/Index.cshtml.cs`](https://github.com/abpframework/abp/blob/dev/modules/docs/src/Volo.Docs.Admin.Web/Pages/Docs/Admin/Projects/Index.cshtml.cs).
+
+```csharp
+[Authorize(DocsAdminPermissions.Projects.Default)]
+public class IndexModel : DocsAdminPageModel
+{
+    public virtual Task<IActionResult> OnGet() => Task.FromResult<IActionResult>(Page());
+}
+```
+
+The page itself is a thin shell — all data binding happens client-side via `Pages/Docs/Admin/Projects/index.js`, which calls the auto-generated `docs-admin-proxy.js` against `IProjectAdminAppService.GetListAsync`:
+
+```cshtml
+@page
+@inject IHtmlLocalizer<DocsResource> L
+@inject IPageLayout PageLayout
+@{
+    PageLayout.Content.Title = L["Projects"].Value;
+    PageLayout.Content.BreadCrumb.Add(L["Menu:DocumentManagement"].Value);
+    PageLayout.Content.MenuItemName = DocsMenuNames.Projects;
+}
+
+@section scripts {
+    <abp-script src="/client-proxies/docs-admin-proxy.js" />
+    <abp-script src="/client-proxies/docs-common-proxy.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/index.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/create.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/edit.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/pull.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/managePdfFiles.js" />
+    <abp-script src="/Pages/Docs/Admin/Projects/generatePdf.js" />
+}
+```
+
+### Project create / edit
+
+`Pages/Docs/Admin/Projects/Create.cshtml.cs` binds a `CreateGithubProjectViewModel` and ships the form to `IProjectAdminAppService.CreateAsync`:
+
+```csharp
+public class CreateModel : DocsAdminPageModel
+{
+    [BindProperty] public CreateGithubProjectViewModel GithubProject { get; set; }
+
+    public List<SelectListItem> FormatTypes { get; set; }
+        = new() { new SelectListItem("markdown", "md") };
+
+    public CreateModel(IProjectAdminAppService projectAppService) { /* ... */ }
+
+    public virtual async Task<ActionResult> OnGetAsync(string source)
+    {
+        if (source != null && source.ToLowerInvariant() == "github")
+        {
+            GithubProject = new CreateGithubProjectViewModel();
+            return Page();
+        }
+        // ... file-system view model otherwise ...
+    }
+}
+```
+
+The form captures the `Project` constructor arguments plus source-specific extras (GitHub URL pattern with `{version}` placeholder, optional PAT, navigation/parameters file overrides, branch prefix). On submit the page service maps the view model to `CreateProjectDto` and posts.
+
+### Pull page
+
+`/Docs/Admin/Projects/Pull/{id}` lets an operator force a fresh download. Backed by `IDocumentAdminAppService.PullAllAsync` ([detailed here](/modules/docs/application#documentadminappservice)), it runs as a background job to avoid blocking the request thread.
+
+<Warning>
+**Pulling all docs costs API quota.** A single click hits the source once per leaf in `docs-nav.json`. For a docs repo with 200 documents in 3 languages that's 600 GitHub API calls. Always configure `GitHubAccessToken` on the project to lift the 60/hour anonymous rate limit.
+</Warning>
+
+### PDF management
+
+Two pages handle PDFs:
+
+- `ManagePdfFiles.cshtml` — lists existing PDFs for a project's versions (via `IDocumentPdfAdminAppService.GetListAsync`), lets you delete them.
+- `GeneratePdf.cshtml` — schedules a `DocumentPdfGenerateBackgroundJob` that walks the project's navigation, renders every leaf through the `pdf-*` HTML converter (see [`DocsDomainConsts.PdfDocumentToHtmlConverterPrefix`](/modules/docs/domain#shared-constants--exceptions)), and writes the merged PDF to `IProjectPdfFileStore`.
+
+### Documents grid
+
+File: [`Pages/Docs/Admin/Documents/Index.cshtml.cs`](https://github.com/abpframework/abp/blob/dev/modules/docs/src/Volo.Docs.Admin.Web/Pages/Docs/Admin/Documents/Index.cshtml.cs).
+
+```csharp
+[Authorize(DocsAdminPermissions.Documents.Default)]
+public class IndexModel : DocsAdminPageModel
+{
+    private readonly IDocumentAdminAppService _documentAdminAppService;
+    public List<ProjectWithoutDetailsDto> Projects { get; set; }
+
+    public IndexModel(IDocumentAdminAppService documentAdminAppService)
+    {
+        _documentAdminAppService = documentAdminAppService;
+    }
+
+    public virtual async Task<IActionResult> OnGet()
+    {
+        Projects = await _documentAdminAppService.GetProjectsAsync();
+        return Page();
+    }
+}
+```
+
+The grid itself is rendered via DataTables on the client, hitting `IDocumentAdminAppService.GetAllAsync` with every filter from `GetAllInput`. Row actions are:
+
+| Action | Calls | Effect |
+| --- | --- | --- |
+| **Remove from cache** | `RemoveFromCacheAsync(docId)` | Deletes the `Document` row. Next reader request triggers a re-fetch from the source. |
+| **Reindex** | `ReindexAsync(docId)` | Pushes the row into `IDocumentFullSearch` (Elastic) without touching the source. |
+
+## Configuration knobs
+
+Everything ships in `DocsUiOptions`, configured in your app's `ConfigureServices`:
+
+<Tabs>
+  <Tab title="DocsUiOptions">
+    ```csharp
+    public class DocsUiOptions
+    {
+        // Route prefix - documents land under /documents by default.
+        public string RoutePrefix { get; set; } = "documents";
+
+        // Show / hide the project combobox in the navbar.
+        public bool ShowProjectsCombobox      = true;
+        public bool ShowProjectsComboboxLabel = true;
+
+        // Scriban-powered per-section tabs (UI / DB / Tiered).
+        public bool SectionRendering = true;
+
+        // Hide the language switcher when false.
+        public bool MultiLanguageMode { get; set; } = true;
+
+        // Single-project sites can collapse the project from the URL.
+        public SingleProjectModeOptions SingleProjectMode { get; } = new();
+
+        // Click-to-zoom on images.
+        public bool EnableEnlargeImage { get; set; } = true;
+
+        // Normalize "/Foo/Index" -> "/Foo" in rendered links.
+        public Func<string, string> DocumentLinksNormalizer { get; set; } = link =>
+            link.EndsWith("/Index", StringComparison.OrdinalIgnoreCase)
+                ? link.Substring(0, link.LastIndexOf("/Index", StringComparison.OrdinalIgnoreCase))
+                : link;
+    }
+    ```
+  </Tab>
+  <Tab title="Wire it up">
+    ```csharp
+    [DependsOn(typeof(DocsWebModule))]
+    public class MyDocsAppModule : AbpModule
+    {
+        public override void ConfigureServices(ServiceConfigurationContext context)
+        {
+            Configure<DocsUiOptions>(options =>
+            {
+                options.RoutePrefix = "docs";
+                options.MultiLanguageMode = false;
+                options.SingleProjectMode.Enable = true;
+                options.SingleProjectMode.ProjectName = "abp";
+            });
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Bundles, assets, and the layout
+
+`Pages/Documents/Project/Index.cshtml` is layout-less (`Layout = ThemeManager.CurrentTheme.GetEmptyLayout();`) and brings its own bundles:
+
+```cshtml
+@section styles {
+    <abp-style-bundle name="@typeof(IndexModel).FullName">
+        <abp-style type="@typeof(PrismjsStyleBundleContributor)"/>
+        <abp-style type="@typeof(MalihuCustomScrollbarPluginStyleBundleContributor)"/>
+        <abp-style src="/Pages/Documents/Shared/Styles/vs.css"/>
+        <abp-style src="/Pages/Documents/Project/index.css"/>
+    </abp-style-bundle>
+}
+
+@section scripts {
+    <abp-script-bundle name="@typeof(IndexModel).FullName">
+        <abp-script type="@typeof(MalihuCustomScrollbarPluginScriptBundleContributor)"/>
+        <abp-script type="@typeof(ClipboardScriptBundleContributor)"/>
+        <abp-script type="@typeof(AnchorJsScriptBundleContributor)"/>
+        <abp-script type="@typeof(PrismjsScriptBundleContributor)"/>
+        <abp-script type="@typeof(PopperJsScriptBundleContributor)"/>
+        <abp-script src="/client-proxies/docs-proxy.js"/>
+        <abp-script src="/client-proxies/docs-common-proxy.js"/>
+        <abp-script src="/Pages/Documents/Shared/Scripts/vs.js"/>
+        <abp-script src="/Pages/Documents/Project/index.js"/>
+    </abp-script-bundle>
+}
+```
+
+| Asset | Why |
+| --- | --- |
+| Prism.js | Client-side syntax highlighting for `<pre><code class="language-xxx">` blocks emitted by the Markdig pipeline. |
+| Anchor.js | Adds the `¶` link icons next to every heading so readers can copy permalinks. |
+| Clipboard.js | "Copy" buttons on code blocks. |
+| Malihu custom scrollbar | Pretty scrollbars in the sidebar / TOC. |
+| Popper.js | Tooltip positioning for code-block actions. |
+
+A small `doc` JS object is emitted inline so the client scripts know which project/version/language they're on without parsing the URL:
+
+```cshtml
+<script type="text/javascript">
+    var doc = doc || {};
+    doc.project = {
+        id:           '@Model.Project.Id',
+        name:         '@Model.Project.ShortName',
+        languageCode: '@Model.LanguageCode',
+        version:      '@Model.Version',
+        format:       '@Model.Project.Format',
+        routeVersion: '@(Model.LatestVersionInfo == null || Model.LatestVersionInfo.IsSelected
+                         ? DocsAppConsts.Latest : Model.Version)'
+    }
+</script>
+```
+
+## Putting it all together
+
+```text
+GET /documents/abp/latest/en/Tutorials/Index.md
+ └─ Pages/Documents/Project/Index.cshtml.cs
+     ├─ ProjectAppService.GetAsync("abp")                 -> Project
+     ├─ ProjectAppService.GetVersionsAsync("abp")         -> latest resolved
+     ├─ ProjectAppService.GetLanguageListAsync(...)       -> language switcher
+     ├─ DocumentAppService.GetAsync(GetDocumentInput)     -> raw markdown
+     ├─ MarkdownDocumentToHtmlConverter.Convert(...)      -> HTML
+     ├─ ScribanWebDocumentSectionRenderer.RenderAsync(...) (optional)
+     ├─ DocumentAppService.GetNavigationAsync(...)        -> NavigationNode
+     └─ TocGeneratorService.GenerateTocItems(content, 2)  -> List<TocItem>
+        └─ Pages/Documents/Project/TableOfContents.cshtml renders the right rail
+```
+
+## Related reading
+
+<CardGroup cols={2}>
+  <Card title="Docs Application layer" icon="layer-group" href="/modules/docs/application">
+    Every service the pages on this page call — DTOs, contracts, caching.
+  </Card>
+  <Card title="Docs Domain layer" icon="cube" href="/modules/docs/domain">
+    The `Project` and `Document` aggregates rendered here.
+  </Card>
+  <Card title="Docs overview" icon="house" href="/modules/docs/overview">
+    Module landing page with the end-to-end pipeline diagram.
+  </Card>
+  <Card title="CMS Kit overview" icon="newspaper" href="/modules/cms-kit/overview">
+    The complementary module for editable in-app content (blogs, pages, comments).
+  </Card>
+  <Card title="Multi-lingual objects" icon="language" href="/localization/multi-lingual-objects">
+    Per-property translation primitives — useful when your custom source backs a database rather than per-language files.
+  </Card>
+</CardGroup>

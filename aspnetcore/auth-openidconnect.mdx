@@ -1,0 +1,181 @@
+---
+title: "OpenID Connect — Cookie + OIDC With Dynamic Claims"
+sidebarTitle: "OpenID Connect"
+description: "Volo.Abp.AspNetCore.Authentication.OpenIdConnect — OIDC + cookie flow, local user creation client and ABP dynamic claims contributor wiring."
+---
+
+`Volo.Abp.AspNetCore.Authentication.OpenIdConnect` is the module that browser apps use to sign in against an OpenIddict (or IdentityServer / Auth0 / Okta / etc.) identity provider. It chains an ABP‑aware OIDC handler with a cookie scheme and ABP's dynamic claims contributor; on first sign‑in it can also call back into the auth server to provision a local copy of the user record.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Volo/Abp/AspNetCore/Authentication/OpenIdConnect/`.
+
+## Module declaration
+
+```csharp
+// AbpAspNetCoreAuthenticationOpenIdConnectModule.cs
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpAspNetCoreAuthenticationOAuthModule),
+    typeof(AbpRemoteServicesModule)
+    )]
+public class AbpAspNetCoreAuthenticationOpenIdConnectModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+
+        Configure<AbpSecurityHeadersOptions>(options =>
+        {
+            options.IgnoredScriptNoncePaths.Add("/signout-oidc");
+        });
+    }
+}
+```
+
+Three things to notice:
+
+| Detail | Why |
+| --- | --- |
+| Depends on the OAuth helper module | To pick up `MultipleClaimAction` / `RemoveDuplicateClaimAction` for the OIDC handler's `ClaimActions`. |
+| Depends on multi‑tenancy | OIDC callbacks need `ICurrentTenant` so `OpenIdLocalUserCreationClient` provisions the local user under the right tenant. |
+| Depends on `AbpRemoteServicesModule` | `OpenIdLocalUserCreationClient` is implemented as an HTTP API client — uses `IHttpClientFactoryProxy` from the remote services module. |
+| Adds `"/signout-oidc"` to `IgnoredScriptNoncePaths` | The federated sign‑out callback page is a thin redirect; it doesn't need a CSP nonce — without this exception strict CSP would block it. |
+
+## The cookie + OIDC flow
+
+The recommended host configuration combines `Cookie` (for the active session) with `OpenIdConnect` (for SSO):
+
+```csharp
+context.Services
+    .AddAuthentication(options =>
+    {
+        options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = OpenIdConnectDefaults.AuthenticationScheme;
+    })
+    .AddCookie("Cookies", options =>
+    {
+        options.ExpireTimeSpan = TimeSpan.FromDays(365);
+    })
+    .AddAbpOpenIdConnect("oidc", options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata = false;
+        options.ResponseType = OpenIdConnectResponseType.CodeIdToken;
+        options.ClientId = configuration["AuthServer:ClientId"];
+        options.ClientSecret = configuration["AuthServer:ClientSecret"];
+        options.UsePkce = true;
+        options.SaveTokens = true;
+
+        options.Scope.Add("offline_access");
+        options.Scope.Add("MyApp");
+        options.Scope.Add("roles");
+        options.Scope.Add("email");
+
+        options.ClaimActions.MapJsonKey(AbpClaimTypes.UserName, "preferred_username");
+        options.ClaimActions.Add(new MultipleClaimAction("role", ClaimValueTypes.String, "role"));
+        options.ClaimActions.Add(new RemoveDuplicateClaimAction(AbpClaimTypes.UserName));
+    });
+```
+
+`AddAbpOpenIdConnect` is the extension method shipped by this module; it sets up the `OpenIdConnectEvents` so:
+
+- `OnTokenValidated` triggers `IOpenIdLocalUserCreationClient.CreateLocalUserAsync(...)` when configured.
+- `OnUserInformationReceived` calls the dynamic claims contributor chain so the resulting cookie carries fully refreshed claims.
+- `OnSignedOutCallbackRedirect` redirects to the configured post‑logout URL via `IAppUrlProvider`.
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Web as Web host (this module)
+    participant Auth as Auth server (OpenIddict)
+    Browser->>Web: GET /protected
+    Web-->>Browser: 302 to /Account/Login
+    Browser->>Web: GET /Account/Login
+    Web-->>Browser: 302 to Auth /connect/authorize
+    Browser->>Auth: GET /connect/authorize?...
+    Auth-->>Browser: 302 to /signin-oidc?code=...
+    Browser->>Web: GET /signin-oidc?code=...
+    Web->>Auth: POST /connect/token (PKCE)
+    Auth-->>Web: id_token + access_token + refresh_token
+    Web->>Auth: GET /connect/userinfo
+    Auth-->>Web: user claims (preferred_username, role[])
+    Web->>Web: ClaimActions map -> AbpClaimTypes.*
+    Web->>Web: WebRemoteDynamicClaimsPrincipalContributor refresh
+    Web->>Web: OpenIdLocalUserCreationClient (if first sign-in)
+    Web-->>Browser: Set-Cookie .AspNetCore.Cookies; 302 to /protected
+    Browser->>Web: GET /protected (with cookie)
+    Web-->>Browser: 200
+```
+
+## `OpenIdLocalUserCreationClient`
+
+```csharp
+// IOpenIdLocalUserCreationClient.cs
+public interface IOpenIdLocalUserCreationClient
+{
+    Task CreateLocalUserAsync(/* TokenValidatedContext or equivalent */);
+}
+```
+
+The default implementation (`OpenIdLocalUserCreationClient.cs`) inspects the incoming claims, finds the canonical `sub`, looks up whether a local user already exists, and if not calls the IdentityServer's account API (via `AbpRemoteServicesModule`'s HTTP client factory) to provision a row in the local `AbpUsers` table. This is what makes the web host's audit logs reference a local user id rather than an opaque SSO `sub`.
+
+### `OpenIdLocalUserCreationClientOptions`
+
+```csharp
+public class OpenIdLocalUserCreationClientOptions
+{
+    public bool IsEnabled { get; set; }
+    // ... endpoint URL, retry count, claim mapping
+}
+```
+
+`IsEnabled` defaults to `false`. Set it to `true` only on Web hosts that legitimately need a mirror of the user record — most resource API hosts don't.
+
+## Why depends on multi‑tenancy?
+
+When the host serves multiple tenants behind the same OIDC client, the OIDC callback URL still needs to know which tenant the principal belongs to. The OIDC handler runs after `MultiTenancyMiddleware` (because `UseAuthentication` runs before `UseMultiTenancy` but the OIDC sign‑in handler completes inside the same request as the callback). The dependency on `AbpMultiTenancyModule` is what makes `ICurrentTenant` available inside the `OpenIdConnectEvents.OnTokenValidated` callback so claim merging happens under the correct tenant scope.
+
+## CSP and the `/signout-oidc` exception
+
+ABP enforces a strict Content Security Policy via `AbpSecurityHeadersMiddleware`. Inline scripts must carry a nonce. The OIDC `signout-oidc` callback page (rendered by Microsoft's handler) contains a `<form method="post">` plus a one‑line script that submits it. That script is not under ABP's control — adding the path to `AbpSecurityHeadersOptions.IgnoredScriptNoncePaths` from this module is how the framework opts that single page out of strict CSP.
+
+## Combining with the JWT bearer module
+
+A typical "Web + API" host:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiBootstrapModule),
+    typeof(AbpAspNetCoreAuthenticationOpenIdConnectModule),
+    typeof(AbpAspNetCoreAuthenticationJwtBearerModule)
+)]
+public class MyWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services
+            .AddAuthentication(o => { o.DefaultScheme = "Cookies"; o.DefaultChallengeScheme = "oidc"; })
+            .AddCookie("Cookies", o => o.ExpireTimeSpan = TimeSpan.FromDays(30))
+            .AddJwtBearer(o => { o.Authority = AuthServerUrl; o.Audience = "MyApp"; })
+            .AddAbpOpenIdConnect("oidc", o => { /* as above */ });
+    }
+}
+```
+
+The browser uses cookies; the SPA's AJAX calls use the JWT directly; both pass through `WebRemoteDynamicClaimsPrincipalContributor` so revoked permissions take effect within the cache TTL.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="JWT Bearer" icon="key" href="/aspnetcore/auth-jwt-bearer">
+    Pairs with this module on hosts that expose APIs alongside the Web UI.
+  </Card>
+  <Card title="OAuth helpers" icon="id-badge" href="/aspnetcore/auth-oauth">
+    `MultipleClaimAction` / `RemoveDuplicateClaimAction` used to map OIDC user‑info into the ABP claim shape.
+  </Card>
+  <Card title="Multi‑tenancy" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    `ICurrentTenant` is consulted inside the OIDC callback so local user creation lands in the right tenant.
+  </Card>
+  <Card title="Current user" icon="shield-halved" href="/security/overview">
+    `AbpClaimTypes`, dynamic claim contributors and the principal factory consumed by the OIDC events.
+  </Card>
+</CardGroup>

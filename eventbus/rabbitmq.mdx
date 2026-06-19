@@ -1,0 +1,375 @@
+---
+title: "RabbitMQ Event Bus: Exchanges, Queues, Routing Keys"
+sidebarTitle: "RabbitMQ"
+description: "Configure RabbitMqDistributedEventBus: exchange and queue declaration, routing-key naming, prefetch tuning and the AbpRabbitMqEventBusOptions surface."
+---
+
+`Volo.Abp.EventBus.RabbitMQ` plugs ABP's distributed event bus into a RabbitMQ broker. It registers `RabbitMqDistributedEventBus` in place of the default `LocalDistributedEventBus`, declares a single exchange for all events, and binds one queue per service. The exchange + routing-key approach gives you per-event subscriptions without a queue explosion.
+
+Sources for everything below live under `framework/src/Volo.Abp.EventBus.RabbitMQ/`.
+
+## Package layout
+
+```text
+framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/
+├── AbpEventBusRabbitMqModule.cs
+├── AbpRabbitMqEventBusOptions.cs
+├── IRabbitMqDistributedEventBus.cs
+├── PostConfigureAbpRabbitMqEventBusOptions.cs
+└── RabbitMqDistributedEventBus.cs
+```
+
+The implementation reuses `Volo.Abp.RabbitMQ` for connections (`IConnectionPool`), serialization (`IRabbitMqSerializer`) and the consumer (`IRabbitMqMessageConsumerFactory`).
+
+## `RabbitMqDistributedEventBus`
+
+Registered with `[Dependency(ReplaceServices = true)]`, so it takes over `IDistributedEventBus` once the module is referenced.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(
+    typeof(IDistributedEventBus),
+    typeof(RabbitMqDistributedEventBus),
+    typeof(IRabbitMqDistributedEventBus))]
+public class RabbitMqDistributedEventBus
+    : DistributedEventBusBase, IRabbitMqDistributedEventBus, ISingletonDependency
+{
+    protected AbpRabbitMqEventBusOptions AbpRabbitMqEventBusOptions { get; }
+    protected IConnectionPool ConnectionPool { get; }
+    protected IRabbitMqSerializer Serializer { get; }
+    protected ConcurrentDictionary<Type, List<IEventHandlerFactory>> HandlerFactories { get; }
+    protected ConcurrentDictionary<string, Type> EventTypes { get; }
+    protected IRabbitMqMessageConsumerFactory MessageConsumerFactory { get; }
+    protected IRabbitMqMessageConsumer Consumer { get; private set; } = default!;
+
+    private bool _exchangeCreated;
+}
+```
+
+`EventTypes` is a name → CLR type lookup so the consumer can route by routing key. `HandlerFactories` keeps the subscription list, mirroring the local bus.
+
+## `AbpRabbitMqEventBusOptions`
+
+The whole configuration surface.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/AbpRabbitMqEventBusOptions.cs
+public class AbpRabbitMqEventBusOptions
+{
+    public const string DefaultExchangeType = RabbitMqConsts.ExchangeTypes.Direct;
+
+    public string? ConnectionName { get; set; }
+
+    public string ClientName { get; set; } = default!;
+
+    public string ExchangeName { get; set; } = default!;
+
+    public string? ExchangeType { get; set; }
+
+    public ushort? PrefetchCount { get; set; }
+
+    public IDictionary<string, object?> QueueArguments { get; set; } = new Dictionary<string, object?>();
+
+    public IDictionary<string, object?> ExchangeArguments { get; set; } = new Dictionary<string, object?>();
+
+    public string GetExchangeTypeOrDefault()
+        => string.IsNullOrEmpty(ExchangeType) ? DefaultExchangeType : ExchangeType!;
+}
+```
+
+| Property | Purpose |
+| --- | --- |
+| `ConnectionName` | Key into `IConnectionPool` so multiple brokers can coexist. `null` means default. |
+| `ClientName` | Becomes the **queue name** for the service. Pick something stable per service so restarts reattach to the same queue. |
+| `ExchangeName` | Single exchange that carries every event. |
+| `ExchangeType` | `direct` (default) or `topic`. With `topic` you can wildcard-bind on the routing key. |
+| `PrefetchCount` | Consumer prefetch — back-pressure knob. |
+| `QueueArguments` | Passed verbatim to `QueueDeclare`. |
+| `ExchangeArguments` | Passed verbatim to `ExchangeDeclare`. |
+
+`PostConfigureAbpRabbitMqEventBusOptions` parses common integer and boolean queue arguments (`x-message-ttl`, `x-max-length`, `x-single-active-consumer`, etc.) from `string` to the typed value RabbitMQ.Client expects.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/PostConfigureAbpRabbitMqEventBusOptions.cs (excerpt)
+private readonly HashSet<string> _uint64QueueArguments =
+[
+    "x-delivery-limit",
+    "x-expires",
+    "x-message-ttl",
+    "x-max-length",
+    "x-max-length-bytes",
+    "x-quorum-initial-group-size",
+    "x-quorum-target-group-size",
+    "x-stream-filter-size-bytes",
+    "x-stream-max-segment-size-bytes",
+];
+```
+
+### Configuration
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var configuration = context.Services.GetConfiguration();
+
+    Configure<AbpRabbitMqOptions>(options =>
+    {
+        options.Connections.Default.UserName = "guest";
+        options.Connections.Default.Password = "guest";
+        options.Connections.Default.HostName = "localhost";
+    });
+
+    Configure<AbpRabbitMqEventBusOptions>(options =>
+    {
+        options.ClientName  = "MyApp.OrdersService";   // queue name
+        options.ExchangeName = "MyApp";                // shared exchange
+        options.PrefetchCount = 32;
+        options.QueueArguments["x-message-ttl"] = "60000"; // 60s TTL
+    });
+}
+```
+
+## Initialization
+
+`AbpEventBusRabbitMqModule` calls `RabbitMqDistributedEventBus.Initialize()` from `OnApplicationInitialization`. That method creates the consumer through the factory using the configured exchange and queue declarations, hooks up message processing, and re-subscribes all `Handlers` from `AbpDistributedEventBusOptions`.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs
+public virtual void Initialize()
+{
+    Consumer = MessageConsumerFactory.Create(
+        new ExchangeDeclareConfiguration(
+            AbpRabbitMqEventBusOptions.ExchangeName,
+            type: AbpRabbitMqEventBusOptions.GetExchangeTypeOrDefault(),
+            durable: true,
+            arguments: AbpRabbitMqEventBusOptions.ExchangeArguments),
+        new QueueDeclareConfiguration(
+            AbpRabbitMqEventBusOptions.ClientName,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            prefetchCount: AbpRabbitMqEventBusOptions.PrefetchCount,
+            arguments: AbpRabbitMqEventBusOptions.QueueArguments),
+        AbpRabbitMqEventBusOptions.ConnectionName);
+
+    Consumer.OnMessageReceived(ProcessEventAsync);
+
+    SubscribeHandlers(AbpDistributedEventBusOptions.Handlers);
+}
+```
+
+Three durable, non-exclusive entities are declared:
+
+- **Exchange** named `ExchangeName` of type `ExchangeType` (default `direct`). Shared across all services.
+- **Queue** named `ClientName`, one per service. Survives restarts.
+- **Binding** added per subscribed event type via `Consumer.BindAsync(EventNameAttribute.GetNameOrDefault(eventType))`.
+
+## Subscribe → bind queue
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs
+public override IDisposable Subscribe(Type eventType, IEventHandlerFactory factory)
+{
+    var handlerFactories = GetOrCreateHandlerFactories(eventType);
+
+    if (factory.IsInFactories(handlerFactories))
+    {
+        return NullDisposable.Instance;
+    }
+
+    handlerFactories.Add(factory);
+
+    if (handlerFactories.Count == 1) //TODO: Multi-threading!
+    {
+        Consumer.BindAsync(EventNameAttribute.GetNameOrDefault(eventType));
+    }
+
+    return new EventHandlerFactoryUnregistrar(this, eventType, factory);
+}
+```
+
+The first subscription for a given event triggers a `QueueBind` on the service queue with the event's name as the routing key. Subsequent subscriptions just append a handler factory — the queue is already bound.
+
+### Routing-key naming
+
+Routing keys come from `EventNameAttribute.GetNameOrDefault(eventType)`. With direct exchange (default), each event needs an exact routing-key match. With topic exchange, you can use wildcard binds:
+
+```csharp
+[EventName("orders.order_placed.v1")]
+public class OrderPlacedEto { /* … */ }
+
+// Topic exchange:
+Configure<AbpRabbitMqEventBusOptions>(o => o.ExchangeType = "topic");
+
+// And consumers can listen to any "orders.*" event by binding "orders.#".
+```
+
+## Producing: outbox or direct
+
+`PublishToEventBusAsync` is called either directly by `DistributedEventBusBase` or by `OutboxSender` via `PublishFromOutboxAsync`.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs (excerpt)
+await channel.BasicPublishAsync(
+    exchange: AbpRabbitMqEventBusOptions.ExchangeName,
+    routingKey: eventName,
+    mandatory: false,
+    basicProperties: properties,
+    body: body
+);
+```
+
+Properties on the published message:
+
+- `MessageId` — outgoing event Id (or a fresh `GuidGenerator.Create()` when publishing without outbox). Used by the consumer-side inbox dedup.
+- `CorrelationId` — current `ICorrelationIdProvider` value, propagated end-to-end.
+- `Headers` — any caller-provided headers.
+
+### Exchange declaration is lazy
+
+`EnsureExchangeExistsAsync` does a passive declare first; if the exchange is missing, it declares it as durable. This handles broker resets and first-deploy cases.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs
+protected virtual async Task EnsureExchangeExistsAsync(IChannel channel)
+{
+    if (_exchangeCreated) return;
+
+    try
+    {
+        using (var temporaryChannel = await (await ConnectionPool
+            .GetAsync(AbpRabbitMqEventBusOptions.ConnectionName)).CreateChannelAsync())
+        {
+            await temporaryChannel.ExchangeDeclarePassiveAsync(AbpRabbitMqEventBusOptions.ExchangeName);
+        }
+    }
+    catch (Exception)
+    {
+        await channel.ExchangeDeclareAsync(
+            AbpRabbitMqEventBusOptions.ExchangeName,
+            AbpRabbitMqEventBusOptions.GetExchangeTypeOrDefault(),
+            durable: true);
+    }
+    _exchangeCreated = true;
+}
+```
+
+## Consuming: deliver to inbox or handler
+
+`Consumer.OnMessageReceived(ProcessEventAsync)` wires the receive callback.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.RabbitMQ/Volo/Abp/EventBus/RabbitMq/RabbitMqDistributedEventBus.cs
+private async Task ProcessEventAsync(IChannel channel, BasicDeliverEventArgs ea)
+{
+    var eventName = ea.RoutingKey;
+    var eventType = EventTypes.GetOrDefault(eventName);
+    if (eventType == null) return;
+
+    var eventData = Serializer.Deserialize(ea.Body.ToArray(), eventType);
+
+    var correlationId = ea.BasicProperties.CorrelationId;
+    if (await AddToInboxAsync(ea.BasicProperties.MessageId, eventName, eventType, eventData, correlationId))
+    {
+        return;
+    }
+
+    using (CorrelationIdProvider.Change(correlationId))
+    {
+        await TriggerHandlersDirectAsync(eventType, eventData);
+    }
+}
+```
+
+The flow:
+
+1. **Resolve event type** from the routing key.
+2. **Deserialize** with `IRabbitMqSerializer`.
+3. **Try inbox.** If an `IEventInbox` is configured, append the row and return. `InboxProcessor` will pick it up.
+4. **No inbox?** Run handlers immediately under the carried correlation id.
+
+The `OnAddToOutboxAsync` override registers the event type in `EventTypes` even when publishing through the outbox so consumer-side subscribers can find the type by name.
+
+## Queue and exchange naming patterns
+
+<AccordionGroup>
+  <Accordion title="One exchange per system, one queue per service">
+    `ExchangeName = "MyApp"`, `ClientName = "MyApp.OrdersService"`. Every service binds its own queue to the same exchange. RabbitMQ replicates the message into every subscribed queue.
+  </Accordion>
+  <Accordion title="Topic exchange for category-style routing">
+    `ExchangeType = "topic"` lets you bind `orders.*` or `*.high_priority.*`. Use it when consumers want to subscribe to families of events without listing each one.
+  </Accordion>
+  <Accordion title="Mirror or quorum queues for durability">
+    Pass `x-queue-type: quorum` through `QueueArguments` to upgrade the queue. `PostConfigureAbpRabbitMqEventBusOptions` parses numeric arguments correctly.
+  </Accordion>
+  <Accordion title="Dedicated connections per concern">
+    Set distinct `ConnectionName` values and configure multiple `AbpRabbitMqOptions.Connections` so heavy-traffic events do not starve control-plane events.
+  </Accordion>
+</AccordionGroup>
+
+## Worked example
+
+```csharp
+[DependsOn(typeof(AbpEventBusRabbitMqModule))]
+public class OrdersModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpRabbitMqOptions>(o =>
+        {
+            o.Connections.Default.HostName = "rabbit";
+            o.Connections.Default.UserName = "abp";
+            o.Connections.Default.Password = "abp";
+        });
+
+        Configure<AbpRabbitMqEventBusOptions>(o =>
+        {
+            o.ExchangeName  = "MyApp";
+            o.ClientName    = "MyApp.OrdersService";
+            o.ExchangeType  = "topic";
+            o.PrefetchCount = 32;
+        });
+
+        Configure<AbpDistributedEventBusOptions>(o =>
+        {
+            o.Outboxes.Configure(config => config.UseDbContext<OrdersDbContext>());
+            o.Inboxes.Configure(config => config.UseDbContext<OrdersDbContext>());
+        });
+    }
+}
+
+[EventName("orders.order_placed.v1")]
+public class OrderPlacedEto
+{
+    public Guid OrderId { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class FulfillOrderHandler
+    : IDistributedEventHandler<OrderPlacedEto>, ITransientDependency
+{
+    private readonly IFulfillmentService _fulfillment;
+    public FulfillOrderHandler(IFulfillmentService fulfillment) => _fulfillment = fulfillment;
+
+    public Task HandleEventAsync(OrderPlacedEto eventData)
+        => _fulfillment.StartAsync(eventData.OrderId);
+}
+```
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Distributed Event Bus" icon="network-wired" href="/eventbus/distributed-event-bus">
+    `DistributedEventBusBase`, outbox/inbox details that this bus reuses.
+  </Card>
+  <Card title="Background workers" icon="gears" href="/background/overview">
+    `OutboxSenderManager` and `InboxProcessManager` deliver to and from RabbitMQ.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Outbox rows commit with the business write in the same DbContext.
+  </Card>
+  <Card title="Publication flow" icon="diagram-project" href="/flows/distributed-event-publish-consume">
+    The end-to-end sequence including queue bindings.
+  </Card>
+</CardGroup>

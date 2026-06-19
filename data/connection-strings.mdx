@@ -1,0 +1,354 @@
+---
+title: "Connection Strings: Multi-Database Resolution in ABP"
+sidebarTitle: "Connection Strings"
+description: "Configure AbpDbConnectionOptions, name connection strings, route DbContexts with [ConnectionStringName], resolve per tenant in ABP modules."
+---
+
+ABP's connection‑string model lets one ABP application talk to N databases without you ever hard‑coding a string in a `DbContext`. The pieces are all in `framework/src/Volo.Abp.Data/Volo/Abp/Data/`: `ConnectionStrings`, `AbpDbConnectionOptions`, `IConnectionStringResolver`, `DefaultConnectionStringResolver`, and the `[ConnectionStringName]` attribute. Provider packages and the multi‑tenancy module layer richer resolvers on top.
+
+This page is the routing reference. For class‑level coverage see [`/data/volo-abp-data`](/data/volo-abp-data). For the per‑tenant override path see `/tenancy/connection-strings`. For provider behavior see [`/data/efcore-sqlserver`](/data/efcore-sqlserver) and friends.
+
+## The data model
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStrings.cs
+[Serializable]
+public class ConnectionStrings : Dictionary<string, string?>
+{
+    public const string DefaultConnectionStringName = "Default";
+
+    public string? Default {
+        get => this.GetOrDefault(DefaultConnectionStringName);
+        set => this[DefaultConnectionStringName] = value;
+    }
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConnectionOptions.cs
+public class AbpDbConnectionOptions
+{
+    public ConnectionStrings ConnectionStrings { get; set; }
+    public AbpDatabaseInfoDictionary Databases { get; set; }
+
+    public AbpDbConnectionOptions()
+    {
+        ConnectionStrings = new ConnectionStrings();
+        Databases = new AbpDatabaseInfoDictionary();
+    }
+
+    public string? GetConnectionStringOrNull(
+        string connectionStringName,
+        bool fallbackToDatabaseMappings = true,
+        bool fallbackToDefault = true)
+    {
+        var connectionString = ConnectionStrings.GetOrDefault(connectionStringName);
+        if (!connectionString.IsNullOrEmpty()) return connectionString;
+
+        if (fallbackToDatabaseMappings)
+        {
+            var database = Databases.GetMappedDatabaseOrNull(connectionStringName);
+            if (database != null)
+            {
+                connectionString = ConnectionStrings.GetOrDefault(database.DatabaseName);
+                if (!connectionString.IsNullOrEmpty()) return connectionString;
+            }
+        }
+
+        if (fallbackToDefault)
+        {
+            connectionString = ConnectionStrings.Default;
+            if (!connectionString.IsNullOrWhiteSpace()) return connectionString;
+        }
+
+        return null;
+    }
+}
+```
+
+Two collections matter:
+
+- **`ConnectionStrings`** — the flat `name → connection‑string` map, bound directly from `appsettings.json:ConnectionStrings`.
+- **`Databases`** — a logical mapping layer (an `AbpDatabaseInfoDictionary`). A "database" has a name and can be marked as serving several module connection‑string names. The lookup walks: explicit name → mapped database → `Default`.
+
+`AbpDataModule` binds the options from configuration:
+
+```csharp
+Configure<AbpDbConnectionOptions>(configuration);
+// ...
+Configure<AbpDbConnectionOptions>(options =>
+{
+    options.Databases.RefreshIndexes();
+});
+```
+
+## appsettings.json shape
+
+The most common shape — one database for everything:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=.;Database=MyApp;Trusted_Connection=True;TrustServerCertificate=True"
+  }
+}
+```
+
+Module‑per‑database (audit log in its own DB):
+
+```json
+{
+  "ConnectionStrings": {
+    "Default":      "Server=.;Database=MyApp;Trusted_Connection=True",
+    "AbpAuditLogging": "Server=.;Database=MyApp_Audit;Trusted_Connection=True",
+    "AbpPermissionManagement": "Server=.;Database=MyApp;Trusted_Connection=True",
+    "AbpSettingManagement":    "Server=.;Database=MyApp;Trusted_Connection=True"
+  }
+}
+```
+
+Per‑provider override (PostgreSQL audit, SQL Server main):
+
+```json
+{
+  "ConnectionStrings": {
+    "Default":         "Server=.;Database=MyApp;Trusted_Connection=True",
+    "AbpAuditLogging": "Host=pg;Database=audit;Username=audit;Password=...;"
+  }
+}
+```
+
+## [ConnectionStringName] — naming the DbContext
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringNameAttribute.cs
+public class ConnectionStringNameAttribute : Attribute
+{
+    [NotNull] public string Name { get; }
+
+    public ConnectionStringNameAttribute([NotNull] string name)
+    {
+        Check.NotNull(name, nameof(name));
+        Name = name;
+    }
+
+    public static string GetConnStringName<T>() => GetConnStringName(typeof(T));
+
+    public static string GetConnStringName(Type type)
+    {
+        var nameAttribute = type.GetTypeInfo().GetCustomAttribute<ConnectionStringNameAttribute>();
+        return nameAttribute == null ? type.FullName! : nameAttribute.Name;
+    }
+}
+```
+
+Every framework DbContext carries one:
+
+```csharp
+[ConnectionStringName(AbpIdentityDbProperties.ConnectionStringName)] // "AbpIdentity"
+public class IdentityDbContext : AbpDbContext<IdentityDbContext>, IIdentityDbContext
+{
+    // ...
+}
+```
+
+The provider's `IDbContextProvider<TDbContext>` does the lookup:
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/Uow/EntityFrameworkCore/UnitOfWorkDbContextProvider.cs
+var targetDbContextType = EfCoreDbContextTypeProvider.GetDbContextType(typeof(TDbContext));
+var connectionStringName = ConnectionStringNameAttribute.GetConnStringName(targetDbContextType);
+var connectionString     = await ResolveConnectionStringAsync(connectionStringName);
+var dbContextKey         = $"{targetDbContextType.FullName}_{connectionString}";
+
+var databaseApi = unitOfWork.FindDatabaseApi(dbContextKey);
+if (databaseApi == null) { /* create + register */ }
+```
+
+<Note>
+If you forget `[ConnectionStringName]`, ABP uses `Type.FullName` as the key. That works — but your config key has to match the full type name (`MyCompany.MyApp.EntityFrameworkCore.MyAppDbContext`), which is fragile under refactors. Always set the attribute.
+</Note>
+
+## Resolution order
+
+`DefaultConnectionStringResolver` (the host implementation):
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DefaultConnectionStringResolver.cs
+private string? ResolveInternal(string? connectionStringName)
+{
+    if (connectionStringName == null) return Options.ConnectionStrings.Default;
+
+    var connectionString = Options.GetConnectionStringOrNull(connectionStringName);
+    if (!connectionString.IsNullOrEmpty()) return connectionString;
+    return null;
+}
+```
+
+`AbpDbConnectionOptions.GetConnectionStringOrNull` resolves in this order:
+
+<Steps>
+  <Step title="Exact name match">
+    `ConnectionStrings["AbpIdentity"]` if present.
+  </Step>
+  <Step title="Mapped database fallback">
+    If the name was mapped via `options.Databases` (typically by a module that says "all my modules share `MainDb`"), look up the connection string for the mapped database.
+  </Step>
+  <Step title="Default">
+    `ConnectionStrings["Default"]`.
+  </Step>
+  <Step title="Null (nothing configured)">
+    The provider throws an `AbpException` — usually visible as "A DbContext can only be created inside a unit of work!" or a provider‑specific connection error.
+  </Step>
+</Steps>
+
+## Mapping connection-string names to a database
+
+Useful when you want to keep all of ABP's framework module DbContexts in one place but **declare** the grouping:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpDbConnectionOptions>(options =>
+    {
+        // Logical database called "Main" backs these module connection-string names
+        options.Databases.Configure("Main", db =>
+        {
+            db.MappedConnections.Add("AbpIdentity");
+            db.MappedConnections.Add("AbpPermissionManagement");
+            db.MappedConnections.Add("AbpSettingManagement");
+        });
+    });
+}
+```
+
+Then `appsettings.json` only needs:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=.;Database=MyApp;Trusted_Connection=True",
+    "Main":    "Server=.;Database=MyApp;Trusted_Connection=True"
+  }
+}
+```
+
+And calls for `"AbpIdentity"` resolve through `Main`.
+
+## Per-tenant overrides
+
+In a multi‑tenant deployment, the framework provides a different `IConnectionStringResolver` (typically `MultiTenantConnectionStringResolver`) that consults the current tenant's `ConnectionStrings` collection first and falls back to host settings. See `/tenancy/connection-strings` for the full path. The provider code is unchanged — it still calls `IConnectionStringResolver.ResolveAsync(connectionStringName)`.
+
+```csharp
+// pseudocode of multi-tenant resolver behaviour
+public async Task<string> ResolveAsync(string? name)
+{
+    if (CurrentTenant.Id != null)
+    {
+        var tenant = await TenantStore.FindAsync(CurrentTenant.Id.Value);
+        var cs = tenant?.ConnectionStrings.GetOrDefault(name ?? "Default");
+        if (!cs.IsNullOrEmpty()) return cs!;
+    }
+    return await _defaultResolver.ResolveAsync(name);
+}
+```
+
+## Live probing — IConnectionStringChecker
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringChecker.cs
+public interface IConnectionStringChecker
+{
+    Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString);
+}
+```
+
+Each EF Core provider package ships a real implementation. SQL Server's, for example:
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/Volo/Abp/EntityFrameworkCore/ConnectionStrings/SqlServerConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class SqlServerConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new SqlConnectionStringBuilder(connectionString) { ConnectTimeout = 1 };
+            var oldDatabaseName = connString.InitialCatalog;
+            connString.InitialCatalog = "master";
+
+            await using var conn = new SqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Why two booleans? `Connected = true, DatabaseExists = false` is the "server is up but the DB hasn't been created yet" case — the SaaS host uses this to decide between "create" and "migrate".
+
+## Patterns
+
+<AccordionGroup>
+  <Accordion title="Pin a DbContext to a non-default DB">
+    Put `[ConnectionStringName("AuditDb")]` on the DbContext and add `"AuditDb"` to `appsettings.json`. No code change at the provider level.
+  </Accordion>
+  <Accordion title="Resolve a connection string at runtime">
+    ```csharp
+    public class TenantDiagnostics
+    {
+        private readonly IConnectionStringResolver _resolver;
+        public TenantDiagnostics(IConnectionStringResolver resolver) { _resolver = resolver; }
+
+        public async Task<string> GetCurrentAsync()
+            => await _resolver.ResolveAsync("Default");
+    }
+    ```
+  </Accordion>
+  <Accordion title="Validate at startup">
+    ```csharp
+    var checker = scope.ServiceProvider.GetRequiredService<IConnectionStringChecker>();
+    var resolver = scope.ServiceProvider.GetRequiredService<IConnectionStringResolver>();
+    var cs = await resolver.ResolveAsync();
+    var result = await checker.CheckAsync(cs);
+    if (!result.Connected) throw new InvalidOperationException("DB server unreachable.");
+    if (!result.DatabaseExists) await dbMigrator.MigrateAsync();
+    ```
+  </Accordion>
+  <Accordion title="Per-module overrides without touching appsettings">
+    ```csharp
+    Configure<AbpDbConnectionOptions>(options =>
+    {
+        options.ConnectionStrings["AbpAuditLogging"] =
+            "Host=pg;Database=audit;Username=audit;Password=...;";
+    });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.Data" icon="database" href="/data/volo-abp-data">
+    The full class‑level reference.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Where the resolved connection string is used to create an `EfCoreDatabaseApi`.
+  </Card>
+  <Card title="EF Core integration" icon="elephant" href="/data/entityframeworkcore">
+    `UnitOfWorkDbContextProvider` calls `IConnectionStringResolver`.
+  </Card>
+  <Card title="MongoDB integration" icon="leaf" href="/data/mongodb">
+    Same flow for `MongoUrl` resolution.
+  </Card>
+  <Card title="SQL Server adapter" icon="server" href="/data/efcore-sqlserver">
+    Provider‑specific connection checker.
+  </Card>
+</CardGroup>

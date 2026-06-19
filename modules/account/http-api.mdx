@@ -1,0 +1,338 @@
+---
+title: "Account HTTP API"
+description: "AccountController and ProfileController — the REST surface over IAccountAppService and IProfileAppService."
+---
+
+The **`Volo.Abp.Account.HttpApi`** project exposes the Account application services as ASP.NET Core MVC controllers. The implementation is intentionally minimal: each controller is a one-to-one passthrough that delegates to the application service while picking up ABP's `RemoteService`, `Area`, and `Route` conventions so the dynamic JS / TS / C# proxy generators discover the endpoints automatically.
+
+```text modules/account/src/Volo.Abp.Account.HttpApi/
+Volo/Abp/Account/
+├── AbpAccountHttpApiModule.cs
+├── AccountController.cs
+├── ProfileController.cs
+└── DynamicClaimsController.cs
+```
+
+## `AccountController`
+
+```csharp modules/account/src/Volo.Abp.Account.HttpApi/Volo/Abp/Account/AccountController.cs
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[Route("api/account")]
+public class AccountController : AbpControllerBase, IAccountAppService
+{
+    protected IAccountAppService AccountAppService { get; }
+
+    public AccountController(IAccountAppService accountAppService)
+    {
+        AccountAppService = accountAppService;
+    }
+
+    [HttpPost]
+    [Route("register")]
+    public virtual Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+    {
+        return AccountAppService.RegisterAsync(input);
+    }
+
+    [HttpPost]
+    [Route("send-password-reset-code")]
+    public virtual Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+    {
+        return AccountAppService.SendPasswordResetCodeAsync(input);
+    }
+
+    [HttpPost]
+    [Route("verify-password-reset-token")]
+    public virtual Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input)
+    {
+        return AccountAppService.VerifyPasswordResetTokenAsync(input);
+    }
+
+    [HttpPost]
+    [Route("reset-password")]
+    public virtual Task ResetPasswordAsync(ResetPasswordDto input)
+    {
+        return AccountAppService.ResetPasswordAsync(input);
+    }
+}
+```
+
+### Endpoint table
+
+| Verb | Route | Method | Auth | Purpose |
+|---|---|---|---|---|
+| POST | `/api/account/register` | `RegisterAsync(RegisterDto)` | Anonymous | Create a new local user. Gated by the `Abp.Account.IsSelfRegistrationEnabled` setting. |
+| POST | `/api/account/send-password-reset-code` | `SendPasswordResetCodeAsync(SendPasswordResetCodeDto)` | Anonymous | Generate a reset token and email the user a link. |
+| POST | `/api/account/verify-password-reset-token` | `VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput)` | Anonymous | Read-only check that a token is still valid for the given user id. |
+| POST | `/api/account/reset-password` | `ResetPasswordAsync(ResetPasswordDto)` | Anonymous | Consume the token and persist the new password, rotating the security stamp. |
+
+### Sample requests
+
+<CodeGroup>
+```http Register
+POST /api/account/register HTTP/1.1
+Host: app.example.com
+Content-Type: application/json
+
+{
+  "userName": "alice",
+  "emailAddress": "alice@example.com",
+  "password": "P@ssw0rd!",
+  "appName": "MVC"
+}
+```
+
+```http Forgot password
+POST /api/account/send-password-reset-code HTTP/1.1
+Host: app.example.com
+Content-Type: application/json
+
+{
+  "email": "alice@example.com",
+  "appName": "MVC",
+  "returnUrl": "https://app.example.com/"
+}
+```
+
+```http Verify token
+POST /api/account/verify-password-reset-token HTTP/1.1
+Host: app.example.com
+Content-Type: application/json
+
+{
+  "userId": "8b8a0d3a-3e64-4f0c-b0ff-9b22e9a8f3d4",
+  "resetToken": "CfDJ8B....shortened"
+}
+```
+
+```http Reset
+POST /api/account/reset-password HTTP/1.1
+Host: app.example.com
+Content-Type: application/json
+
+{
+  "userId": "8b8a0d3a-3e64-4f0c-b0ff-9b22e9a8f3d4",
+  "resetToken": "CfDJ8B....shortened",
+  "password": "Newp@ssw0rd!"
+}
+```
+</CodeGroup>
+
+### Behavioural notes
+
+- **No authentication.** Every endpoint on `AccountController` is anonymous. Multi-tenant deployments rely on the standard `__tenant` query / cookie / header resolver to scope the lookup against the right `IdentityUser` table.
+- **Friendly errors → 403/400.** When self-registration is disabled, the service throws `UserFriendlyException` which the ABP exception filter translates into HTTP 403 with a JSON envelope:
+  ```json
+  { "error": { "code": null, "message": "Self registration is not enabled.", "details": null, "data": {} } }
+  ```
+- **Identity result errors → 400.** `CheckErrors()` on a failing `IdentityResult` raises `AbpIdentityResultException`, mapped to HTTP 400 with the localized identity error list.
+- **Reset endpoint is idempotent only until the stamp rotates.** Once `ResetPasswordAsync` succeeds, the same token cannot be replayed because the user's security stamp has changed — the second call returns a 400 with `InvalidToken`.
+
+## `ProfileController`
+
+```csharp modules/account/src/Volo.Abp.Account.HttpApi/Volo/Abp/Account/ProfileController.cs
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[ControllerName("Profile")]
+[Route("/api/account/my-profile")]
+public class ProfileController : AbpControllerBase, IProfileAppService
+{
+    protected IProfileAppService ProfileAppService { get; }
+
+    public ProfileController(IProfileAppService profileAppService)
+    {
+        ProfileAppService = profileAppService;
+    }
+
+    [HttpGet]
+    public virtual Task<ProfileDto> GetAsync()
+    {
+        return ProfileAppService.GetAsync();
+    }
+
+    [HttpPut]
+    public virtual Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+    {
+        return ProfileAppService.UpdateAsync(input);
+    }
+
+    [HttpPost]
+    [Route("change-password")]
+    public virtual Task ChangePasswordAsync(ChangePasswordInput input)
+    {
+        return ProfileAppService.ChangePasswordAsync(input);
+    }
+}
+```
+
+### Endpoint table
+
+| Verb | Route | Method | Auth | Purpose |
+|---|---|---|---|---|
+| GET | `/api/account/my-profile` | `GetAsync()` | `[Authorize]` | Read the authenticated user's profile DTO. |
+| PUT | `/api/account/my-profile` | `UpdateAsync(UpdateProfileDto)` | `[Authorize]` | Update username / email / phone / name / extra properties. |
+| POST | `/api/account/my-profile/change-password` | `ChangePasswordAsync(ChangePasswordInput)` | `[Authorize]` | Add or rotate the local password (rejects external users). |
+
+The `[Authorize]` attribute lives on the `ProfileAppService` class itself; the controller inherits it through the interface implementation contract and the ABP action filter pipeline.
+
+### Sample requests
+
+<CodeGroup>
+```http GET profile
+GET /api/account/my-profile HTTP/1.1
+Host: app.example.com
+Authorization: Bearer eyJhbGciOi...
+```
+
+```http PUT profile
+PUT /api/account/my-profile HTTP/1.1
+Host: app.example.com
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+
+{
+  "userName": "alice",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "surname": "Doe",
+  "phoneNumber": "+15551234567",
+  "concurrencyStamp": "0e7f9d3c-2c2a-4d2e-9c3a-3c9d0b9a1f5e",
+  "extraProperties": { }
+}
+```
+
+```http POST change-password
+POST /api/account/my-profile/change-password HTTP/1.1
+Host: app.example.com
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+
+{
+  "currentPassword": "P@ssw0rd!",
+  "newPassword": "Newp@ssw0rd!"
+}
+```
+</CodeGroup>
+
+### Sample response — `GET /api/account/my-profile`
+
+```json
+{
+  "userName": "alice",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "surname": "Doe",
+  "phoneNumber": "+15551234567",
+  "emailConfirmed": true,
+  "phoneNumberConfirmed": false,
+  "isExternal": false,
+  "hasPassword": true,
+  "concurrencyStamp": "0e7f9d3c-2c2a-4d2e-9c3a-3c9d0b9a1f5e",
+  "extraProperties": { }
+}
+```
+
+The `hasPassword` flag drives the **Current Password** field in the change-password UI — when it is `false`, the page calls `AddPasswordAsync` instead of `ChangePasswordAsync`.
+
+## Conventions in play
+
+The two attributes at the top of every controller deserve a closer look:
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+```
+
+- **`RemoteService`** registers the controller with the ABP API description provider, which feeds the **dynamic client proxy** generators (`abp generate-proxy -t ts | csharp | ng`). The `Name` becomes the proxy module name.
+- **`Area`** segregates the routes under `/api/account/...` from other module surfaces so swagger groups them cleanly.
+- **`[ControllerName("Profile")]`** on `ProfileController` is required because the routing template (`/api/account/my-profile`) does not contain the conventional `[controller]` token, so MVC needs an explicit name for action discovery.
+
+## Disabling the dynamic JS proxy
+
+Because the Razor Pages UI calls these endpoints through `axios` / `abp.ajax`, the ABP framework already ships generated proxies under `wwwroot/client-proxies/account-proxy.js`. The web module suppresses re-generation at startup:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountWebModule.cs
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(AccountRemoteServiceConsts.ModuleName);
+});
+```
+
+This keeps the embedded `account-proxy.js` as the single source of truth on the client and avoids confusion when a downstream app also enables dynamic proxies.
+
+## Putting the controllers in a host
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountHttpApiModule),
+    typeof(AbpAccountApplicationModule),
+    typeof(AbpAspNetCoreMvcModule)
+)]
+public class MyApiHostModule : AbpModule
+{
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var app = context.GetApplicationBuilder();
+        app.UseRouting();
+        app.UseAuthentication();
+        app.UseAuthorization();
+        app.UseConfiguredEndpoints();
+    }
+}
+```
+
+That single registration is enough: the controllers are discovered through the application-part injected by `AbpAccountHttpApiModule`, the routes resolve as listed above, and Swagger / OpenAPI generation works automatically thanks to `RemoteService` metadata.
+
+## Calling the API from a client
+
+<CodeGroup>
+```ts TypeScript proxy
+import { AccountService } from '@abp/ng.account';
+
+constructor(private account: AccountService) {}
+
+register() {
+  this.account.register({
+    userName: 'alice',
+    emailAddress: 'alice@example.com',
+    password: 'P@ssw0rd!',
+    appName: 'Angular'
+  }).subscribe();
+}
+```
+
+```csharp C# proxy
+public class Caller
+{
+    private readonly IAccountAppService _account;
+    public Caller(IAccountAppService account) => _account = account;
+
+    public Task RequestResetAsync(string email)
+        => _account.SendPasswordResetCodeAsync(new SendPasswordResetCodeDto
+        {
+            Email   = email,
+            AppName = "MVC"
+        });
+}
+```
+</CodeGroup>
+
+Both paths work because `Volo.Abp.Account.HttpApi.Client` ships `IAccountAppService` and `IProfileAppService` as remote-service clients that go through the ABP `DynamicHttpProxy` machinery — no manual `HttpClient` plumbing required.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Application services" icon="cog" href="/modules/account/application">
+    The methods these controllers wrap.
+  </Card>
+  <Card title="Razor Pages UI" icon="window" href="/modules/account/web-mvc">
+    The server-rendered counterpart that the proxies coexist with.
+  </Card>
+  <Card title="OpenID Connect authentication" icon="globe" href="/aspnetcore/auth-openidconnect">
+    How a downstream API host validates the tokens used to call `/api/account/my-profile`.
+  </Card>
+  <Card title="Security helpers" icon="lock" href="/security/security-helpers">
+    `ICurrentUser`, `AbpClaimTypes`, and the helpers that translate the bearer token into `CurrentUser.GetId()`.
+  </Card>
+</CardGroup>

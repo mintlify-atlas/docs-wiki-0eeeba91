@@ -1,0 +1,378 @@
+---
+title: "Volo.Abp.Data: Core Data Abstractions and Module Surface"
+sidebarTitle: "Volo.Abp.Data"
+description: "Inside ABP's Volo.Abp.Data package: AbpDataModule, IDataFilter, IDataSeeder, connection strings, concurrency exceptions, and the data migration ETO."
+---
+
+`Volo.Abp.Data` is the small, provider‑independent package every ABP persistence stack depends on. It exposes connection‑string resolution, data filters, the data‑seeding pipeline, the concurrency stamp helper and a couple of integration events used by the migration tooling. The code lives in `framework/src/Volo.Abp.Data/Volo/Abp/Data/` and is consumed by `Volo.Abp.EntityFrameworkCore`, `Volo.Abp.MongoDB`, `Volo.Abp.MemoryDb`, `Volo.Abp.Dapper` and the framework's tenancy and module systems.
+
+This page walks the package class by class so you know exactly what every type does and where it is registered. For the runtime side (UoW, ASP.NET Core middleware) see [`/data/unit-of-work`](/data/unit-of-work). For provider‑specific behavior see [`/data/entityframeworkcore`](/data/entityframeworkcore) and [`/data/mongodb`](/data/mongodb).
+
+## Module surface
+
+`AbpDataModule` (`framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDataModule.cs`) is the entry point:
+
+```csharp
+[DependsOn(
+    typeof(AbpObjectExtendingModule),
+    typeof(AbpUnitOfWorkModule),
+    typeof(AbpEventBusAbstractionsModule)
+)]
+public class AbpDataModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        AutoAddDataSeedContributors(context.Services);
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        Configure<AbpDbConnectionOptions>(configuration);
+
+        context.Services.AddSingleton(typeof(IDataFilter<>), typeof(DataFilter<>));
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbConnectionOptions>(options =>
+        {
+            options.Databases.RefreshIndexes();
+        });
+    }
+}
+```
+
+Three things to notice:
+
+<AccordionGroup>
+  <Accordion title="AbpDbConnectionOptions is bound to the root IConfiguration">
+    `Configure<AbpDbConnectionOptions>(configuration)` binds the entire `ConnectionStrings:` and `Databases:` sections of `appsettings.json` to options. See [`/data/connection-strings`](/data/connection-strings) for the binding shape.
+  </Accordion>
+  <Accordion title="IDataFilter<TFilter> is open-generic, singleton">
+    A single `DataFilter<TFilter>` instance per filter type backs the per‑request `AsyncLocal<DataFilterState>` toggling. The umbrella `IDataFilter` (non‑generic) wraps it in a `ConcurrentDictionary`.
+  </Accordion>
+  <Accordion title="Data seed contributors are auto-discovered">
+    `OnRegistered` watches every DI registration; types assignable to `IDataSeedContributor` are recorded into `AbpDataSeedOptions.Contributors`. You do not need to register them manually — see [`/data/data-seeding`](/data/data-seeding).
+  </Accordion>
+</AccordionGroup>
+
+## IDataFilter — toggling cross-cutting filters
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataFilter.cs
+public interface IDataFilter<TFilter>
+    where TFilter : class
+{
+    IDisposable Enable();
+    IDisposable Disable();
+    bool IsEnabled { get; }
+}
+
+public interface IDataFilter
+{
+    IDisposable Enable<TFilter>()  where TFilter : class;
+    IDisposable Disable<TFilter>() where TFilter : class;
+    bool IsEnabled<TFilter>()      where TFilter : class;
+}
+```
+
+The generic `DataFilter<TFilter>` uses `AsyncLocal<DataFilterState>` (not a static field) so toggles are scoped to the current logical async flow:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataFilter.cs
+public class DataFilter<TFilter> : IDataFilter<TFilter>
+    where TFilter : class
+{
+    private readonly AsyncLocal<DataFilterState> _filter;
+    private readonly AbpDataFilterOptions _options;
+
+    public IDisposable Enable()
+    {
+        if (IsEnabled) return NullDisposable.Instance;
+        _filter.Value!.IsEnabled = true;
+        return new DisposeAction(() => Disable());
+    }
+
+    public IDisposable Disable()
+    {
+        if (!IsEnabled) return NullDisposable.Instance;
+        _filter.Value!.IsEnabled = false;
+        return new DisposeAction(() => Enable());
+    }
+
+    private void EnsureInitialized()
+    {
+        if (_filter.Value != null) return;
+        _filter.Value = _options.DefaultStates.GetOrDefault(typeof(TFilter))?.Clone()
+                       ?? new DataFilterState(true);
+    }
+}
+```
+
+<Warning>
+The `using (DataFilter.Disable<ISoftDelete>())` idiom relies on the `DisposeAction` returned by `Disable()` re‑enabling on dispose. **Don't capture and re‑use the returned `IDisposable` across awaits in unrelated flows** — the `AsyncLocal` may not carry it.
+</Warning>
+
+Default states (e.g. "soft delete enabled, multi‑tenant enabled") are set in `AbpDataFilterOptions`:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDataFilterOptions.cs
+public class AbpDataFilterOptions
+{
+    public Dictionary<Type, DataFilterState> DefaultStates { get; }
+}
+```
+
+Configured via `Configure<AbpDataFilterOptions>(o => o.DefaultStates[typeof(ISoftDelete)] = new DataFilterState(false));` in a module to flip the default. The deep dive is at [`/data/data-filtering`](/data/data-filtering) and the multi‑tenant case at [`/tenancy/data-filtering`](/tenancy/data-filtering).
+
+## IDataSeeder & DataSeedContributorList
+
+`IDataSeeder` runs the registered contributors. `DataSeeder` itself is decorated with `[UnitOfWork]` so the whole pass executes inside one ambient UoW unless the contributor list opts into separate UoWs:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataSeeder.cs
+public class DataSeeder : IDataSeeder, ITransientDependency
+{
+    [UnitOfWork]
+    public virtual async Task SeedAsync(DataSeedContext context)
+    {
+        using (var scope = ServiceScopeFactory.CreateScope())
+        {
+            if (context.Properties.ContainsKey(DataSeederExtensions.SeedInSeparateUow))
+            {
+                var manager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+                foreach (var contributorType in Options.Contributors)
+                {
+                    var options = context.Properties.TryGetValue(...)
+                        ? (AbpUnitOfWorkOptions) uowOptions! : new AbpUnitOfWorkOptions();
+                    var requiresNew = context.Properties.TryGetValue(..., out var obj) && (bool) obj!;
+                    using (var uow = manager.Begin(options, requiresNew))
+                    {
+                        var contributor = (IDataSeedContributor)scope.ServiceProvider
+                            .GetRequiredService(contributorType);
+                        await contributor.SeedAsync(context);
+                        await uow.CompleteAsync();
+                    }
+                }
+            }
+            else
+            {
+                foreach (var contributorType in Options.Contributors)
+                {
+                    var contributor = (IDataSeedContributor)scope.ServiceProvider
+                        .GetRequiredService(contributorType);
+                    await contributor.SeedAsync(context);
+                }
+            }
+        }
+    }
+}
+```
+
+`DataSeedContributorList` is just `List<Type>` — declarative ordering, populated by `AbpDataModule`. See [`/data/data-seeding`](/data/data-seeding) for `IDataSeedContributor`, `DataSeedContext` and the real `IdentityDataSeedContributor`.
+
+## IConnectionStringResolver & DefaultConnectionStringResolver
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringResolver.cs
+public interface IConnectionStringResolver
+{
+    [Obsolete("Use ResolveAsync method.")]
+    string Resolve(string? connectionStringName = null);
+    Task<string> ResolveAsync(string? connectionStringName = null);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DefaultConnectionStringResolver.cs
+public class DefaultConnectionStringResolver : IConnectionStringResolver, ITransientDependency
+{
+    protected AbpDbConnectionOptions Options { get; }
+
+    public DefaultConnectionStringResolver(IOptionsMonitor<AbpDbConnectionOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public virtual Task<string> ResolveAsync(string? connectionStringName = null)
+    {
+        return Task.FromResult(ResolveInternal(connectionStringName))!;
+    }
+
+    private string? ResolveInternal(string? connectionStringName)
+    {
+        if (connectionStringName == null) return Options.ConnectionStrings.Default;
+
+        var connectionString = Options.GetConnectionStringOrNull(connectionStringName);
+        if (!connectionString.IsNullOrEmpty()) return connectionString;
+        return null;
+    }
+}
+```
+
+Multi‑tenant deployments replace this with a tenant‑aware implementation (see `/tenancy/connection-strings`) that consults the current tenant's overrides first and falls back to host settings.
+
+## ConnectionStrings & [ConnectionStringName]
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStrings.cs
+[Serializable]
+public class ConnectionStrings : Dictionary<string, string?>
+{
+    public const string DefaultConnectionStringName = "Default";
+
+    public string? Default {
+        get => this.GetOrDefault(DefaultConnectionStringName);
+        set => this[DefaultConnectionStringName] = value;
+    }
+}
+```
+
+`[ConnectionStringName]` is the attribute every DbContext / MongoDbContext carries so providers can ask `IConnectionStringResolver` for the right entry:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringNameAttribute.cs
+public class ConnectionStringNameAttribute : Attribute
+{
+    [NotNull] public string Name { get; }
+
+    public ConnectionStringNameAttribute([NotNull] string name)
+    {
+        Check.NotNull(name, nameof(name));
+        Name = name;
+    }
+
+    public static string GetConnStringName<T>() => GetConnStringName(typeof(T));
+
+    public static string GetConnStringName(Type type)
+    {
+        var nameAttribute = type.GetTypeInfo().GetCustomAttribute<ConnectionStringNameAttribute>();
+        return nameAttribute == null ? type.FullName! : nameAttribute.Name;
+    }
+}
+```
+
+<Note>
+If you don't put `[ConnectionStringName("X")]` on your DbContext, the framework uses its full type name as the connection‑string key. That's why ABP's own modules ship with `[ConnectionStringName(AbpIdentityDbProperties.ConnectionStringName)]` and similar constants.
+</Note>
+
+The full multi‑database routing path is on [`/data/connection-strings`](/data/connection-strings).
+
+## AbpDbConcurrencyException
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConcurrencyException.cs
+public class AbpDbConcurrencyException : AbpException
+{
+    public AbpDbConcurrencyException() { }
+    public AbpDbConcurrencyException(string message) : base(message) { }
+    public AbpDbConcurrencyException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+```
+
+`AbpDbContext.SaveChangesAsync` catches `DbUpdateConcurrencyException` and rethrows as `AbpDbConcurrencyException` — that translation keeps your application code free of EF Core types. The `ConcurrencyStampExtensions` helper is the companion that keeps the stamp consistent:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/ConcurrencyStampExtensions.cs
+public static class ConcurrencyStampExtensions
+{
+    public static void SetConcurrencyStampIfNotNull(this IHasConcurrencyStamp entity, string? concurrencyStamp)
+    {
+        if (!concurrencyStamp.IsNullOrEmpty())
+        {
+            entity.ConcurrencyStamp = concurrencyStamp!;
+        }
+    }
+}
+```
+
+Application services typically do `entity.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp)` before update — if the client passed an outdated stamp EF Core fires the concurrency check.
+
+## AppliedDatabaseMigrationsEto
+
+Migration ETOs are distributed integration events published when a DbMigrator or tenant database tooling completes a migration pass. The applied event signals downstream services (e.g. a SaaS host that caches schema versions) that they can trust the new schema:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AppliedDatabaseMigrationsEto.cs
+[Serializable]
+[EventName("abp.data.applied_database_migrations")]
+public class AppliedDatabaseMigrationsEto
+{
+    public Guid? TenantId { get; set; }
+    public string? DatabaseName { get; set; }
+}
+```
+
+Its sibling `ApplyDatabaseMigrationsEto` is the request that triggers a tenant migration. Both live next to each other in the package.
+
+## IConnectionStringChecker
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringChecker.cs
+public interface IConnectionStringChecker
+{
+    Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString);
+}
+```
+
+The default `DefaultConnectionStringChecker` returns `Connected = true, DatabaseExists = true`. Provider packages ship a more accurate implementation that opens the connection without a database name and only asserts `DatabaseExists` if `ChangeDatabaseAsync` succeeds — see `SqlServerConnectionStringChecker` covered on [`/data/efcore-sqlserver`](/data/efcore-sqlserver).
+
+## AbpDataMigrationEnvironment
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDataMigrationEnvironment.cs
+public class AbpDataMigrationEnvironment
+{
+}
+```
+
+A marker type. `AbpDataMigrationEnvironmentExtensions` (same folder) provides `IsRunningDbMigrations(this IServiceProvider)` so seed contributors and modules can branch their behavior when the host is the `DbMigrator` console rather than the web application. The framework registers this as a singleton when the migrator boots, and code such as the OpenIddict seeder uses it to suppress event publication during schema seeding.
+
+## Class index
+
+| Type                                  | Role                                                                    |
+| ------------------------------------- | ----------------------------------------------------------------------- |
+| `AbpDataModule`                       | Wires options, registers `IDataFilter<>`, auto‑adds seed contributors.  |
+| `IDataFilter` / `DataFilter`          | Non‑generic dispatcher over per‑filter `IDataFilter<TFilter>`.          |
+| `DataFilter<TFilter>`                 | Per‑filter `AsyncLocal` state.                                          |
+| `AbpDataFilterOptions`                | Per‑filter default state.                                               |
+| `IDataSeeder` / `DataSeeder`          | Runs registered seed contributors inside a UoW.                         |
+| `IDataSeedContributor`                | One unit of seed work.                                                  |
+| `DataSeedContext`                     | TenantId + extensible `Properties` dictionary passed to contributors.   |
+| `DataSeedContributorList`             | Type list, ordered as registered.                                       |
+| `IConnectionStringResolver`           | Async lookup, the only abstraction providers depend on.                 |
+| `DefaultConnectionStringResolver`     | Reads `AbpDbConnectionOptions`.                                         |
+| `ConnectionStrings`                   | `Dictionary<string,string?>` with a typed `Default` accessor.           |
+| `AbpDbConnectionOptions`              | Holds `ConnectionStrings` + `AbpDatabaseInfoDictionary`.                |
+| `ConnectionStringNameAttribute`       | Annotates DbContexts; provides static `GetConnStringName`.              |
+| `AbpDbConcurrencyException`           | Provider‑independent concurrency error.                                 |
+| `ConcurrencyStampExtensions`          | `SetConcurrencyStampIfNotNull` helper.                                  |
+| `AppliedDatabaseMigrationsEto`        | Distributed event raised after migrations apply.                        |
+| `IConnectionStringChecker`            | Live‑probe a connection string.                                         |
+| `AbpDataMigrationEnvironment`         | Marker singleton used to detect "running under DbMigrator".             |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Ambient transactional boundary every provider plugs into.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    Multi‑DB resolution, named entries, `[ConnectionStringName]`.
+  </Card>
+  <Card title="Data filtering" icon="filter" href="/data/data-filtering">
+    `ISoftDelete`, `IMultiTenant` and friends.
+  </Card>
+  <Card title="Data seeding" icon="seedling" href="/data/data-seeding">
+    Real `IdentityDataSeedContributor` walkthrough.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The domain abstraction every provider satisfies.
+  </Card>
+  <Card title="Tenancy: data filtering" icon="building" href="/tenancy/data-filtering">
+    How `IMultiTenant` interacts with `IDataFilter<IMultiTenant>`.
+  </Card>
+</CardGroup>

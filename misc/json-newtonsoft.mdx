@@ -1,0 +1,395 @@
+---
+title: "JSON — Newtonsoft: AbpNewtonsoftJsonSerializer, contract resolvers, DateTime converter"
+sidebarTitle: "JSON — Newtonsoft"
+description: "The Newtonsoft.Json provider for IJsonSerializer. Covers AbpNewtonsoftJsonSerializer, AbpNewtonsoftJsonSerializerOptions, AbpCamelCasePropertyNamesContractResolver, AbpDefaultContractResolver and the AbpDateTimeConverter that normalises DateTime through IClock."
+---
+
+`Volo.Abp.Json.Newtonsoft` is the **Newtonsoft.Json (`Newtonsoft.Json`, aka Json.NET)** provider for ABP's [`IJsonSerializer`](/misc/json) abstraction. When you bring this module in alongside (or instead of) `AbpJsonModule`, every internal serialization in ABP goes through Newtonsoft instead of System.Text.Json.
+
+Why pick it: Newtonsoft has historically broader type support (`JObject`, polymorphic `TypeNameHandling`, custom `IContractResolver`), and is the only realistic choice when you depend on libraries that expect Newtonsoft-decorated objects. The trade-off is throughput — System.Text.Json is generally faster.
+
+Source: `framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/`
+
+## The serializer
+
+```csharp
+// framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/AbpNewtonsoftJsonSerializer.cs
+[Dependency(ReplaceServices = true)]
+public class AbpNewtonsoftJsonSerializer : IJsonSerializer, ITransientDependency
+{
+    protected IRootServiceProvider RootServiceProvider { get; }
+    protected IOptions<AbpNewtonsoftJsonSerializerOptions> Options { get; }
+
+    public AbpNewtonsoftJsonSerializer(
+        IRootServiceProvider rootServiceProvider,
+        IOptions<AbpNewtonsoftJsonSerializerOptions> options)
+    {
+        RootServiceProvider = rootServiceProvider;
+        Options = options;
+    }
+
+    public string Serialize(object obj, bool camelCase = true, bool indented = false)
+        => JsonConvert.SerializeObject(obj, CreateJsonSerializerOptions(camelCase, indented));
+
+    public T Deserialize<T>(string jsonString, bool camelCase = true)
+        => JsonConvert.DeserializeObject<T>(jsonString, CreateJsonSerializerOptions(camelCase))!;
+
+    public object Deserialize(Type type, string jsonString, bool camelCase = true)
+        => JsonConvert.DeserializeObject(jsonString, type, CreateJsonSerializerOptions(camelCase))!;
+```
+
+Two pieces of design carry the weight:
+
+1. **`[Dependency(ReplaceServices = true)]`** — when this module is loaded, its `IJsonSerializer` registration replaces any prior one (notably the System.Text.Json default from `AbpJsonModule`). That's the entire dispatch mechanism.
+2. **`IRootServiceProvider`** — needed because `CreateJsonSerializerOptions` reaches out to resolve `AbpDateTimeConverter` for the *non-camelCase* path. Resolving from the root provider avoids capturing a request-scoped scope inside a long-lived `JsonSerializerSettings`.
+
+### `CreateJsonSerializerOptions` and the cache
+
+```csharp
+private readonly static ConcurrentDictionary<object, JsonSerializerSettings> JsonSerializerOptionsCache =
+    new ConcurrentDictionary<object, JsonSerializerSettings>();
+
+protected virtual JsonSerializerSettings CreateJsonSerializerOptions(bool camelCase = true, bool indented = false)
+{
+    return JsonSerializerOptionsCache.GetOrAdd(new { camelCase, indented }, _ =>
+    {
+        var settings = new JsonSerializerSettings
+        {
+            // Copies every field of Options.Value.JsonSerializerSettings into a fresh instance.
+            ContractResolver         = Options.Value.JsonSerializerSettings.ContractResolver,
+            Converters               = Options.Value.JsonSerializerSettings.Converters,
+            DateFormatHandling       = Options.Value.JsonSerializerSettings.DateFormatHandling,
+            DateTimeZoneHandling     = Options.Value.JsonSerializerSettings.DateTimeZoneHandling,
+            // … ~25 properties copied verbatim
+        };
+
+        if (!camelCase)
+        {
+            // The default contract resolver is AbpCamelCasePropertyNamesContractResolver,
+            // so when camelCase=false we substitute the PascalCase-preserving one.
+            settings.ContractResolver = new AbpDefaultContractResolver(
+                RootServiceProvider.GetRequiredService<AbpDateTimeConverter>()
+                    .SkipDateTimeNormalization());
+        }
+
+        if (indented)
+        {
+            settings.Formatting = Formatting.Indented;
+        }
+
+        return settings;
+    });
+}
+```
+
+Two specific things to notice:
+
+1. **The cache key is `new { camelCase, indented }`** — anonymous types with the same field values are equal, so all calls with `(true, false)` hit the same entry. Hot-path allocations are limited to the boxing of two booleans.
+2. **`Settings` are *deep-copied* per cache entry**. Mutating the cached settings from outside is unsafe (Newtonsoft caches contract resolvers internally), so the serializer never hands them out.
+
+### Why `SkipDateTimeNormalization()` on the PascalCase path?
+
+The default `JsonSerializerSettings.ContractResolver` is `AbpCamelCasePropertyNamesContractResolver`, set in the module's `ConfigureServices`. Its `CreateProperty` attaches the *normalising* `AbpDateTimeConverter` to every `DateTime` property.
+
+When the caller asks for `camelCase: false`, the serializer swaps in `AbpDefaultContractResolver` and attaches a **separate** converter instance whose `SkipDateTimeNormalization()` has been called. The reasoning: when you serialize with PascalCase you're usually targeting an external system that has its own timezone semantics; ABP's per-tenant clock normalisation could double-shift the value.
+
+Both paths use the **same** converter type — only the per-instance toggle differs.
+
+## The options
+
+```csharp
+// framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/AbpNewtonsoftJsonSerializerOptions.cs
+using Newtonsoft.Json;
+
+namespace Volo.Abp.Json.Newtonsoft;
+
+public class AbpNewtonsoftJsonSerializerOptions
+{
+    public JsonSerializerSettings JsonSerializerSettings { get; }
+
+    public AbpNewtonsoftJsonSerializerOptions()
+    {
+        JsonSerializerSettings = new JsonSerializerSettings();
+    }
+}
+```
+
+A single property: an empty `JsonSerializerSettings` you customise via `Configure<AbpNewtonsoftJsonSerializerOptions>(...)`. Add converters, change `TypeNameHandling`, override `NullValueHandling`, etc.:
+
+```csharp
+[DependsOn(typeof(AbpJsonNewtonsoftModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpNewtonsoftJsonSerializerOptions>(opts =>
+        {
+            opts.JsonSerializerSettings.NullValueHandling = NullValueHandling.Ignore;
+            opts.JsonSerializerSettings.Converters.Add(new StringEnumConverter());
+        });
+    }
+}
+```
+
+The framework already installs the contract resolver (see module) and `AbpDateTimeConverter` is attached **per property** by the resolver, so you don't need to add it to `Converters` yourself.
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/AbpJsonNewtonsoftModule.cs
+[DependsOn(typeof(AbpJsonAbstractionsModule), typeof(AbpTimingModule))]
+public class AbpJsonNewtonsoftModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddOptions<AbpNewtonsoftJsonSerializerOptions>()
+            .Configure<IServiceProvider>((options, rootServiceProvider) =>
+            {
+                options.JsonSerializerSettings.ContractResolver =
+                    new AbpCamelCasePropertyNamesContractResolver(
+                        rootServiceProvider.GetRequiredService<AbpDateTimeConverter>()
+                            .SkipDateTimeNormalization());
+            });
+    }
+}
+```
+
+Notice the **`Configure<IServiceProvider>`** overload — this lets the configure callback resolve services from DI, which is needed to grab `AbpDateTimeConverter` (it's `ITransientDependency`, so the IoC container builds it for you).
+
+`AbpTimingModule` is in `[DependsOn]` because `AbpDateTimeConverter` takes `IClock` from that module.
+
+### Why `SkipDateTimeNormalization()` here too?
+
+Same reasoning as before, but in reverse: the resolver attaches a converter that **doesn't normalise**, then the resolver itself walks every property and decides on a per-property basis whether normalisation should apply — using the `DisableDateTimeNormalizationAttribute` heuristic in `AbpDateTimeConverter.ShouldNormalize`. The base converter on the settings is the "don't touch dates" version; the resolver-attached converter on a per-property basis is the "normalise" version.
+
+## `AbpCamelCasePropertyNamesContractResolver`
+
+```csharp
+// framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/AbpCamelCasePropertyNamesContractResolver.cs
+public class AbpCamelCasePropertyNamesContractResolver : CamelCasePropertyNamesContractResolver
+{
+    private readonly AbpDateTimeConverter _dateTimeConverter;
+
+    public AbpCamelCasePropertyNamesContractResolver(AbpDateTimeConverter dateTimeConverter)
+    {
+        _dateTimeConverter = dateTimeConverter;
+
+        NamingStrategy = new CamelCaseNamingStrategy
+        {
+            ProcessDictionaryKeys = false
+        };
+    }
+
+    protected override JsonProperty CreateProperty(MemberInfo member, MemberSerialization memberSerialization)
+    {
+        var property = base.CreateProperty(member, memberSerialization);
+
+        if (AbpDateTimeConverter.ShouldNormalize(member, property))
+        {
+            property.Converter = _dateTimeConverter;
+        }
+
+        return property;
+    }
+}
+```
+
+Two small choices encode a lot:
+
+1. **`ProcessDictionaryKeys = false`** — dictionary keys remain as-is. The default Newtonsoft behaviour is to camelCase them, which corrupts data round-trips where the key carries meaning (`User-Agent`, `Content-Type`, IDs).
+2. **`CreateProperty` attaches the converter** only if `ShouldNormalize` agrees — i.e. the property is a `DateTime` and not decorated with `[DisableDateTimeNormalization]`. The check lives on the converter itself so the resolver doesn't carry policy.
+
+`AbpDefaultContractResolver` is the same pattern, but extends `DefaultContractResolver` (no naming changes).
+
+## `AbpDateTimeConverter`
+
+```csharp
+// framework/src/Volo.Abp.Json.Newtonsoft/Volo/Abp/Json/Newtonsoft/AbpDateTimeConverter.cs
+public class AbpDateTimeConverter : DateTimeConverterBase, ITransientDependency
+{
+    private const string DefaultDateTimeFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss.FFFFFFFK";
+    private readonly DateTimeStyles _dateTimeStyles = DateTimeStyles.RoundtripKind;
+    private readonly CultureInfo _culture = CultureInfo.InvariantCulture;
+    private readonly IClock _clock;
+    private readonly AbpJsonOptions _options;
+    private bool _skipDateTimeNormalization;
+```
+
+The constant `DefaultDateTimeFormat` is the **only** "default DateTime format" in this package. It's used when:
+
+- `AbpJsonOptions.OutputDateTimeFormat` is null or whitespace, and
+- The converter is writing a `DateTime`.
+
+It encodes an ISO-8601 round-trippable string with up to 7 fractional digits and a `K`-style offset (`Z` for UTC, `+HH:MM` otherwise) — the same shape `DateTime.ToString("o")` produces.
+
+### `Read`
+
+```csharp
+public override object? ReadJson(JsonReader reader, Type objectType, object? existingValue, JsonSerializer serializer)
+{
+    var nullable = Nullable.GetUnderlyingType(objectType) != null;
+    if (reader.TokenType == JsonToken.Null)
+    {
+        if (!nullable)
+        {
+            throw new JsonSerializationException($"Cannot convert null value to {objectType.FullName}.");
+        }
+        return null;
+    }
+
+    if (reader.TokenType == JsonToken.Date)
+    {
+        return Normalize(reader.Value!.To<DateTime>());
+    }
+
+    if (reader.TokenType != JsonToken.String)
+    {
+        throw new JsonSerializationException($"Unexpected token parsing date. Expected String, got {reader.TokenType}.");
+    }
+
+    var dateText = reader.Value?.ToString();
+
+    if (dateText.IsNullOrEmpty() && nullable) return null;
+
+    if (_options.InputDateTimeFormats.Any())
+    {
+        foreach (var format in _options.InputDateTimeFormats)
+        {
+            if (DateTime.TryParseExact(dateText, format, _culture, _dateTimeStyles, out var d1))
+            {
+                return Normalize(d1);
+            }
+        }
+    }
+
+    var date = DateTime.Parse(dateText!, _culture, _dateTimeStyles);
+    return Normalize(date);
+}
+```
+
+The flow is: handle null, fast-path `JsonToken.Date`, otherwise treat the token as a string. If `InputDateTimeFormats` is configured, try each one in order; otherwise fall back to `DateTime.Parse` with invariant culture and round-trip styles.
+
+### `Write`
+
+```csharp
+public override void WriteJson(JsonWriter writer, object? value, JsonSerializer serializer)
+{
+    if (value != null) value = Normalize(value.To<DateTime>());
+
+    if (value is DateTime dateTime)
+    {
+        writer.WriteValue(_options.OutputDateTimeFormat.IsNullOrWhiteSpace()
+            ? dateTime.ToString(DefaultDateTimeFormat, _culture)
+            : dateTime.ToString(_options.OutputDateTimeFormat, _culture));
+    }
+    else
+    {
+        throw new JsonSerializationException($"Unexpected value when converting date. Expected DateTime or DateTimeOffset, got {value?.GetType()}.");
+    }
+}
+```
+
+No surprises — normalise then format. The output never carries timezone offset if `OutputDateTimeFormat` doesn't request one, so be explicit.
+
+### `ShouldNormalize`
+
+```csharp
+static internal bool ShouldNormalize(MemberInfo member, JsonProperty property)
+{
+    if (property.PropertyType != typeof(DateTime) &&
+        property.PropertyType != typeof(DateTime?))
+    {
+        return false;
+    }
+
+    return ReflectionHelper.GetSingleAttributeOfMemberOrDeclaringTypeOrDefault<DisableDateTimeNormalizationAttribute>(member) == null;
+}
+```
+
+Two reasons not to normalise:
+
+1. The property isn't `DateTime` or `DateTime?` — the converter shouldn't be attached at all.
+2. The property (or its declaring type) carries `[DisableDateTimeNormalization]`.
+
+The latter is the per-field opt-out used by audit logs and similar "store the original timestamp" cases.
+
+## Putting it together
+
+```mermaid
+flowchart LR
+    A[Application calls<br/>IJsonSerializer.Serialize(obj)]
+    B[AbpNewtonsoftJsonSerializer]
+    C[CreateJsonSerializerOptions<br/>cache lookup]
+    D[ContractResolver:<br/>AbpCamelCasePropertyNamesContractResolver]
+    E[Per-property:<br/>AbpDateTimeConverter]
+    F[IClock.Normalize<br/>(per tenant)]
+    G[AbpJsonOptions<br/>InputDateTimeFormats / OutputDateTimeFormat]
+
+    A --> B --> C --> D --> E
+    E --> F
+    E --> G
+```
+
+For deserialisation the chain runs in reverse: `JsonConvert.DeserializeObject` → resolver picks `AbpDateTimeConverter` → converter normalises through `IClock`.
+
+## Custom converters
+
+Custom converters are added to `AbpNewtonsoftJsonSerializerOptions.JsonSerializerSettings.Converters`:
+
+```csharp
+Configure<AbpNewtonsoftJsonSerializerOptions>(opts =>
+{
+    opts.JsonSerializerSettings.Converters.Add(new MoneyJsonConverter());
+    opts.JsonSerializerSettings.Converters.Add(new StringEnumConverter());
+});
+```
+
+Per-property converters via attributes:
+
+```csharp
+public class Invoice
+{
+    [JsonConverter(typeof(MoneyJsonConverter))]
+    public Money Total { get; set; }
+
+    [DisableDateTimeNormalization]
+    public DateTime IssuedAt { get; set; }   // written as-is, no IClock normalisation
+}
+```
+
+Per-property converters always win over global ones.
+
+## When to pick Newtonsoft over System.Text.Json
+
+| Use case | Pick |
+|---|---|
+| Polymorphism via `TypeNameHandling.Auto` | Newtonsoft |
+| You depend on a library that decorates with `[JsonProperty]` etc. | Newtonsoft |
+| You serialize `JObject` / `JToken` directly | Newtonsoft |
+| Maximum throughput | System.Text.Json |
+| Source-generated `JsonSerializerContext` | System.Text.Json |
+| Smallest dependency surface | System.Text.Json |
+
+The two are not mutually exclusive across the framework: ABP MVC has separate `Volo.Abp.AspNetCore.Mvc.NewtonsoftJson` integration for the MVC pipeline. The choice here only affects `IJsonSerializer` — the abstraction used internally by ABP modules.
+
+## Pitfalls
+
+<Warning>**`InputDateTimeFormats` is order-sensitive.** Specific patterns first. `"yyyy"` ahead of `"yyyy-MM-dd"` will match `"2024"` and lose `MM-dd`.</Warning>
+
+<Warning>**Replacing the contract resolver wholesale.** If you do `opts.JsonSerializerSettings.ContractResolver = new MyResolver();`, you lose the `AbpDateTimeConverter` attachment. Subclass `AbpCamelCasePropertyNamesContractResolver` instead.</Warning>
+
+<Warning>**Hot-reloading settings.** The cached `JsonSerializerSettings` is keyed by `(camelCase, indented)` — changing options at runtime doesn't invalidate the cache. Plan for restart-time configuration only.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="JSON core" icon="brackets-curly" href="/misc/json">
+    `IJsonSerializer`, `AbpJsonOptions`, the provider-dispatch rules.
+  </Card>
+  <Card title="System.Text.Json provider" icon="brackets-curly" href="/misc/json-systemtextjson">
+    Same shape, different engine.
+  </Card>
+  <Card title="Options & configuration" icon="gear" href="/core/options-and-configuration">
+    How `AbpNewtonsoftJsonSerializerOptions` gets layered with `Configure` / `PostConfigure`.
+  </Card>
+</CardGroup>

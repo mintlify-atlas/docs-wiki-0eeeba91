@@ -1,0 +1,214 @@
+---
+title: "ASP.NET Core Serilog Integration — LogContext Enrichers"
+sidebarTitle: "Serilog"
+description: "Volo.Abp.AspNetCore.Serilog — AbpAspNetCoreSerilogModule and AbpSerilogMiddleware adding TenantId, UserId, ClientId and CorrelationId to LogContext."
+---
+
+`Volo.Abp.AspNetCore.Serilog` is a one‑middleware module: it pushes ABP's request‑scope identity onto Serilog's `LogContext` so every log event during the request carries `TenantId`, `UserId`, `ClientId` and `CorrelationId` properties without each log site having to opt in.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.Serilog/Volo/Abp/AspNetCore/Serilog/`.
+
+## `AbpAspNetCoreSerilogModule`
+
+```csharp
+// AbpAspNetCoreSerilogModule.cs
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpAspNetCoreModule)
+)]
+public class AbpAspNetCoreSerilogModule : AbpModule
+{
+}
+```
+
+No `ConfigureServices` — the conventional registrar in `AbpAspNetCoreModule` already registers `AbpSerilogMiddleware` as a transient service because it extends `AbpMiddlewareBase`. The module exists for the `[DependsOn]` declaration only.
+
+## `AbpSerilogMiddleware`
+
+```csharp
+// AbpSerilogMiddleware.cs
+public class AbpSerilogMiddleware : AbpMiddlewareBase, ITransientDependency
+{
+    private readonly ICurrentClient _currentClient;
+    private readonly ICurrentTenant _currentTenant;
+    private readonly ICurrentUser _currentUser;
+    private readonly ICorrelationIdProvider _correlationIdProvider;
+    private readonly AbpAspNetCoreSerilogOptions _options;
+
+    public AbpSerilogMiddleware(
+        ICurrentTenant currentTenant,
+        ICurrentUser currentUser,
+        ICurrentClient currentClient,
+        ICorrelationIdProvider correlationIdProvider,
+        IOptions<AbpAspNetCoreSerilogOptions> options)
+    {
+        _currentTenant = currentTenant;
+        _currentUser = currentUser;
+        _currentClient = currentClient;
+        _correlationIdProvider = correlationIdProvider;
+        _options = options.Value;
+    }
+
+    public async override Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var enrichers = new List<ILogEventEnricher>();
+
+        if (_currentTenant?.Id != null)
+        {
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.TenantId, _currentTenant.Id));
+        }
+        if (_currentUser?.Id != null)
+        {
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.UserId, _currentUser.Id));
+        }
+        if (_currentClient?.Id != null)
+        {
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.ClientId, _currentClient.Id));
+        }
+
+        var correlationId = _correlationIdProvider.Get();
+        if (!string.IsNullOrEmpty(correlationId))
+        {
+            enrichers.Add(new PropertyEnricher(_options.EnricherPropertyNames.CorrelationId, correlationId));
+        }
+
+        using (LogContext.Push(enrichers.ToArray()))
+        {
+            await next(context);
+        }
+    }
+}
+```
+
+The middleware:
+
+1. Pulls the four values from ABP's identity accessors. Each is null when missing (anonymous request, no tenant, no client id) — the enricher is only pushed when the value exists, so log queries can distinguish "no tenant" from "tenant 00000000…".
+2. Uses Serilog's `LogContext.Push(...)` so the property is scoped to the awaited continuation — when `await next(context)` returns and `Dispose()` runs, the properties pop off.
+3. Renders properties via `PropertyEnricher` (constant value) — cheap and allocation‑light.
+
+The `IDisposable` returned by `LogContext.Push` is what makes the properties show up on log events emitted by application services, EF Core queries and other middlewares further down the pipeline.
+
+## `AbpAspNetCoreSerilogOptions`
+
+`AbpAspNetCoreSerilogOptions.cs` is a small options class with one nested property bag, `EnricherPropertyNames`. Defaults:
+
+| Property | Default key |
+| --- | --- |
+| `EnricherPropertyNames.TenantId` | `"TenantId"` |
+| `EnricherPropertyNames.UserId` | `"UserId"` |
+| `EnricherPropertyNames.ClientId` | `"ClientId"` |
+| `EnricherPropertyNames.CorrelationId` | `"CorrelationId"` |
+
+Override them once if your sink expects different names:
+
+```csharp
+Configure<AbpAspNetCoreSerilogOptions>(options =>
+{
+    options.EnricherPropertyNames.TenantId = "tenant_id";
+    options.EnricherPropertyNames.UserId = "user_id";
+    options.EnricherPropertyNames.ClientId = "client_id";
+    options.EnricherPropertyNames.CorrelationId = "correlation_id";
+});
+```
+
+## Wiring it up
+
+The host module calls the extension method that pipes the middleware in:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    // ... other middleware
+    app.UseAuthentication();
+    app.UseMultiTenancy();
+    app.UseUnitOfWork();
+    app.UseAbpSerilogEnrichers();   // <-- AbpSerilogMiddleware
+    app.UseConfiguredEndpoints();
+}
+```
+
+`UseAbpSerilogEnrichers()` is a small extension that resolves the middleware via DI and calls `app.UseMiddleware<AbpSerilogMiddleware>()`. The middleware must run **after** authentication and multi‑tenancy so the property values are populated.
+
+### Why after multi‑tenancy?
+
+The `ICurrentTenant.Id` is only set after `MultiTenancyMiddleware` swaps it in. Pushing Serilog properties before that would log `null` for the entire request even though the request belongs to a tenant.
+
+### Why before unit‑of‑work doesn't matter
+
+The unit‑of‑work middleware doesn't change `CurrentUser` / `CurrentTenant`; ordering relative to UoW is only a matter of whether log events emitted inside the UoW callback carry the properties. Application templates put `UseAbpSerilogEnrichers` after `UseUnitOfWork` to keep the trace context together.
+
+## `ICorrelationIdProvider`
+
+The interface lives in `Volo.Abp.Tracing`. The default implementation, registered by `AbpAspNetCoreModule`, is `AspNetCoreCorrelationIdProvider`: it reads the `X-Correlation-Id` header from the incoming request, or generates a new GUID if missing. Cross‑process callers (HTTP API clients, distributed event bus consumers) forward this id so logs from the upstream process and the downstream service carry the same value.
+
+## How Serilog config consumes the properties
+
+The application template's `Program.cs` typically configures Serilog with `WriteTo.Console(outputTemplate: ...)` referring to the properties:
+
+```csharp
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console(outputTemplate:
+        "[{Timestamp:HH:mm:ss} {Level:u3}] " +
+        "[{CorrelationId}] [tenant:{TenantId}] [user:{UserId}] {Message:lj}{NewLine}{Exception}")
+    .CreateLogger();
+```
+
+`Enrich.FromLogContext()` is what makes the `LogContext.Push(...)` properties visible to sinks — without that line the middleware's enrichers are silently ignored.
+
+## What this module does **not** do
+
+- It does not configure Serilog itself — `Program.cs` does that.
+- It does not log HTTP request/response bodies — see `Serilog.AspNetCore`'s `UseSerilogRequestLogging()` for that.
+- It does not surface log events to other ABP subsystems — `IAuditingManager` and `ISecurityLogManager` have their own storage.
+
+## How the enrichers propagate
+
+Inside an action filter or application service, the `LogContext` push is still active because the awaited middleware continuation has not returned yet. Example:
+
+```csharp
+public class MyAppService : ApplicationService, IMyAppService
+{
+    private readonly ILogger<MyAppService> _logger;
+
+    public MyAppService(ILogger<MyAppService> logger) { _logger = logger; }
+
+    public async Task DoSomethingAsync(Guid id)
+    {
+        _logger.LogInformation("Processing {Id}", id);
+        // log event automatically carries: TenantId, UserId, ClientId, CorrelationId
+    }
+}
+```
+
+The `Enrich.FromLogContext()` call in `Program.cs` (combined with `using LogContext.Push(...)` in the middleware) is what threads the per‑request context to every emitted event.
+
+## EF Core SQL log events also carry the properties
+
+Because `LogContext.Push` is async‑local, every `IDbCommandInterceptor` log event emitted by EF Core during the request is also enriched. This is how dashboards can correlate "user X ran query Y" without coupling the EF Core layer to ABP's identity accessors.
+
+## Background workers and queued operations
+
+`LogContext` is process‑wide; once the request scope returns and `LogContext.Push`'s `IDisposable` is disposed, the properties are popped. Background workers and queued tasks therefore log without these properties — by design — and instead set their own scope (`BackgroundWorker.LogContext` is the typical pattern, see `Volo.Abp.BackgroundWorkers`).
+
+## Subtle correctness point — order with `UseAuthentication`
+
+If `UseAbpSerilogEnrichers` is placed **before** `UseAuthentication`, the very first request's authentication exception (e.g. invalid JWT) would not carry `UserId` (correct, the user is unauthenticated) but also would not carry `TenantId` even when the failure was a tenant resolve error from `CurrentUserTenantResolveContributor` running on a stale claim. Place the middleware after `UseAuthentication` and `UseMultiTenancy` so authentication failures still log `CorrelationId` and authorization failures log both `UserId` and `TenantId`.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Host module" icon="server" href="/aspnetcore/host-module">
+    `AbpMiddlewareBase`, `ICorrelationIdProvider` and the conventional registrar that registers this middleware.
+  </Card>
+  <Card title="Multi‑tenancy middleware" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    Must run before this module's middleware so `ICurrentTenant.Id` is populated.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    Where `UseAbpSerilogEnrichers` sits in the request order.
+  </Card>
+  <Card title="Current user" icon="shield-halved" href="/security/overview">
+    `ICurrentUser.Id` is the source of the `UserId` property.
+  </Card>
+</CardGroup>

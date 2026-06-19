@@ -1,0 +1,561 @@
+---
+title: "Entity Framework Core provider"
+description: "IdentityServerDbContext, the AbpIdentityServerEntityFrameworkCoreModule, repository implementations, and the ConfigureIdentityServer() model builder that materialises the IdentityServer4 schema."
+---
+
+<Info>
+Source root: `modules/identityserver/src/Volo.Abp.IdentityServer.EntityFrameworkCore/`
+
+Reference this provider when your application uses Entity Framework Core. For MongoDB, see [`/modules/identityserver/mongodb`](/modules/identityserver/mongodb). The aggregate roots and repository contracts being implemented here live in the [Domain layer](/modules/identityserver/domain).
+</Info>
+
+## What the package contains
+
+```text
+Volo.Abp.IdentityServer.EntityFrameworkCore/
+└── Volo/Abp/IdentityServer/
+    ├── AbpIdentityServerEfCoreQueryableExtensions.cs   # IncludeDetails helpers
+    ├── ApiResources/ApiResourceRepository.cs
+    ├── ApiScopes/ApiScopeRepository.cs
+    ├── Clients/ClientRepository.cs
+    ├── Devices/DeviceFlowCodesRepository.cs
+    ├── Grants/PersistentGrantRepository.cs
+    ├── IdentityResources/IdentityResourceRepository.cs
+    └── EntityFrameworkCore/
+        ├── AbpIdentityServerEntityFrameworkCoreModule.cs
+        ├── IIdentityServerDbContext.cs
+        ├── IdentityServerDbContext.cs
+        └── IdentityServerDbContextModelCreatingExtensions.cs
+```
+
+There is exactly one repository per [Domain-layer interface](/modules/identityserver/domain#repository-contracts) and one EF Core `DbContext` that exposes a `DbSet` for every aggregate and child entity.
+
+## `AbpIdentityServerEntityFrameworkCoreModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityServerDomainModule),
+    typeof(AbpEntityFrameworkCoreModule)
+)]
+public class AbpIdentityServerEntityFrameworkCoreModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<IIdentityServerBuilder>(
+            builder =>
+            {
+                builder.AddAbpStores();
+            }
+        );
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<IdentityServerDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IIdentityServerDbContext>();
+
+            options.AddRepository<Client, ClientRepository>();
+            options.AddRepository<ApiResource, ApiResourceRepository>();
+            options.AddRepository<ApiScope, ApiScopeRepository>();
+            options.AddRepository<IdentityResource, IdentityResourceRepository>();
+            options.AddRepository<PersistedGrant, PersistentGrantRepository>();
+            options.AddRepository<DeviceFlowCodes, DeviceFlowCodesRepository>();
+        });
+    }
+}
+```
+
+Two important details:
+
+1. **`PreConfigureServices`** — `services.PreConfigure<IIdentityServerBuilder>(b => b.AddAbpStores())` registers the ABP-backed IdentityServer4 stores (`ClientStore`, `ResourceStore`, `PersistedGrantStore`, `DeviceFlowStore`) *before* `AbpIdentityServerDomainModule.ConfigureServices` runs. That is why the domain module's "register in-memory fallback if no `IClientStore` exists" branch never fires when this provider is referenced.
+2. **`AddDefaultRepositories<IIdentityServerDbContext>()`** registers the generic `IRepository<T, Guid>` for every entity in the context, and then the explicit `AddRepository<TAggregate, TRepository>()` lines override the six aggregates with the specialised implementations that expose the contract methods.
+
+## `IIdentityServerDbContext`
+
+The contract used by `EfCoreRepository<IIdentityServerDbContext, T, Guid>` is a thin interface listing every `DbSet`:
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpIdentityServerDbProperties.ConnectionStringName)]
+public interface IIdentityServerDbContext : IEfCoreDbContext
+{
+    #region ApiResource
+    DbSet<ApiResource> ApiResources { get; }
+    DbSet<ApiResourceSecret> ApiResourceSecrets { get; }
+    DbSet<ApiResourceClaim> ApiResourceClaims { get; }
+    DbSet<ApiResourceScope> ApiResourceScopes { get; }
+    DbSet<ApiResourceProperty> ApiResourceProperties { get; }
+    #endregion
+
+    #region ApiScope
+    DbSet<ApiScope> ApiScopes { get; }
+    DbSet<ApiScopeClaim> ApiScopeClaims { get; }
+    DbSet<ApiScopeProperty> ApiScopeProperties { get; }
+    #endregion
+
+    #region IdentityResource
+    DbSet<IdentityResource> IdentityResources { get; }
+    DbSet<IdentityResourceClaim> IdentityClaims { get; }
+    DbSet<IdentityResourceProperty> IdentityResourceProperties { get; }
+    #endregion
+
+    #region Client
+    DbSet<Client> Clients { get; }
+    DbSet<ClientGrantType> ClientGrantTypes { get; }
+    DbSet<ClientRedirectUri> ClientRedirectUris { get; }
+    DbSet<ClientPostLogoutRedirectUri> ClientPostLogoutRedirectUris { get; }
+    DbSet<ClientScope> ClientScopes { get; }
+    DbSet<ClientSecret> ClientSecrets { get; }
+    DbSet<ClientClaim> ClientClaims { get; }
+    DbSet<ClientIdPRestriction> ClientIdPRestrictions { get; }
+    DbSet<ClientCorsOrigin> ClientCorsOrigins { get; }
+    DbSet<ClientProperty> ClientProperties { get; }
+    #endregion
+
+    DbSet<PersistedGrant> PersistedGrants { get; }
+    DbSet<DeviceFlowCodes> DeviceFlowCodes { get; }
+}
+```
+
+- **`[IgnoreMultiTenancy]`** tells ABP not to filter by `TenantId` automatically. IdentityServer configuration is global; per-tenant data is keyed via the `TenantId` claim on persisted grants instead.
+- **`[ConnectionStringName(AbpIdentityServerDbProperties.ConnectionStringName)]`** (the constant value is `"AbpIdentityServer"`) lets you host the IS schema in its own database. ABP looks up `ConnectionStrings:AbpIdentityServer` first, then falls back to `Default`.
+
+`IdentityServerDbContext` is the concrete class — it just inherits `AbpDbContext<IdentityServerDbContext>` and exposes `DbSet { get; set; }` for each interface member.
+
+## The model builder: `ConfigureIdentityServer`
+
+Hosts call `modelBuilder.ConfigureIdentityServer()` from `OnModelCreating` to apply every table mapping. The extension lives in `IdentityServerDbContextModelCreatingExtensions`. A representative slice:
+
+```csharp
+public static void ConfigureIdentityServer(this ModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    if (builder.IsTenantOnlyDatabase())
+    {
+        return; // configuration is host-only; skip in tenant DBs
+    }
+
+    #region Client
+
+    builder.Entity<Client>(b =>
+    {
+        b.ToTable(
+            AbpIdentityServerDbProperties.DbTablePrefix + "Clients",
+            AbpIdentityServerDbProperties.DbSchema);
+
+        b.ConfigureByConvention();
+
+        b.Property(x => x.ClientId).HasMaxLength(ClientConsts.ClientIdMaxLength).IsRequired();
+        b.Property(x => x.ProtocolType).HasMaxLength(ClientConsts.ProtocolTypeMaxLength).IsRequired();
+        b.Property(x => x.ClientName).HasMaxLength(ClientConsts.ClientNameMaxLength);
+        b.Property(x => x.ClientUri).HasMaxLength(ClientConsts.ClientUriMaxLength);
+        b.Property(x => x.Description).HasMaxLength(ClientConsts.DescriptionMaxLength);
+        b.Property(x => x.FrontChannelLogoutUri).HasMaxLength(ClientConsts.FrontChannelLogoutUriMaxLength);
+        b.Property(x => x.BackChannelLogoutUri).HasMaxLength(ClientConsts.BackChannelLogoutUriMaxLength);
+        b.Property(x => x.ClientClaimsPrefix).HasMaxLength(ClientConsts.ClientClaimsPrefixMaxLength);
+
+        b.HasMany(x => x.AllowedScopes).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.ClientSecrets).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.AllowedGrantTypes).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.AllowedCorsOrigins).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.RedirectUris).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.PostLogoutRedirectUris).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.IdentityProviderRestrictions).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.Claims).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+        b.HasMany(x => x.Properties).WithOne().HasForeignKey(x => x.ClientId).IsRequired();
+
+        b.HasIndex(x => x.ClientId);
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    // ... 19 more entities ...
+}
+```
+
+A few patterns are worth knowing because they apply to every entity:
+
+- **`ConfigureByConvention()`** wires up ABP's audit columns, soft-delete filter, and concurrency token.
+- **`ApplyObjectExtensionMappings()`** projects extra properties from the [object-extension](/modules/identityserver/domain#entity-extension-hook) system onto real shadow/table columns.
+- **`IsTenantOnlyDatabase()`** short-circuits the whole method in tenant databases, since IdentityServer configuration is global. The `Account` host typically owns the host DB.
+
+### Child-entity composite keys
+
+Every child of `Client` uses a **composite key** instead of a generated `Guid` so the rows are deduplicated by their content:
+
+```csharp
+builder.Entity<ClientGrantType>(b =>
+{
+    b.ToTable(AbpIdentityServerDbProperties.DbTablePrefix + "ClientGrantTypes",
+        AbpIdentityServerDbProperties.DbSchema);
+    b.ConfigureByConvention();
+    b.HasKey(x => new { x.ClientId, x.GrantType });
+    b.Property(x => x.GrantType).HasMaxLength(ClientGrantTypeConsts.GrantTypeMaxLength).IsRequired();
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<ClientScope>(b =>
+{
+    b.ToTable(AbpIdentityServerDbProperties.DbTablePrefix + "ClientScopes",
+        AbpIdentityServerDbProperties.DbSchema);
+    b.ConfigureByConvention();
+    b.HasKey(x => new { x.ClientId, x.Scope });
+    b.Property(x => x.Scope).HasMaxLength(ClientScopeConsts.ScopeMaxLength).IsRequired();
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<ClientSecret>(b =>
+{
+    b.ToTable(AbpIdentityServerDbProperties.DbTablePrefix + "ClientSecrets",
+        AbpIdentityServerDbProperties.DbSchema);
+    b.ConfigureByConvention();
+    b.HasKey(x => new { x.ClientId, x.Type, x.Value });
+    b.Property(x => x.Type).HasMaxLength(ClientSecretConsts.TypeMaxLength).IsRequired();
+    b.Property(x => x.Value).HasMaxLength(ClientSecretConsts.ValueMaxLength).IsRequired();
+    b.Property(x => x.Description).HasMaxLength(ClientSecretConsts.DescriptionMaxLength);
+    b.ApplyObjectExtensionMappings();
+});
+```
+
+That is why `Client.AddSecret(...)` checks for duplicates implicitly — the database will reject a second row with the same `(ClientId, Type, Value)`.
+
+### Provider-specific tweaks
+
+MySQL and Oracle have shorter string-key limits. The model builder mutates the consts in-place when those providers are detected:
+
+```csharp
+if (IsDatabaseProvider(builder, EfCoreDatabaseProvider.MySql))
+{
+    ClientRedirectUriConsts.RedirectUriMaxLengthValue = 300;
+}
+
+if (IsDatabaseProvider(builder, EfCoreDatabaseProvider.MySql,
+                              EfCoreDatabaseProvider.Oracle))
+{
+    ClientSecretConsts.ValueMaxLength = 300;
+}
+```
+
+This is fine because the const classes use **mutable static properties**, not real `const` literals.
+
+### Operational store mapping
+
+`PersistedGrant` and `DeviceFlowCodes` get the indexes that IS4's store adapters rely on for performance:
+
+```csharp
+builder.Entity<PersistedGrant>(b =>
+{
+    b.ToTable(AbpIdentityServerDbProperties.DbTablePrefix + "PersistedGrants",
+        AbpIdentityServerDbProperties.DbSchema);
+
+    b.Property(x => x.Key).HasMaxLength(PersistedGrantConsts.KeyMaxLength).ValueGeneratedNever();
+    b.Property(x => x.Type).HasMaxLength(PersistedGrantConsts.TypeMaxLength).IsRequired();
+    b.Property(x => x.SubjectId).HasMaxLength(PersistedGrantConsts.SubjectIdMaxLength);
+    b.Property(x => x.SessionId).HasMaxLength(PersistedGrantConsts.SessionIdMaxLength);
+    b.Property(x => x.ClientId).HasMaxLength(PersistedGrantConsts.ClientIdMaxLength).IsRequired();
+    b.Property(x => x.Description).HasMaxLength(PersistedGrantConsts.DescriptionMaxLength);
+    b.Property(x => x.Data).HasMaxLength(PersistedGrantConsts.DataMaxLengthValue).IsRequired();
+
+    b.HasIndex(x => new { x.SubjectId, x.ClientId, x.Type });
+    b.HasIndex(x => new { x.SubjectId, x.SessionId, x.Type });
+    b.HasIndex(x => x.Expiration);
+});
+
+builder.Entity<DeviceFlowCodes>(b =>
+{
+    b.ToTable(AbpIdentityServerDbProperties.DbTablePrefix + "DeviceFlowCodes",
+        AbpIdentityServerDbProperties.DbSchema);
+
+    b.Property(x => x.DeviceCode).HasMaxLength(DeviceFlowCodesConsts.DeviceCodeMaxLength).IsRequired();
+    b.Property(x => x.UserCode).HasMaxLength(DeviceFlowCodesConsts.UserCodeMaxLength).IsRequired();
+    b.Property(x => x.SubjectId).HasMaxLength(DeviceFlowCodesConsts.SubjectIdMaxLength);
+    b.Property(x => x.SessionId).HasMaxLength(DeviceFlowCodesConsts.SessionIdMaxLength);
+    b.Property(x => x.ClientId).HasMaxLength(DeviceFlowCodesConsts.ClientIdMaxLength).IsRequired();
+    b.Property(x => x.Description).HasMaxLength(DeviceFlowCodesConsts.DescriptionMaxLength);
+    b.Property(x => x.Data).HasMaxLength(DeviceFlowCodesConsts.DataMaxLength).IsRequired();
+
+    b.HasIndex(x => new { x.UserCode });
+    b.HasIndex(x => x.DeviceCode).IsUnique();
+    b.HasIndex(x => x.Expiration);
+});
+```
+
+The `Expiration` indexes are what make the `TokenCleanupBackgroundWorker` cheap — the cleanup `DELETE WHERE Expiration < @now` becomes an index seek instead of a table scan.
+
+### Table summary
+
+Every table is prefixed with `IdentityServer` (configurable via `AbpIdentityServerDbProperties.DbTablePrefix`). The list of tables created by `ConfigureIdentityServer()`:
+
+| Aggregate | Table |
+|-----------|-------|
+| `Client` | `IdentityServerClients` |
+| `ClientGrantType` | `IdentityServerClientGrantTypes` |
+| `ClientRedirectUri` | `IdentityServerClientRedirectUris` |
+| `ClientPostLogoutRedirectUri` | `IdentityServerClientPostLogoutRedirectUris` |
+| `ClientScope` | `IdentityServerClientScopes` |
+| `ClientSecret` | `IdentityServerClientSecrets` |
+| `ClientClaim` | `IdentityServerClientClaims` |
+| `ClientIdPRestriction` | `IdentityServerClientIdPRestrictions` |
+| `ClientCorsOrigin` | `IdentityServerClientCorsOrigins` |
+| `ClientProperty` | `IdentityServerClientProperties` |
+| `IdentityResource` | `IdentityServerIdentityResources` |
+| `IdentityResourceClaim` | `IdentityServerIdentityResourceClaims` |
+| `IdentityResourceProperty` | `IdentityServerIdentityResourceProperties` |
+| `ApiResource` | `IdentityServerApiResources` |
+| `ApiResourceSecret` | `IdentityServerApiResourceSecrets` |
+| `ApiResourceClaim` | `IdentityServerApiResourceClaims` |
+| `ApiResourceScope` | `IdentityServerApiResourceScopes` |
+| `ApiResourceProperty` | `IdentityServerApiResourceProperties` |
+| `ApiScope` | `IdentityServerApiScopes` |
+| `ApiScopeClaim` | `IdentityServerApiScopeClaims` |
+| `ApiScopeProperty` | `IdentityServerApiScopeProperties` |
+| `PersistedGrant` | `IdentityServerPersistedGrants` |
+| `DeviceFlowCodes` | `IdentityServerDeviceFlowCodes` |
+
+## `IncludeDetails` helpers
+
+The repositories need to eagerly load child collections when returning a fully-populated aggregate (for example, when IS4 fetches a client to validate a token request). The extension helpers in `AbpIdentityServerEfCoreQueryableExtensions` collect all the includes in one place:
+
+```csharp
+public static IQueryable<Client> IncludeDetails(
+    this IQueryable<Client> queryable, bool include = true)
+{
+    if (!include) return queryable;
+
+    return queryable
+        .Include(x => x.AllowedGrantTypes)
+        .Include(x => x.RedirectUris)
+        .Include(x => x.PostLogoutRedirectUris)
+        .Include(x => x.AllowedScopes)
+        .Include(x => x.ClientSecrets)
+        .Include(x => x.Claims)
+        .Include(x => x.IdentityProviderRestrictions)
+        .Include(x => x.AllowedCorsOrigins)
+        .Include(x => x.Properties);
+}
+
+public static IQueryable<ApiResource> IncludeDetails(
+    this IQueryable<ApiResource> queryable, bool include = true)
+{
+    if (!include) return queryable;
+
+    return queryable
+        .Include(x => x.Secrets)
+        .Include(x => x.UserClaims)
+        .Include(x => x.Scopes)
+        .Include(x => x.Properties);
+}
+```
+
+`ApiScope` and `IdentityResource` get slimmer versions that just include `UserClaims` and `Properties`.
+
+## `ClientRepository`
+
+```csharp
+public class ClientRepository
+    : EfCoreRepository<IIdentityServerDbContext, Client, Guid>, IClientRepository
+{
+    public ClientRepository(IDbContextProvider<IIdentityServerDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<Client> FindByClientIdAsync(
+        string clientId, bool includeDetails = true,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .IncludeDetails(includeDetails)
+            .OrderBy(x => x.ClientId)
+            .FirstOrDefaultAsync(
+                x => x.ClientId == clientId,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Client>> GetListAsync(
+        string sorting, int skipCount, int maxResultCount,
+        string filter, bool includeDetails = false,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .IncludeDetails(includeDetails)
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .OrderBy(sorting.IsNullOrWhiteSpace() ? nameof(Client.ClientName) : sorting)
+            .PageBy(skipCount, maxResultCount)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<string>> GetAllDistinctAllowedCorsOriginsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbContextAsync()).ClientCorsOrigins
+            .Select(x => x.Origin)
+            .Distinct()
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<bool> CheckClientIdExistAsync(
+        string clientId, Guid? expectedId = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .AnyAsync(
+                c => c.Id != expectedId && c.ClientId == clientId,
+                GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Notable: `GetAllDistinctAllowedCorsOriginsAsync` queries the `ClientCorsOrigins` `DbSet` directly (a flat projection) rather than walking the `Client.AllowedCorsOrigins` navigation. This is what powers ABP's CORS lookup with one round-trip.
+
+### Cascading delete
+
+`DeleteAsync(Guid)` is overridden to remove the child rows explicitly because IS4's stores treat the client as the aggregate root:
+
+```csharp
+public async override Task DeleteAsync(
+    Guid id, bool autoSave = false, CancellationToken cancellationToken = default)
+{
+    var dbContext = await GetDbContextAsync();
+
+    foreach (var clientGrantType in dbContext.Set<ClientGrantType>()
+                                             .Where(x => x.ClientId == id))
+    {
+        dbContext.Set<ClientGrantType>().Remove(clientGrantType);
+    }
+
+    foreach (var clientRedirectUri in dbContext.Set<ClientRedirectUri>()
+                                               .Where(x => x.ClientId == id))
+    {
+        dbContext.Set<ClientRedirectUri>().Remove(clientRedirectUri);
+    }
+    // ... ClientPostLogoutRedirectUri, ClientScope, ClientSecret,
+    //     ClientClaim, ClientCorsOrigin, ClientIdPRestriction, ClientProperty
+
+    await base.DeleteAsync(id, autoSave, cancellationToken);
+}
+```
+
+The pattern is repeated for `ApiResource` and `ApiScope` repositories. `PersistentGrantRepository.DeleteAsync(subjectId: ...)` and `DeleteExpirationAsync(maxExpirationDate)` are similar batch wipes.
+
+## `PersistentGrantRepository`
+
+Lean and read-heavy:
+
+```csharp
+public class PersistentGrantRepository
+    : EfCoreRepository<IIdentityServerDbContext, PersistedGrant, Guid>,
+      IPersistentGrantRepository
+{
+    public PersistentGrantRepository(
+        IDbContextProvider<IIdentityServerDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<List<PersistedGrant>> GetListAsync(
+        string subjectId, string sessionId, string clientId, string type,
+        bool includeDetails = false, CancellationToken cancellationToken = default)
+    {
+        return await (await FilterAsync(subjectId, sessionId, clientId, type))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<PersistedGrant> FindByKeyAsync(
+        string key, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                x => x.Key == key,
+                GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+`FilterAsync` is a private helper that composes `WhereIf` predicates against the `(SubjectId, SessionId, ClientId, Type)` tuple. The `(SubjectId, ClientId, Type)` and `(SubjectId, SessionId, Type)` indexes from the model builder cover both projections.
+
+## Adding the module to a host
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityServerEntityFrameworkCoreModule),
+    typeof(AbpIdentityEntityFrameworkCoreModule),
+    typeof(AbpAccountWebIdentityServerModule), // login UI
+    typeof(AbpAspNetCoreMvcModule)
+)]
+public class MyAuthServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseSqlServer();
+        });
+    }
+}
+```
+
+Your application DbContext can either be a subclass of `IdentityServerDbContext` or — more commonly — implement `IIdentityServerDbContext` directly and call `modelBuilder.ConfigureIdentityServer()` in `OnModelCreating`:
+
+```csharp
+public class MyAppDbContext : AbpDbContext<MyAppDbContext>,
+    IIdentityServerDbContext, IIdentityDbContext
+{
+    // DbSet<Client> Clients { get; set; }
+    // ... all the other DbSets from IIdentityServerDbContext
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureIdentityServer();
+        builder.ConfigureIdentity();
+        // ...
+    }
+}
+```
+
+The hosted `Account` host packages this glue for you — see [`/modules/account/identityserver-host`](/modules/account/identityserver-host).
+
+## Connection string isolation
+
+Because `IIdentityServerDbContext` carries `[ConnectionStringName("AbpIdentityServer")]`, you can point IdentityServer data at a different physical database without re-mapping everything:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=...;Database=MyApp;",
+    "AbpIdentityServer": "Server=...;Database=MyApp.IdentityServer;"
+  }
+}
+```
+
+ABP's [connection-string resolver](/data/connection-strings) reads the attribute, looks up the matching key, and binds the right `DbContextOptions` for that DbContext instance.
+
+## Migrations
+
+Generate an EF Core migration the usual way against the host that owns `IdentityServerDbContext`:
+
+```bash
+dotnet ef migrations add Initial_IdentityServer --context IdentityServerDbContext
+dotnet ef database update --context IdentityServerDbContext
+```
+
+Volo's startup templates use a dedicated `DbMigrationService` to run migrations and the `IIdentityResourceDataSeeder` together — see the [Domain page](/modules/identityserver/domain#identityresource) for what the seeder produces.
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="cube" href="/modules/identityserver/domain">
+    The aggregate roots and repository contracts these classes implement.
+  </Card>
+  <Card title="MongoDB provider" icon="leaf" href="/modules/identityserver/mongodb">
+    Same role, document-oriented storage.
+  </Card>
+  <Card title="Identity module" icon="users" href="/modules/identity/overview">
+    Co-located in the same DbContext for most hosts.
+  </Card>
+  <Card title="Account / IS host" icon="house-lock" href="/modules/account/identityserver-host">
+    The opinionated host application that uses this provider end-to-end.
+  </Card>
+  <Card title="OpenIddict (forward path)" icon="shield-check" href="/modules/openiddict/overview" />
+  <Card title="OIDC client" icon="key" href="/aspnetcore/auth-openidconnect" />
+</CardGroup>

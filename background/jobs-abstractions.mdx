@@ -1,0 +1,374 @@
+---
+title: "Background Jobs Abstractions — Contracts and Options"
+sidebarTitle: "Jobs Abstractions"
+description: "The provider‑neutral contracts for Abp background jobs: IBackgroundJob, IBackgroundJobManager, BackgroundJobPriority, AbpBackgroundJobOptions, executer."
+---
+
+`Volo.Abp.BackgroundJobs.Abstractions` is the package every other background‑job package depends on. It defines the **shape of a job**, the **manager** that enqueues one, the **executer** that runs one, and the **options** that describe the set of jobs the application knows about. None of these types touch a database, a queue, or a scheduler — that is the job of the provider packages.
+
+This separation is important: application code (and shared libraries) reference only the abstractions, so swapping `DefaultBackgroundJobManager` for `HangfireBackgroundJobManager` or `RabbitMqBackgroundJobManager` is a host configuration concern, not a code change.
+
+<Info>
+Source: `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/`. Module class is `AbpBackgroundJobsAbstractionsModule`, which depends on `AbpJsonModule` and `AbpMultiTenancyAbstractionsModule`.
+</Info>
+
+## A job is a class that takes a TArgs
+
+The two job interfaces are minimal on purpose. A job is just a class with a single `Execute` (or `ExecuteAsync`) method that takes a strongly‑typed argument object.
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJob.cs
+public interface IBackgroundJob<in TArgs>
+{
+    void Execute(TArgs args);
+}
+
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IAsyncBackgroundJob.cs
+public interface IAsyncBackgroundJob<in TArgs>
+{
+    Task ExecuteAsync(TArgs args);
+}
+```
+
+Two convenience base classes provide an `ILogger`:
+
+```csharp
+// BackgroundJob.cs
+public abstract class BackgroundJob<TArgs> : IBackgroundJob<TArgs>
+{
+    public ILogger<BackgroundJob<TArgs>> Logger { get; set; }
+
+    protected BackgroundJob()
+    {
+        Logger = NullLogger<BackgroundJob<TArgs>>.Instance;
+    }
+
+    public abstract void Execute(TArgs args);
+}
+
+// AsyncBackgroundJob.cs
+public abstract class AsyncBackgroundJob<TArgs> : IAsyncBackgroundJob<TArgs>
+{
+    public ILogger<AsyncBackgroundJob<TArgs>> Logger { get; set; }
+    // ...
+    public abstract Task ExecuteAsync(TArgs args);
+}
+```
+
+The framework discovers job classes automatically during DI registration — every type that implements `IBackgroundJob<>` or `IAsyncBackgroundJob<>` is added to `AbpBackgroundJobOptions` (see below). You do not need to call `AddJob` manually unless you want to override the name.
+
+<Tip>
+Inherit from `AsyncBackgroundJob<TArgs>` for new code. The synchronous variant exists for legacy scenarios; everything in the executor pipeline is `async`.
+</Tip>
+
+## The single producer API
+
+Every provider implements the same one‑method contract:
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJobManager.cs
+public interface IBackgroundJobManager
+{
+    Task<string> EnqueueAsync<TArgs>(
+        TArgs args,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null
+    );
+}
+```
+
+The returned string is a provider‑specific identifier (`Guid` for the default store, Hangfire job id, Quartz job key, etc.) — treat it as opaque.
+
+`BackgroundJobManagerExtensions.IsAvailable()` lets calling code detect whether a real provider is installed:
+
+```csharp
+public static bool IsAvailable(this IBackgroundJobManager backgroundJobManager)
+{
+    return !(ProxyHelper.UnProxy(backgroundJobManager) is NullBackgroundJobManager);
+}
+```
+
+If no module replaces `NullBackgroundJobManager`, `EnqueueAsync` returns immediately without doing anything. This makes optional integration safe in libraries.
+
+## Priority
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/BackgroundJobPriority.cs
+public enum BackgroundJobPriority : byte
+{
+    Low         = 5,
+    BelowNormal = 10,
+    Normal      = 15, // default
+    AboveNormal = 20,
+    High        = 25
+}
+```
+
+Only the `DefaultBackgroundJobManager` honours priority natively — its `InMemoryBackgroundJobStore` orders waiting jobs by `Priority DESC, TryCount ASC, NextTryTime ASC`. The Hangfire and Quartz providers do not have a built‑in priority mechanism, and the RabbitMQ provider's `JobQueue<T>` includes a `TODO: How to handle priority` comment — so treat priority as an optimisation hint that may or may not be respected.
+
+## Naming jobs with attributes
+
+A job's stable string identifier is derived from the argument type's full name unless overridden:
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/BackgroundJobNameAttribute.cs
+public class BackgroundJobNameAttribute : Attribute, IBackgroundJobNameProvider
+{
+    public string Name { get; }
+
+    public BackgroundJobNameAttribute([NotNull] string name)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+    }
+
+    public static string GetName<TJobArgs>() => GetName(typeof(TJobArgs));
+
+    public static string GetName([NotNull] Type jobArgsType)
+    {
+        Check.NotNull(jobArgsType, nameof(jobArgsType));
+
+        return (jobArgsType
+                    .GetCustomAttributes(true)
+                    .OfType<IBackgroundJobNameProvider>()
+                    .FirstOrDefault()
+                    ?.Name
+                ?? jobArgsType.FullName)!;
+    }
+}
+```
+
+Apply it to the **args** type, not the job type:
+
+```csharp
+[BackgroundJobName("emails.welcome")]
+public class WelcomeEmailArgs
+{
+    public Guid UserId { get; set; }
+    public string Email { get; set; } = default!;
+}
+```
+
+That name is what `BackgroundJobInfo.JobName` stores in the database, what the RabbitMQ provider uses to build the queue name (`AbpBackgroundJobs.emails.welcome`), and what `AbpBackgroundJobOptions.GetJob(string)` looks up. Renaming the args type later is breaking unless you pin the name with the attribute.
+
+<Warning>
+Once jobs have been persisted with a given name, changing the name breaks lookup. Add the attribute *before* you ship.
+</Warning>
+
+## AbpBackgroundJobOptions — the registry
+
+`AbpBackgroundJobOptions` is the in‑memory registry that maps `TArgs → JobType` and `JobName → BackgroundJobConfiguration`. It is populated automatically by the abstractions module.
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/AbpBackgroundJobOptions.cs
+public class AbpBackgroundJobOptions
+{
+    public bool IsJobExecutionEnabled { get; set; } = true;
+
+    public Func<Type, string> GetBackgroundJobName { get; set; }
+        = BackgroundJobNameAttribute.GetName;
+
+    public BackgroundJobConfiguration GetJob<TArgs>() { /* ... */ }
+    public BackgroundJobConfiguration GetJob(Type argsType) { /* ... */ }
+    public BackgroundJobConfiguration GetJob(string name) { /* ... */ }
+    public IReadOnlyList<BackgroundJobConfiguration> GetJobs() { /* ... */ }
+
+    public void AddJob<TJob>() { AddJob(typeof(TJob)); }
+    public void AddJob(Type jobType) { /* ... */ }
+    public void AddJob(BackgroundJobConfiguration jobConfiguration) { /* ... */ }
+}
+```
+
+`IsJobExecutionEnabled` is the global kill switch:
+
+- The abstractions module sets it to `false` when `IsDataMigrationEnvironment()` is true, so EF Core migrations do not accidentally start executing jobs.
+- The Hangfire and Quartz modules both check it during `OnPreApplicationInitialization`; if `false`, they swap in a `null` server / no‑op factory so the host does **not** spin up workers but still has a writable manager.
+
+```csharp
+public class BackgroundJobConfiguration
+{
+    public Type ArgsType { get; }
+    public Type JobType { get; }
+    public string JobName { get; }
+
+    public BackgroundJobConfiguration(Type jobType, string jobName)
+    {
+        JobType = jobType;
+        ArgsType = BackgroundJobArgsHelper.GetJobArgsType(jobType);
+        JobName = jobName;
+    }
+}
+```
+
+### Automatic discovery
+
+The abstractions module hooks `services.OnRegistered` so every type ABP registers is checked against the job interfaces:
+
+```csharp
+// AbpBackgroundJobsAbstractionsModule.cs
+private static void RegisterJobs(IServiceCollection services)
+{
+    var jobTypes = new List<Type>();
+
+    services.OnRegistered(context =>
+    {
+        if (ReflectionHelper.IsAssignableToGenericType(context.ImplementationType, typeof(IBackgroundJob<>)) ||
+            ReflectionHelper.IsAssignableToGenericType(context.ImplementationType, typeof(IAsyncBackgroundJob<>)))
+        {
+            jobTypes.Add(context.ImplementationType);
+        }
+    });
+
+    services.Configure<AbpBackgroundJobOptions>(options =>
+    {
+        foreach (var jobType in jobTypes)
+        {
+            options.AddJob(jobType);
+        }
+    });
+}
+```
+
+This means: write a class that implements `IAsyncBackgroundJob<TArgs>`, make sure it is in a module assembly that is loaded, and it will be enqueueable. No `services.AddTransient` or `options.AddJob<T>()` calls required.
+
+## IBackgroundJobExecuter — the consumer pipeline
+
+Every provider eventually hands a `JobExecutionContext` to `IBackgroundJobExecuter`. This is where the actual `Execute`/`ExecuteAsync` method is invoked.
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/IBackgroundJobExecuter.cs
+public interface IBackgroundJobExecuter
+{
+    Task ExecuteAsync(JobExecutionContext context);
+}
+
+// JobExecutionContext.cs
+public class JobExecutionContext : IServiceProviderAccessor
+{
+    public IServiceProvider ServiceProvider { get; }
+    public Type JobType { get; }
+    public object JobArgs { get; }
+    public CancellationToken CancellationToken { get; }
+}
+```
+
+The default implementation `BackgroundJobExecuter` resolves the job from the scoped service provider, finds the right method, and invokes it inside a tenant scope:
+
+```csharp
+public class BackgroundJobExecuter : IBackgroundJobExecuter, ITransientDependency
+{
+    public virtual async Task ExecuteAsync(JobExecutionContext context)
+    {
+        var job = context.ServiceProvider.GetService(context.JobType);
+        if (job == null)
+        {
+            throw new AbpException("The job type is not registered to DI: " + context.JobType);
+        }
+
+        var jobExecuteMethod = context.JobType.GetMethod(nameof(IBackgroundJob<object>.Execute)) ??
+                               context.JobType.GetMethod(nameof(IAsyncBackgroundJob<object>.ExecuteAsync));
+        if (jobExecuteMethod == null)
+        {
+            throw new AbpException(
+                $"Given job type does not implement {typeof(IBackgroundJob<>).Name} or {typeof(IAsyncBackgroundJob<>).Name}. " +
+                "The job type was: " + context.JobType);
+        }
+
+        try
+        {
+            using (CurrentTenant.Change(GetJobArgsTenantId(context.JobArgs)))
+            {
+                var cancellationTokenProvider = context.ServiceProvider
+                    .GetRequiredService<ICancellationTokenProvider>();
+
+                using (cancellationTokenProvider.Use(context.CancellationToken))
+                {
+                    if (jobExecuteMethod.Name == nameof(IAsyncBackgroundJob<object>.ExecuteAsync))
+                    {
+                        await ((Task)jobExecuteMethod.Invoke(job, new[] { context.JobArgs })!);
+                    }
+                    else
+                    {
+                        jobExecuteMethod.Invoke(job, new[] { context.JobArgs });
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogException(ex);
+
+            await context.ServiceProvider
+                .GetRequiredService<IExceptionNotifier>()
+                .NotifyAsync(new ExceptionNotificationContext(ex));
+
+            throw new BackgroundJobExecutionException(
+                "A background job execution is failed. See inner exception for details.", ex)
+            {
+                JobType = context.JobType.AssemblyQualifiedName!,
+                JobArgs = context.JobArgs
+            };
+        }
+    }
+
+    protected virtual Guid? GetJobArgsTenantId(object jobArgs)
+    {
+        return jobArgs switch
+        {
+            IMultiTenant multiTenantJobArgs => multiTenantJobArgs.TenantId,
+            _ => CurrentTenant.Id
+        };
+    }
+}
+```
+
+A few details worth highlighting:
+
+- The job is resolved from `context.ServiceProvider`, which is **scoped** — each execution gets a fresh `IUnitOfWorkManager`, current tenant accessor, repositories, and so on.
+- If `JobArgs` implements `IMultiTenant`, the tenant is restored from the args before execution. This is the only thing that keeps multi‑tenant jobs correct.
+- Any exception is wrapped in `BackgroundJobExecutionException` and re‑thrown. Providers catch this specific type to drive retry logic — see [`/background/jobs-default`](/background/jobs-default).
+- Exceptions are also pushed to `IExceptionNotifier`, so audit logging and error reporting hook in automatically.
+
+## Module wiring
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/AbpBackgroundJobsAbstractionsModule.cs
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpMultiTenancyAbstractionsModule)
+)]
+public class AbpBackgroundJobsAbstractionsModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        RegisterJobs(context.Services);
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        if (context.Services.IsDataMigrationEnvironment())
+        {
+            Configure<AbpBackgroundJobOptions>(options =>
+            {
+                options.IsJobExecutionEnabled = false;
+            });
+        }
+    }
+}
+```
+
+`AbpBackgroundJobsAbstractionsModule` does **not** register `NullBackgroundJobManager` or a real executer — the abstractions package only registers job types and the options. The default executer (`BackgroundJobExecuter`) is registered by virtue of `[ITransientDependency]` once the package is loaded.
+
+## What you do not get from this package
+
+- **No job storage.** Adding `AbpBackgroundJobsModule` (in‑process), Hangfire, Quartz, or RabbitMQ provides the storage.
+- **No worker.** The poller is in `Volo.Abp.BackgroundJobs`; the cron triggers are in the integration packages.
+- **No retry policy.** That is provider‑specific (`AbpBackgroundJobWorkerOptions.DefaultWaitFactor` / `AbpBackgroundJobQuartzOptions.RetryStrategy` / RabbitMQ requeue).
+
+## Cross‑links
+
+- [`/background/jobs-default`](/background/jobs-default) — the default in‑process manager and worker.
+- [`/background/jobs-hangfire`](/background/jobs-hangfire) — Hangfire provider.
+- [`/background/jobs-quartz`](/background/jobs-quartz) — Quartz provider.
+- [`/background/jobs-rabbitmq`](/background/jobs-rabbitmq) — RabbitMQ provider.
+- [`/modules/background-jobs/overview`](/modules/background-jobs/overview) — EF Core / Mongo store modules.
+- [`/flows/background-job-execution`](/flows/background-job-execution) — end‑to‑end execution flow.

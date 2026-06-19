@@ -1,0 +1,301 @@
+---
+title: "Http.Client.Web — MVC Frontend Re-Exposes Client Proxies"
+sidebarTitle: "Client Web"
+description: "Volo.Abp.Http.Client.Web: lets an MVC host expose IHttpClientProxy-backed application services as auto-controllers so the UI calls them via one gateway."
+---
+
+`Volo.Abp.Http.Client.Web` solves a specific microservice-frontend problem: your MVC site already holds dynamic *client* proxies for `IBookAppService` (pointing at a `BookService` microservice), and you want the JavaScript / jQuery UI in that same MVC site to call `/api/app/book` *on the MVC host*, which then forwards to the microservice using the user's already-authenticated cookie. Rather than write hand-coded gateway controllers, this package teaches the MVC conventions to *also* surface `ClientProxyBase<TService>` subclasses as controllers — so the same dynamic proxy becomes both a C# client and an HTTP endpoint.
+
+Module path: `framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/`.
+
+## `AbpHttpClientWebModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(AbpHttpClientModule)
+)]
+public class AbpHttpClientWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(
+            ServiceDescriptor.Transient<IAbpServiceConvention, AbpHttpClientProxyServiceConvention>());
+        context.Services.AddTransient<AbpHttpClientProxyServiceConvention>();
+
+        var partManager = context.Services.GetSingletonInstance<ApplicationPartManager>();
+        partManager.FeatureProviders.Add(new AbpHttpClientProxyControllerFeatureProvider());
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var partManager = context.ServiceProvider.GetRequiredService<ApplicationPartManager>();
+        foreach (var moduleAssembly in context
+            .ServiceProvider
+            .GetRequiredService<IModuleContainer>()
+            .Modules
+            .SelectMany(m => m.AllAssemblies)
+            .Where(a => a.GetTypes().Any(AbpHttpClientProxyHelper.IsClientProxyService))
+            .Distinct())
+        {
+            partManager.ApplicationParts.AddIfNotContains(moduleAssembly);
+        }
+    }
+}
+```
+
+Three moving parts:
+
+1. **Replaces** `IAbpServiceConvention` with `AbpHttpClientProxyServiceConvention` — the convention now knows about client-proxy controllers.
+2. **Adds** `AbpHttpClientProxyControllerFeatureProvider` to the MVC `ApplicationPartManager` — this is what teaches MVC that `BookClientProxy : ClientProxyBase<IBookAppService>` is in fact a controller class.
+3. On startup, walks every loaded ABP module's assemblies and registers them as `ApplicationParts` if they contain at least one `ClientProxyBase<>` subclass — without this, the feature provider wouldn't see them.
+
+## `AbpHttpClientProxyHelper`
+
+The detector used everywhere:
+
+```csharp
+public static class AbpHttpClientProxyHelper
+{
+    public static bool IsClientProxyService(Type type)
+    {
+        return typeof(IApplicationService).IsAssignableFrom(type) &&
+            type.GetBaseClasses().Any(x =>
+                x.IsGenericType && x.GetGenericTypeDefinition() == typeof(ClientProxyBase<>));
+    }
+}
+```
+
+A class is "a client-proxy service" iff it implements `IApplicationService` (so it has the right semantic surface) *and* derives from `ClientProxyBase<>` (so it has the right HTTP dispatch surface). The dynamic-proxy variant doesn't show up here because it's a Castle-generated wrapper around the original interface, not a `ClientProxyBase<>` subclass.
+
+## `AbpHttpClientProxyServiceConvention`
+
+The convention class is a subclass of `AbpServiceConvention` (the standard MVC auto-controller convention) that **only** processes the client-proxy controllers. Excerpts:
+
+```csharp
+[DisableConventionalRegistration]
+public class AbpHttpClientProxyServiceConvention : AbpServiceConvention
+{
+    protected readonly IClientProxyApiDescriptionFinder ClientProxyApiDescriptionFinder;
+    protected readonly List<ControllerModel> ControllerWithAttributeRoute;
+    protected readonly List<ActionModel> ActionWithAttributeRoute;
+    protected readonly AbpHttpClientStaticProxyingOptions StaticProxyingOptions;
+
+    public AbpHttpClientProxyServiceConvention(
+        IOptions<AbpAspNetCoreMvcOptions> options,
+        IConventionalRouteBuilder conventionalRouteBuilder,
+        IClientProxyApiDescriptionFinder clientProxyApiDescriptionFinder,
+        IOptions<AbpHttpClientStaticProxyingOptions> staticProxyingOptions)
+        : base(options, conventionalRouteBuilder)
+    {
+        ClientProxyApiDescriptionFinder = clientProxyApiDescriptionFinder;
+        StaticProxyingOptions = staticProxyingOptions.Value;
+        ControllerWithAttributeRoute = new List<ControllerModel>();
+        ActionWithAttributeRoute = new List<ActionModel>();
+    }
+
+    protected override IList<ControllerModel> GetControllers(ApplicationModel application)
+    {
+        return application.Controllers
+            .Where(c => !AbpHttpClientProxyHelper.IsClientProxyService(c.ControllerType)).ToList();
+    }
+
+    protected virtual IList<ControllerModel> GetClientProxyControllers(ApplicationModel application)
+    {
+        return application.Controllers
+            .Where(c => AbpHttpClientProxyHelper.IsClientProxyService(c.ControllerType)).ToList();
+    }
+
+    protected override void ApplyForControllers(ApplicationModel application)
+    {
+        base.ApplyForControllers(application);
+
+        foreach (var controller in GetClientProxyControllers(application))
+        {
+            if (ShouldBeRemove(application, controller))
+            {
+                application.Controllers.Remove(controller);
+                continue;
+            }
+
+            controller.ControllerName = controller.ControllerName.RemovePostFix("ClientProxy");
+
+            var controllerApiDescription = FindControllerApiDescriptionModel(controller);
+            if (controllerApiDescription != null
+                && !controllerApiDescription.ControllerGroupName.IsNullOrWhiteSpace())
+            {
+                controller.ControllerName = controllerApiDescription.ControllerGroupName!;
+            }
+
+            ConfigureClientProxySelector(controller);
+            ConfigureClientProxyApiExplorer(controller);
+            ConfigureParameters(controller);
+        }
+    }
+}
+```
+
+The flow per controller:
+
+<Steps>
+  <Step title="Skip duplicates">
+    `ShouldBeRemove` removes a client-proxy controller if the same `IApplicationService` interface is already implemented by a *real* controller in the same app — so an MVC host that hosts the service directly never accidentally double-exposes it.
+  </Step>
+  <Step title="Strip the `ClientProxy` suffix">
+    `BookClientProxy` becomes `Book` — so the auto-generated route is `/api/app/book/...` and not `/api/app/bookClientProxy/...`.
+  </Step>
+  <Step title="Use the grouped name from the upstream description">
+    If the **microservice that owns the real controller** declared a `[ControllerName]` or grouping, the same name wins here.
+  </Step>
+  <Step title="Configure route selector & API explorer">
+    Builds the conventional route, copies HTTP-method metadata, and registers Swagger metadata so the proxy controller shows up in the host's `swagger.json`.
+  </Step>
+  <Step title="Configure parameters">
+    Walks `action.Parameters`, applies `[FromQuery]` to any type in `AbpHttpClientStaticProxyingOptions.BindingFromQueryTypes`, and lets the base convention handle the rest (`[FromBody]`, `[FromRoute]`, …).
+  </Step>
+</Steps>
+
+### `ConfigureParameters`
+
+The override is small but essential:
+
+```csharp
+protected override void ConfigureParameters(ControllerModel controller)
+{
+    foreach (var action in controller.Actions)
+    {
+        foreach (var prm in action.Parameters)
+        {
+            if (prm.BindingInfo != null) continue;
+
+            if (StaticProxyingOptions.BindingFromQueryTypes.Contains(prm.ParameterInfo.ParameterType))
+            {
+                prm.BindingInfo = BindingInfo.GetBindingInfo(new[] { new FromQueryAttribute() });
+            }
+        }
+    }
+
+    base.ConfigureParameters(controller);
+}
+```
+
+Because a `ClientProxyBase<>` method signature is `Task<PagedResultDto<X>> GetListAsync(GetListInput input)`, the framework needs to pick a binding source for `input`. Whitelisted query-string types win; everything else falls through to the base convention's `[FromBody]` defaulting.
+
+## `AbpHttpClientProxyControllerFeatureProvider`
+
+This is the MVC plumbing that says "yes, treat `BookClientProxy` as a controller". The default `ControllerFeatureProvider` rejects classes whose name doesn't end in `Controller` *and* whose type isn't decorated with `[Controller]`. This feature provider relaxes that test for any class detected by `AbpHttpClientProxyHelper.IsClientProxyService`.
+
+## End-to-end picture
+
+```text
+Browser  ─► MVC host  ─► IBookAppService (DI binding)
+                        └── BookClientProxy : ClientProxyBase<IBookAppService>
+                            └── HttpClient ─► BookService microservice
+```
+
+What changes when you add `AbpHttpClientWebModule`:
+
+```text
+Browser ─► MVC host /api/app/book/...     ← surfaced by AbpHttpClientProxyServiceConvention
+            └── BookClientProxy           ← serves the HTTP request AS a controller
+                  └── ClientProxyBase     ← turns it into an outgoing HttpClient call
+                        └── microservice  ← same forwarding as before
+```
+
+The MVC host's auth pipeline (cookie + `Microsoft.AspNetCore.Authentication.JwtBearer`) handles the **inbound** authentication; the [IdentityModel client authenticator](/http/http-client-identitymodel) handles the **outbound** authentication; the microservice's [JWT bearer middleware](/aspnetcore/auth-jwt-bearer) validates it on the far side.
+
+## Wiring example
+
+A typical MVC host module that uses this package looks like:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpHttpClientWebModule),
+    typeof(AbpHttpClientIdentityModelWebModule),
+    typeof(BookHttpApiClientModule))]
+public class BookWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        Configure<AbpAspNetCoreMvcOptions>(o =>
+        {
+            // Optional: re-expose client-proxy controllers under a custom prefix
+            o.ConventionalControllers
+                .Create(typeof(BookContractsModule).Assembly,
+                    opts => { opts.RootPath = "books"; });
+        });
+    }
+}
+```
+
+What happens at runtime:
+
+<Steps>
+  <Step title="ABP boots and loads BookHttpApiClientModule">
+    `AddHttpClientProxies(typeof(BookContractsModule).Assembly, "Default")` registers Castle proxies for every `IRemoteService` in the assembly.
+  </Step>
+  <Step title="AbpHttpClientWebModule kicks in">
+    The replacement `AbpHttpClientProxyServiceConvention` runs during MVC startup, picks up the Castle proxy *classes* (the synthesized concrete types), and emits controllers for them.
+  </Step>
+  <Step title="Routes resolve">
+    Inbound `GET /api/app/book/...` hits the synthesized `BookClientProxy` *as a controller*. The controller action is the `BookClientProxy.GetListAsync` method.
+  </Step>
+  <Step title="Outbound call goes out">
+    `GetListAsync` is the same `ClientProxyBase<IBookAppService>` method that performs the outbound HTTP call to the microservice — completing the round trip.
+  </Step>
+</Steps>
+
+## Static vs. dynamic proxies
+
+`AbpHttpClientProxyHelper.IsClientProxyService` matches only `ClientProxyBase<>` subclasses. That means:
+
+| Generated by | Visible to convention? |
+| --- | --- |
+| `AddStaticHttpClientProxies(asm)` → concrete `BookClientProxy : ClientProxyBase<IBookAppService>` | ✅ Yes |
+| `AddHttpClientProxies(asm)` → Castle proxy of `IBookAppService` | ❌ No |
+
+So the Web convention package is **paired with static proxy generation**. The recommended workflow is:
+
+1. Run `abp generate-proxy -t csharp` on the microservice to create `BookClientProxy.cs` in your `*HttpApi.Client` project.
+2. Register the assembly with `AddStaticHttpClientProxies`.
+3. Reference the generated assembly from the MVC host so `AbpHttpClientWebModule` can lift the proxies into controllers.
+
+## Auth forwarding
+
+Because the synthesized controller runs inside the MVC host's auth pipeline, ABP's standard `[Authorize]` / `[AllowAnonymous]` metadata flows through transparently:
+
+```csharp
+public interface IBookAppService : IApplicationService
+{
+    [Authorize(BookPermissions.Default)]
+    Task<PagedResultDto<BookDto>> GetListAsync(GetBookListInput input);
+}
+```
+
+When the MVC host re-exposes `IBookAppService` via `BookClientProxy`, the `[Authorize]` attribute on the **interface** propagates to the controller action so the MVC host's policy engine rejects unauthorized callers *before* the outbound HTTP call ever leaves the process.
+
+For the outbound leg, `IRemoteServiceHttpClientAuthenticator` attaches the user's bearer token to the request — see [Http.Client.IdentityModel](/http/http-client-identitymodel).
+
+
+
+## Swagger and discoverability
+
+`AbpHttpClientProxyServiceConvention.ConfigureClientProxyApiExplorer` makes the synthesized controllers visible to `Swashbuckle` — so the MVC host's `swagger.json` advertises every proxied endpoint as if it were a native controller. That means your developers can browse `/swagger` on the MVC host and see the same surface area available on the microservice, without leaving the host's origin (and avoiding CORS in dev).
+
+## When *not* to use this package
+
+- If your front-end is Blazor WebAssembly or Angular, it should call the microservice **directly** (CORS + JWT) — no MVC host in the middle. Reference `Volo.Abp.Http.Client.IdentityModel.WebAssembly` instead.
+- If your microservice is on a different audience and you don't want the MVC host to handle audience exchange, host an actual gateway (e.g. YARP) instead.
+- If the MVC host owns the application service in-process, you don't need a `ClientProxy` at all — direct DI binding wins.
+
+## Related
+
+- [Http.Client](/http/http-client) — `ClientProxyBase<TService>` and how `Request*` methods work.
+- [Http.Client.IdentityModel](/http/http-client-identitymodel) — supplies `IRemoteServiceHttpClientAuthenticator` so the outbound call carries a bearer token.
+- [MVC Controllers and Conventions](/aspnetcore/mvc-controllers-and-conventions) — the base `AbpServiceConvention` this convention extends.
+- [Auth — OpenID Connect](/aspnetcore/auth-openidconnect) — how the MVC host obtains the token it forwards.
+- [Auth — JWT Bearer](/aspnetcore/auth-jwt-bearer) — validates the forwarded token on the microservice.
+- [Dynamic HTTP API and Proxy Generation](/aspnetcore/mvc-controllers-and-conventions) — the end-to-end flow.

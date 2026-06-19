@@ -1,0 +1,342 @@
+---
+title: "HTTP API & Client Proxies"
+description: "EmailSettingsController, TimeZoneSettingsController, and the generated static client proxies under /api/setting-management/."
+---
+
+The HTTP API is a thin wrapper: every controller method delegates 1‑to‑1 to the matching `IEmailSettingsAppService` / `ITimeZoneSettingsAppService` from [Application](/modules/setting-management/application). Two assemblies:
+
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi) — controllers
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client) — generated `ClientProxyBase<T>` implementations
+
+## Remote-service identity
+
+Both layers key off the constants in `Volo.Abp.SettingManagement.Application.Contracts`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/SettingManagementRemoteServiceConsts.cs
+public class SettingManagementRemoteServiceConsts
+{
+    public const string RemoteServiceName = "SettingManagement";
+    public const string ModuleName = "settingManagement";
+}
+```
+
+- `RemoteServiceName = "SettingManagement"` is matched in `appsettings.json` under `RemoteServices:SettingManagement:BaseUrl` so a microservice host can point the HTTP client at a different base address than the default.
+- `ModuleName = "settingManagement"` is the `[Area(...)]` value used by the dynamic-controller and Swagger-grouping logic, and it is the key disabled on the JavaScript proxy options (see below).
+
+## Module wiring
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/
+//   Volo/Abp/SettingManagement/AbpSettingManagementHttpApiModule.cs
+[DependsOn(
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpSettingManagementHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpSettingManagementHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpSettingManagementResource>()
+                .AddBaseTypes(
+                    typeof(AbpUiResource)
+                );
+        });
+    }
+}
+```
+
+`AddApplicationPartIfNotExists` is what makes ASP.NET Core MVC discover the controllers in this assembly even though the host only references `AbpSettingManagementHttpApiModule` transitively. The localization tweak makes `AbpSettingManagementResource` inherit the standard `AbpUiResource` translations (Yes/No, Save, Cancel, etc.) needed when the API throws `UserFriendlyException`s.
+
+## EmailSettingsController
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/
+//   Volo/Abp/SettingManagement/EmailSettingsController.cs
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/emailing")]
+public class EmailSettingsController : AbpControllerBase, IEmailSettingsAppService
+{
+    private readonly IEmailSettingsAppService _emailSettingsAppService;
+
+    public EmailSettingsController(IEmailSettingsAppService emailSettingsAppService)
+    {
+        _emailSettingsAppService = emailSettingsAppService;
+    }
+
+    [HttpGet]
+    public Task<EmailSettingsDto> GetAsync()
+    {
+        return _emailSettingsAppService.GetAsync();
+    }
+
+    [HttpPost]
+    public Task UpdateAsync(UpdateEmailSettingsDto input)
+    {
+        return _emailSettingsAppService.UpdateAsync(input);
+    }
+
+    [HttpPost("send-test-email")]
+    public Task SendTestEmailAsync(SendTestEmailInput input)
+    {
+        return _emailSettingsAppService.SendTestEmailAsync(input);
+    }
+}
+```
+
+The controller implements `IEmailSettingsAppService` — that's how ABP's *integrated services* feature lets in-process callers resolve `IEmailSettingsAppService` and get the app service directly, while out-of-process callers hit the controller. (When `AbpSettingManagementHttpApiClientModule` is loaded, the `EmailSettingsClientProxy` registers itself with `[Dependency(ReplaceServices = true)]` and takes over the same interface.)
+
+### Routes
+
+| Method | Path | Action | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/api/setting-management/emailing` | `GetAsync` | `SettingManagement.Emailing` |
+| `POST` | `/api/setting-management/emailing` | `UpdateAsync` | `SettingManagement.Emailing` |
+| `POST` | `/api/setting-management/emailing/send-test-email` | `SendTestEmailAsync` | `SettingManagement.Emailing.Test` |
+
+The `[Authorize(...)]` is on the app service, not the controller — `AbpControllerBase` re-evaluates it through the standard authorization middleware.
+
+### Example: GET /api/setting-management/emailing
+
+A successful response (host scope, no overrides set):
+
+```json
+{
+  "smtpHost": "127.0.0.1",
+  "smtpPort": 25,
+  "smtpUserName": "",
+  "smtpPassword": null,
+  "smtpDomain": "",
+  "smtpEnableSsl": false,
+  "smtpUseDefaultCredentials": true,
+  "defaultFromAddress": "noreply@abp.io",
+  "defaultFromDisplayName": "ABP application"
+}
+```
+
+`smtpPassword` is intentionally `null` on every read — the [app service never copies it into the DTO](/modules/setting-management/application#emailsettingsappservice). If you need to roundtrip the password to test a connection without saving, use the dedicated `send-test-email` endpoint.
+
+### Example: POST /api/setting-management/emailing
+
+Request body:
+
+```json
+{
+  "smtpHost": "smtp.acme.com",
+  "smtpPort": 587,
+  "smtpUserName": "noreply@acme.com",
+  "smtpPassword": "••••••••",
+  "smtpDomain": "acme.com",
+  "smtpEnableSsl": true,
+  "smtpUseDefaultCredentials": false,
+  "defaultFromAddress": "noreply@acme.com",
+  "defaultFromDisplayName": "Acme Corp"
+}
+```
+
+Response: `200 OK` (empty body). Send `"smtpPassword": ""` (or omit it) to keep the existing password — see the `IsNullOrWhiteSpace` guard in [`EmailSettingsAppService.UpdateAsync`](/modules/setting-management/application#updateasync).
+
+## TimeZoneSettingsController
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/
+//   Volo/Abp/SettingManagement/TimeZoneSettingsController.cs
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/timezone")]
+public class TimeZoneSettingsController : AbpControllerBase, ITimeZoneSettingsAppService
+{
+    private readonly ITimeZoneSettingsAppService _timeZoneSettingsAppService;
+
+    public TimeZoneSettingsController(ITimeZoneSettingsAppService timeZoneSettingsAppService)
+    {
+        _timeZoneSettingsAppService = timeZoneSettingsAppService;
+    }
+
+    [HttpGet]
+    public Task<string> GetAsync()
+    {
+        return _timeZoneSettingsAppService.GetAsync();
+    }
+
+    [HttpGet]
+    [Route("timezones")]
+    public Task<List<NameValue>> GetTimezonesAsync()
+    {
+        return _timeZoneSettingsAppService.GetTimezonesAsync();
+    }
+
+    [HttpPost]
+    public Task UpdateAsync(string timezone)
+    {
+        return _timeZoneSettingsAppService.UpdateAsync(timezone);
+    }
+}
+```
+
+| Method | Path | Action |
+| --- | --- | --- |
+| `GET` | `/api/setting-management/timezone` | `GetAsync` — returns current scope's TZ or `"Unspecified"` |
+| `GET` | `/api/setting-management/timezone/timezones` | `GetTimezonesAsync` — the full IANA list |
+| `POST` | `/api/setting-management/timezone?timezone=Europe/Berlin` | `UpdateAsync` — `[FromQuery]` (the parameter is a simple string) |
+
+The `POST` takes a primitive `string` so MVC binds it from the query string by default. ABP-generated clients pass it as a form value; either works.
+
+## HTTP API client module
+
+The client side registers everything in one line:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client/
+//   Volo/Abp/SettingManagement/AbpSettingManagementHttpApiClientModule.cs
+[DependsOn(
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpHttpClientModule))]
+public class AbpSettingManagementHttpApiClientModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddStaticHttpClientProxies(
+            typeof(AbpSettingManagementApplicationContractsModule).Assembly,
+            SettingManagementRemoteServiceConsts.RemoteServiceName
+        );
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSettingManagementHttpApiClientModule>();
+        });
+    }
+}
+```
+
+`AddStaticHttpClientProxies(assembly, remoteServiceName)` scans the contracts assembly for every interface implementing `IRemoteService` and registers the generated proxy classes. Because the proxies use `[Dependency(ReplaceServices = true)]`, downstream code that injects `IEmailSettingsAppService` automatically gets the HTTP proxy in a separated-microservice scenario.
+
+## Generated client proxies
+
+These files are checked in but generated by the `abp generate-proxy -t csharp` command:
+
+### EmailSettingsClientProxy.Generated.cs
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client/
+//   ClientProxies/Volo/Abp/SettingManagement/EmailSettingsClientProxy.Generated.cs
+// This file is automatically generated by ABP framework to use MVC Controllers from CSharp
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IEmailSettingsAppService), typeof(EmailSettingsClientProxy))]
+public partial class EmailSettingsClientProxy
+    : ClientProxyBase<IEmailSettingsAppService>, IEmailSettingsAppService
+{
+    public virtual async Task<EmailSettingsDto> GetAsync()
+    {
+        return await RequestAsync<EmailSettingsDto>(nameof(GetAsync));
+    }
+
+    public virtual async Task UpdateAsync(UpdateEmailSettingsDto input)
+    {
+        await RequestAsync(nameof(UpdateAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(UpdateEmailSettingsDto), input }
+        });
+    }
+
+    public virtual async Task SendTestEmailAsync(SendTestEmailInput input)
+    {
+        await RequestAsync(nameof(SendTestEmailAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(SendTestEmailInput), input }
+        });
+    }
+}
+```
+
+`ClientProxyBase<TInterface>.RequestAsync(...)` looks up the **action descriptor** for `TInterface.GetAsync` from the metadata cache (built from the controller's Swagger document) and turns it into an `HttpClient.SendAsync` against the configured `RemoteServices:SettingManagement:BaseUrl`. No hand-coded URL strings.
+
+### TimeZoneSettingsClientProxy.Generated.cs
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client/
+//   ClientProxies/Volo/Abp/SettingManagement/TimeZoneSettingsClientProxy.Generated.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(ITimeZoneSettingsAppService), typeof(TimeZoneSettingsClientProxy))]
+public partial class TimeZoneSettingsClientProxy
+    : ClientProxyBase<ITimeZoneSettingsAppService>, ITimeZoneSettingsAppService
+{
+    public virtual async Task<string> GetAsync()
+    {
+        return await RequestAsync<string>(nameof(GetAsync));
+    }
+
+    public virtual async Task<List<NameValue>> GetTimezonesAsync()
+    {
+        return await RequestAsync<List<NameValue>>(nameof(GetTimezonesAsync));
+    }
+
+    public virtual async Task UpdateAsync(string timezone)
+    {
+        await RequestAsync(nameof(UpdateAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(string), timezone }
+        });
+    }
+}
+```
+
+### Customising a proxy
+
+Each generated class is `partial`, so create a sibling file `EmailSettingsClientProxy.cs` with your own additions:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi.Client/
+//   ClientProxies/Volo/Abp/SettingManagement/EmailSettingsClientProxy.cs
+public partial class EmailSettingsClientProxy
+{
+    // Add overrides, helper methods, or extra logging here.
+    // Never edit the .Generated.cs file — `abp generate-proxy` will overwrite it.
+}
+```
+
+## Disabling the dynamic JavaScript proxy
+
+The MVC-side dynamic-controller / dynamic-JavaScript proxy system generates `/api/abp/api-definition` entries for every `IApplicationService`. For settings, the Web module **disables** that and ships hand-written jQuery code instead, because the password handling is too special-case to auto-generate:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/AbpSettingManagementWebModule.cs
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(SettingManagementRemoteServiceConsts.ModuleName);
+});
+```
+
+This call is what stops `abp.settingManagement.emailing.update(...)` from appearing in the auto-generated JS — replaced by the page's own `setting-management.js`.
+
+## Multi-tenancy and the X-Requested-With header
+
+Because `ICurrentTenant` is determined inside the API by the tenant-resolution middleware, a client targeting a tenant scope must send the tenant identifier — typically via the `__tenant=<id>` cookie/header or by switching to the tenant subdomain (whichever your host has configured through the [Tenant Management module](/modules/tenant-management/overview)).
+
+When a request reaches `EmailSettingsAppService.UpdateAsync` and `CurrentTenant.IsAvailable == true`, the `SetForTenantOrGlobalAsync` extension passes the tenant ID, the write lands in `AbpSettings` with `ProviderName = "T", ProviderKey = <tenantId>`, and a host-scope reader on a different request will still see the global value because the read chain stops at the tenant level only when the resolved tenant matches.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Application layer" icon="layer-group" href="/modules/setting-management/application">
+    The `IEmailSettingsAppService` and `ITimeZoneSettingsAppService` definitions and what `UpdateAsync` actually does.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-restore" href="/modules/setting-management/web-and-blazor">
+    The Razor and Blazor consumers of these proxies — `EmailSettingGroupViewComponent`.
+  </Card>
+  <Card title="Domain layer" icon="database" href="/modules/setting-management/domain">
+    `ISettingManager`, the write path triggered by every POST.
+  </Card>
+</CardGroup>

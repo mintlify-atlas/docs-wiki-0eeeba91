@@ -1,0 +1,435 @@
+---
+title: "Volo.Abp.AspNetCore.Components.Web"
+sidebarTitle: "Shared Web components"
+description: "The renderer-agnostic Blazor surface: AbpComponentBase, IUiMessageService, IUiNotificationService, cookie/local-storage helpers, layout slots, breadcrumbs, page headers, and page toolbars."
+---
+
+`Volo.Abp.AspNetCore.Components.Web` and its sibling `Volo.Abp.AspNetCore.Components.Web.Theming` are the **shared layer** that every Blazor host (Server, WebAssembly, Web App, MAUI Blazor) consumes. They expose the renderer-agnostic primitives ABP needs — cookie/localStorage access via `IJSRuntime`, a server-URL provider, the authentication-state listener, layout slot state, the page header, breadcrumbs, and page toolbars — without taking a dependency on any specific hosting model.
+
+Together with the underlying [`Volo.Abp.AspNetCore.Components`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore.Components) package (which carries `AbpComponentBase`, `IUiMessageService`, `IUiNotificationService`, alerts, block UI, progression, and the claims cache) they form the foundation every higher-level page covered in this group depends on.
+
+<Info>
+**Packages**: [`framework/src/Volo.Abp.AspNetCore.Components.Web/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore.Components.Web) and [`framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming)
+</Info>
+
+## Module wiring
+
+[`AbpAspNetCoreComponentsWebModule`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpAspNetCoreComponentsWebModule.cs) registers exactly two things: ABP's own `IComponentActivator` replacement so DI-aware components resolve services correctly, and a deferred application of any pre-configured `AbpAspNetCoreComponentsWebOptions`:
+
+```csharp
+[DependsOn(
+    typeof(AbpUiModule),
+    typeof(AbpAspNetCoreComponentsModule)
+    )]
+public class AbpAspNetCoreComponentsWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(
+            ServiceDescriptor.Transient<IComponentActivator, ServiceProviderComponentActivator>());
+
+        var preActions = context.Services.GetPreConfigureActions<AbpAspNetCoreComponentsWebOptions>();
+        Configure<AbpAspNetCoreComponentsWebOptions>(options =>
+        {
+            preActions.Configure(options);
+        });
+    }
+}
+```
+
+The dependency on `AbpAspNetCoreComponentsModule` brings in the renderer-agnostic services described below. The dependency on `AbpUiModule` brings the layout-hook and navigation infrastructure shared with MVC/Razor Pages.
+
+## AbpComponentBase
+
+[`AbpComponentBase`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/AbpComponentBase.cs) inherits from `Microsoft.AspNetCore.Components.OwningComponentBase` — meaning each component gets its own scoped `IServiceProvider` whose lifetime is bound to the component — and exposes a curated set of lazily-resolved framework services:
+
+```csharp
+public abstract class AbpComponentBase : OwningComponentBase
+{
+    protected IStringLocalizerFactory StringLocalizerFactory => ...
+    protected IStringLocalizer L => ...
+    protected Type? LocalizationResource { get; set; } = typeof(DefaultResource);
+    protected ILogger Logger => ...
+    protected ILoggerFactory LoggerFactory => ...
+    protected IAuthorizationService AuthorizationService => ...
+    protected ICurrentUser CurrentUser => ...
+    protected ICurrentTenant CurrentTenant => ...
+
+    protected IUiMessageService Message => LazyGetNonScopedRequiredService(ref _message)!;
+    protected IUiNotificationService Notify => LazyGetNonScopedRequiredService(ref _notify)!;
+    protected IUserExceptionInformer UserExceptionInformer => ...
+    protected IAlertManager AlertManager => ...
+    protected IClock Clock => ...
+    protected AlertList Alerts => AlertManager.Alerts;
+
+    protected IObjectMapper ObjectMapper { get => ... }
+    protected Type? ObjectMapperContext { get; set; }
+    // ...
+}
+```
+
+Two resolution strategies are at play:
+
+1. **`LazyGetRequiredService<T>`** — pulls from the component's own `ScopedServices`. Used for services that legitimately want to share state with the component (`ICurrentUser`, `ICurrentTenant`, `IAuthorizationService`).
+2. **`LazyGetNonScopedRequiredService<T>`** — pulls from the application's *client scope* — i.e. the SignalR circuit (Server) or the WASM host scope. Used for services that need to survive across components: messages, notifications, alerts, clock, object mapping.
+
+`L` is a `IStringLocalizer` lazily created against `LocalizationResource` (defaulting to `DefaultResource`). Setting `LocalizationResource = typeof(MyResource)` in a derived component's `OnInitialized` resets the cached localizer so the next access creates one bound to the project's localization namespace.
+
+### Localization helper
+
+[`AbpBlazorMessageLocalizerHelper<T>`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpBlazorMessageLocalizerHelper.cs) is a `[Singleton]`-registered helper that wraps `IStringLocalizer<T>` with a smart localization pass: it tries `DisplayName:{Name}` first, falls back to `{Name}`, and is the service used by Blazorise's auto-generated form validation messages and the page-toolbar contributors:
+
+```csharp
+public string Localize(string message, IEnumerable<string>? arguments = null)
+{
+    var argumentsList = arguments?.ToList();
+    return argumentsList?.Count > 0
+        ? stringLocalizer[message, LocalizeMessageArguments(argumentsList).ToArray()]
+        : stringLocalizer[message];
+}
+```
+
+## Cross-cutting UI services
+
+<CardGroup cols={2}>
+  <Card title="IUiMessageService" icon="comment-dots">
+    Defined in [`Volo.Abp.AspNetCore.Components.Messages`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components/Volo/Abp/AspNetCore/Components/Messages/IUiMessageService.cs). Methods: `Info`, `Success`, `Warn`, `Error`, `Confirm`. The Web layer ships a [`SimpleUiMessageService`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/Messages/SimpleUiMessageService.cs) fallback that delegates to JS `alert()` / `confirm()`; Blazorise replaces it with a dialog-based implementation.
+  </Card>
+  <Card title="IUiNotificationService" icon="bell">
+    Same five-method shape as messages but for toast-style notifications. Hosts subscribe to `NotificationReceived` events in a layout component and render them as transient toasts.
+  </Card>
+  <Card title="IAlertManager + AlertList" icon="triangle-exclamation">
+    Inline page alerts — `AbpComponentBase.Alerts.Add(AlertType.Warning, "Saved")` injects an alert that the layout renders above the page content.
+  </Card>
+  <Card title="IBlockUiService" icon="ban">
+    Globally blocks the UI during a long operation. The default `NullBlockUiService` does nothing; UI libraries provide concrete implementations.
+  </Card>
+  <Card title="IUiPageProgressService" icon="bars-progress">
+    Drives a top-of-page progress bar. The HTTP message handlers (`AbpBlazorClientHttpMessageHandler`, `AbpMauiBlazorClientHttpMessageHandler`) call `Go(null, opts => opts.Type = UiPageProgressType.Info)` at the start of each outgoing request.
+  </Card>
+  <Card title="IUserExceptionInformer" icon="bug">
+    Translates `Exception` instances into user-friendly messages, applying the same `IBusinessException` / `IUserFriendlyException` / `IHasErrorCode` taxonomy described in [/core/exception-handling](/core/exception-handling).
+  </Card>
+</CardGroup>
+
+## Browser-storage helpers
+
+The Web layer ships JS-interop services for cookies and `localStorage`. Both are `[Dependency(ReplaceServices = true)]` so they replace any default registration:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class CookieService : ICookieService, ITransientDependency
+{
+    public IJSRuntime JsRuntime { get; }
+
+    public async ValueTask SetAsync(string key, string value, CookieOptions? options)
+    {
+        await JsRuntime.InvokeVoidAsync(
+            "abp.utils.setCookieValue",
+            key, value,
+            options?.ExpireDate?.ToString("r"),
+            options?.Path,
+            options?.Secure);
+    }
+
+    public async ValueTask<string> GetAsync(string key)
+    {
+        return await JsRuntime.InvokeAsync<string>("abp.utils.getCookieValue", key);
+    }
+
+    public async ValueTask DeleteAsync(string key, string? path = null)
+    {
+        await JsRuntime.InvokeVoidAsync("abp.utils.deleteCookie", key);
+    }
+}
+```
+
+`abp.utils.*` is the JS facade bundled in `wwwroot/libs/abp/js/abp.js`. The matching [`LocalStorageService`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/LocalStorageService.cs) wraps the native `localStorage.{setItem,getItem,removeItem}`.
+
+Two additional `IAbpUtilsService` / `AbpUtilsService` methods (`AddClassToTagAsync`, `RemoveClassFromTagAsync`) are how the MAUI module flips the `<body>` class to `rtl` after detecting a right-to-left culture.
+
+## Server URL and HTTP client
+
+[`IServerUrlProvider`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/IServerUrlProvider.cs) returns the base URL the HTTP client stack should use when talking to a remote ABP API. The default implementation simply returns `"/"` — same-origin — and is overridden by `WebAssemblyServerUrlProvider` and `MauiBlazorServerUrlProvider` for the remote-host scenarios.
+
+[`AbpBlazorClientHttpMessageHandler`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpBlazorClientHttpMessageHandler.cs) is the shared `DelegatingHandler` that:
+
+- attaches the current culture as an `Accept-Language` header,
+- forwards the active tenant id,
+- starts and stops `IUiPageProgressService`,
+- and decodes `Volo.Abp.Http.RemoteServiceErrorResponse` payloads through `IUserExceptionInformer`.
+
+It is plugged into every typed client proxy through `AbpHttpClientBuilderOptions.ProxyClientBuildActions` — the same hook documented in [/http/http-client](/http/http-client).
+
+## Authentication state
+
+[`AbpAuthenticationState`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/Security/AbpAuthenticationState.cs) is a component the Web.Theming layer adds to every dynamic layout. It listens (via `wwwroot/libs/abp/js/authentication-state-listener.js`) for browser-side `storage` events on a well-known key and forces the `AuthenticationStateProvider` to refresh — so logging in or out in one tab is propagated to every other tab. The companion [`AbpComponentsClaimsCache`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/Security/AbpComponentsClaimsCache.cs) caches the resolved `ClaimsPrincipal` for the lifetime of the circuit/scope so repeated calls to `CurrentUser` are O(1).
+
+[`ApplicationConfigurationChangedService`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/Security/ApplicationConfigurationChangedService.cs) raises an event whenever permissions or features change so any subscribed component can refresh. The Server and WebAssembly modules each register a host-specific `ICurrentApplicationConfigurationCacheResetService` that the HTTP message handler calls after a 401-recovered request.
+
+## Web.Theming: layouts, breadcrumbs, page header
+
+The `.Web.Theming` package layers Blazorise-aware UI primitives on top of the renderer-agnostic Web package. Its module is short:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlazoriseUIModule),
+    typeof(AbpUiNavigationModule)
+    )]
+public class AbpAspNetCoreComponentsWebThemingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDynamicLayoutComponentOptions>(options =>
+        {
+            options.Components.Add(typeof(AbpAuthenticationState), null);
+        });
+    }
+}
+```
+
+That single `Configure` call adds `AbpAuthenticationState` to the **dynamic layout component options** — a registry the host's `<DynamicLayoutComponent>` enumerates and renders so cross-cutting components (auth state, multi-tab listeners) ship with the theme automatically.
+
+### Standard layout slots
+
+[`StandardLayouts`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Layout/StandardLayouts.cs) defines the four conventional slot names every ABP theme implements:
+
+```csharp
+public static class StandardLayouts
+{
+    public const string Application = "Application";
+    public const string Account = "Account";
+    public const string Public = "Public";
+    public const string Empty = "Empty";
+}
+```
+
+Application pages use `Application`; the account module's login/register/forgot pages use `Account`; public-facing pages (landing, marketing) use `Public`; and dialog/full-screen wizards use `Empty`. A `[Layout]` attribute or `IThemeManager.CurrentTheme.GetLayout(name)` call resolves the slot to a concrete `Type`.
+
+### PageLayout
+
+[`PageLayout`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Layout/PageLayout.cs) is the per-page, scoped, mutable model the header reads from. It implements `INotifyPropertyChanged` so any subscribed component re-renders when the title, menu item, breadcrumbs, or toolbar items change:
+
+```csharp
+public class PageLayout : IScopedDependency, INotifyPropertyChanged
+{
+    public virtual string? Title { get => title; set { ... OnPropertyChanged(); } }
+    public string? MenuItemName { get => menuItemName; set { ... OnPropertyChanged(); } }
+
+    public virtual ObservableCollection<BreadcrumbItem> BreadcrumbItems { get; } = new();
+    public virtual ObservableCollection<PageToolbarItem> ToolbarItems { get; } = new();
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public void Reset()
+    {
+        Title = string.Empty;
+        MenuItemName = string.Empty;
+        BreadcrumbItems.Clear();
+        ToolbarItems.Clear();
+    }
+}
+```
+
+`PageHeader` calls `PageLayout.Reset()` in its `Dispose` so navigating between pages always starts from a clean slate.
+
+### PageHeader
+
+[`PageHeader`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Layout/PageHeader.razor.cs) is the markup-less component you place at the top of every page to bind a title, breadcrumbs, and toolbar:
+
+```csharp
+public partial class PageHeader : ComponentBase, IDisposable
+{
+    [Inject] public PageLayout PageLayout { get; private set; } = default!;
+
+    [Parameter] public string? Title { get => PageLayout.Title; set => PageLayout.Title = value; }
+    [Parameter] public bool BreadcrumbShowHome { get; set; } = true;
+    [Parameter] public bool BreadcrumbShowCurrent { get; set; } = true;
+    [Parameter] public RenderFragment ChildContent { get; set; } = default!;
+    [Parameter] public List<BreadcrumbItem> BreadcrumbItems { ... }
+    [Parameter] public PageToolbar? Toolbar { get; set; }
+
+    public IPageToolbarManager PageToolbarManager { get; set; } = default!;
+    protected List<RenderFragment> ToolbarItemRenders { get; set; }
+    // ...
+}
+```
+
+Use it in any page:
+
+```razor
+<PageHeader Title="@L["Users"]"
+            BreadcrumbItems="@(new List<BreadcrumbItem> {
+                new(L["Menu:Admin"]),
+                new(L["Menu:Users"])
+            })"
+            Toolbar="@(new PageToolbar("UsersToolbar"))" />
+```
+
+Behavior is configured via [`PageHeaderOptions`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Layout/PageHeaderOptions.cs):
+
+```csharp
+public class PageHeaderOptions
+{
+    public bool RenderPageTitle { get; set; } = true;
+    public bool RenderBreadcrumbs { get; set; } = true;
+    public bool RenderToolbar { get; set; } = true;
+}
+```
+
+A theme can flip `RenderToolbar = false` and instead push items into `PageLayout.ToolbarItems` so the layout's main toolbar can render them in its own designated spot.
+
+### BreadcrumbItem
+
+The model is defined in `Volo.Abp.BlazoriseUI` (since the markup that consumes it lives there) and is intentionally minimal:
+
+```csharp
+namespace Volo.Abp.BlazoriseUI;
+
+public class BreadcrumbItem
+{
+    public string Text { get; set; }
+    public object? Icon { get; set; }
+    public string? Url { get; set; }
+
+    public BreadcrumbItem(string text, string? url = null, object? icon = null)
+    {
+        Text = text;
+        Url = url;
+        Icon = icon;
+    }
+}
+```
+
+`Text` and `Url` are obvious; `Icon` is `object?` so themes can pass a Blazorise icon enum value, a Font Awesome string, or a custom render fragment.
+
+## Page toolbars
+
+[`IPageToolbarManager`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/PageToolbars/IPageToolbarManager.cs) returns an array of `PageToolbarItem` for a named toolbar:
+
+```csharp
+public interface IPageToolbarManager
+{
+    Task<PageToolbarItem[]> GetItemsAsync(PageToolbar toolbar);
+}
+```
+
+A `PageToolbarItem` is a component type plus optional arguments plus an order:
+
+```csharp
+public class PageToolbarItem
+{
+    public Type ComponentType { get; }
+    public Dictionary<string, object?>? Arguments { get; set; }
+    public int Order { get; set; }
+}
+```
+
+Modules participate by registering `IPageToolbarContributor` implementations against `AbpPageToolbarOptions`. The manager fans the contributors out against the requested `PageToolbar.Name`, sorts by `Order`, and returns the merged list. Pages typically forward the array straight into `PageHeader`, which constructs each component dynamically:
+
+```csharp
+ToolbarItemRenders.Add(builder =>
+{
+    builder.OpenComponent(sequence, item.ComponentType);
+    if (item.Arguments != null)
+    {
+        foreach (var argument in item.Arguments)
+        {
+            sequence++;
+            builder.AddAttribute(sequence, argument.Key, argument.Value);
+        }
+    }
+    builder.CloseComponent();
+});
+```
+
+## Dynamic layout components
+
+[`AbpDynamicLayoutComponentOptions`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/AbpDynamicLayoutComponentOptions.cs) is a `Dictionary<Type, IDictionary<string,object>?>` of component types to inject into every layout:
+
+```csharp
+public class AbpDynamicLayoutComponentOptions
+{
+    [NotNull]
+    public Dictionary<Type, IDictionary<string,object>?> Components { get; set; }
+
+    public AbpDynamicLayoutComponentOptions()
+    {
+        Components = new Dictionary<Type, IDictionary<string, object>?>();
+    }
+}
+```
+
+`DynamicLayoutComponent.razor` enumerates this dictionary and renders each component with its attribute bag. `AbpAuthenticationState` is the default entry; theme packages add their own (LeptonX adds a feedback widget, for example).
+
+## Layout hooks
+
+`LayoutHook` is the Blazor equivalent of MVC's `IPageHook` / `IThemeHook`:
+
+```csharp
+public partial class LayoutHook : ComponentBase
+{
+    [Parameter] public string Name { get; set; } = default!;
+    [Parameter] public string? Layout { get; set; }
+
+    [Inject] protected IOptions<AbpLayoutHookOptions> LayoutHookOptions { get; set; } = default!;
+    protected LayoutHookViewModel LayoutHookViewModel { get; private set; } = default!;
+
+    protected override Task OnInitializedAsync()
+    {
+        if (LayoutHookOptions.Value.Hooks.TryGetValue(Name, out var layoutHooks))
+        {
+            layoutHooks = layoutHooks
+                .Where(x => IsComponentBase(x) && (string.IsNullOrWhiteSpace(x.Layout) || x.Layout == Layout))
+                .ToList();
+        }
+
+        layoutHooks ??= new List<LayoutHookInfo>();
+        LayoutHookViewModel = new LayoutHookViewModel(layoutHooks.ToArray(), Layout);
+        return Task.CompletedTask;
+    }
+}
+```
+
+Modules drop components into named hook locations (`<LayoutHook Name="Head" />`, `<LayoutHook Name="BodyEnd" />`) via `AbpLayoutHookOptions.Hooks.Add(...)` without ever touching theme markup. The `Layout` filter restricts a hook to a specific layout slot so a contributor can target `Application` but skip `Public`, for example.
+
+## Routing options
+
+[`AbpRouterOptions`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Routing/AbpRouterOptions.cs) carries the assembly list that the `<Router>` should inspect for routable components:
+
+```csharp
+public class AbpRouterOptions
+{
+    public Assembly AppAssembly { get; set; } = default!;
+    public RouterAssemblyList AdditionalAssemblies { get; }
+}
+```
+
+The host startup module typically sets `options.AppAssembly = typeof(MyApp.HostModule).Assembly` and ABP's `App.razor` template binds the router to `AdditionalAssemblies` so module assemblies that ship Razor pages light up automatically.
+
+## Bundling sub-namespace
+
+[`IComponentBundleManager`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/Bundling/IComponentBundleManager.cs) is the abstraction the `AbpScripts.razor` and `AbpStyles.razor` components consume to render their `<link>` and `<script>` tags. Each host package binds it to a concrete implementation — `BlazorServerComponentBundleManager` on Server, `WebAssemblyComponentBundleManager` on WASM, and so on. Full coverage is in [/blazor/bundling](/blazor/bundling).
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Blazor Server host" icon="server" href="/blazor/components-server">
+    How the Server module wires Blazor hub endpoints, the global asset bundles, and the localizer helper that powers Blazorise dialogs on Server.
+  </Card>
+  <Card title="Blazor WebAssembly host" icon="browser" href="/blazor/components-webassembly">
+    `AbpWebAssemblyHostBuilderExtensions.AddApplicationAsync<TModule>`, dynamic option configurators, remote auth state, and build-time global bundles.
+  </Card>
+  <Card title="Theming pipeline" icon="palette" href="/blazor/theming">
+    Themes, layouts, page toolbars, and the menu manager covered end-to-end.
+  </Card>
+  <Card title="Blazorise UI" icon="table-cells" href="/blazor/blazorise-ui">
+    `AbpCrudPageBase<>`, `AbpExtensibleDataGrid`, and the dialog/notification implementations that replace `SimpleUiMessageService`.
+  </Card>
+  <Card title="HTTP client" icon="cloud" href="/http/http-client">
+    Where `AbpBlazorClientHttpMessageHandler` plugs into the proxy client builder.
+  </Card>
+  <Card title="Exception handling" icon="triangle-exclamation" href="/core/exception-handling">
+    The taxonomy `IUserExceptionInformer` reads when translating remote errors into user-friendly messages.
+  </Card>
+</CardGroup>

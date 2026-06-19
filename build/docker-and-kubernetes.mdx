@@ -1,0 +1,534 @@
+---
+title: "Docker & Kubernetes"
+description: "Dockerfiles in templates and modules, the docker-compose.yml / .override.yml / .migrations.yml triplet, and the Verdaccio-based npm publish test rig."
+---
+
+ABP ships Dockerfiles and compose files for the parts of the repository that benefit from container-based testing: the **module template** (so contributors can spin up an end-to-end Identity-Server + Module-Host + SQL Server stack with one command) and a handful of modules that have HTTP host projects of their own (`cms-kit`, `docs`). The `npm/` folder also has a Verdaccio-based dry-run rig for npm publishing.
+
+There is **no** Dockerfile or compose file in `templates/app/aspnet-core/` — the application template intentionally leaves containerization to the generated solution rather than baking it into the template itself. The reference compose stack to study is the one under `templates/module/aspnet-core/`.
+
+## Dockerfile inventory
+
+```text Dockerfiles in the repo (excluding node_modules)
+modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/Dockerfile
+modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/Dockerfile.azure
+modules/cms-kit/database/Dockerfile
+modules/cms-kit/host/Volo.CmsKit.HttpApi.Host/Dockerfile
+modules/cms-kit/host/Volo.CmsKit.IdentityServer/Dockerfile
+modules/docs/app/VoloDocs.Migrator/Dockerfile
+modules/docs/app/VoloDocs.Web/Dockerfile
+npm/verdaccio-containers/publish-packages/Dockerfile
+npm/verdaccio-containers/serve-app/Dockerfile
+templates/module/aspnet-core/database/Dockerfile
+templates/module/aspnet-core/host/MyCompanyName.MyProjectName.AuthServer/Dockerfile
+templates/module/aspnet-core/host/MyCompanyName.MyProjectName.HttpApi.Host/Dockerfile
+```
+
+<Info>
+`samples/` does not exist as a top-level folder in the current `dev` branch — the equivalent today is what's under `modules/*/test/*Demo/` and `modules/*/app/`. Those Demo Dockerfiles (e.g. `modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/`) are used by ABP maintainers to test theme changes against a containerized host.
+</Info>
+
+## Compose file inventory
+
+```text docker-compose files in the repo
+modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/docker-compose.yml
+modules/cms-kit/docker-compose.migrations.yml
+modules/cms-kit/docker-compose.override.yml
+modules/cms-kit/docker-compose.yml
+modules/docs/docker-compose.migrate.yml
+modules/docs/docker-compose.override.yml
+modules/docs/docker-compose.yml
+npm/verdaccio-containers/docker-compose.yml
+templates/module/aspnet-core/docker-compose.migrations.yml
+templates/module/aspnet-core/docker-compose.override.yml
+templates/module/aspnet-core/docker-compose.yml
+```
+
+Every "real" ABP stack uses the same three-file pattern: `docker-compose.yml` for the topology, `docker-compose.override.yml` for environment-specific knobs (connection strings, ports, dev-mode secrets), and `docker-compose.migrations.yml` for the one-shot DB migration container. Compose merges `.yml` + `.override.yml` automatically; `.migrations.yml` is opted into with `-f`.
+
+## The standard ABP Dockerfile
+
+Every ABP HTTP host uses a four-stage multi-stage Dockerfile. Here's the module template's `HttpApi.Host`:
+
+```docker templates/module/aspnet-core/host/MyCompanyName.MyProjectName.HttpApi.Host/Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+WORKDIR /app
+EXPOSE 80
+ENV ASPNETCORE_URLS=http://+:80
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+WORKDIR /src/templates/service/host/MyCompanyName.MyProjectName.HttpApi.Host
+RUN dotnet restore -nowarn:msb3202,nu1503
+RUN dotnet build --no-restore -c Release -o /app
+
+FROM build AS publish
+RUN dotnet publish --no-restore -c Release -o /app
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app .
+ENTRYPOINT ["dotnet", "MyCompanyName.MyProjectName.HttpApi.Host.dll"]
+```
+
+### Stage breakdown
+
+<CardGroup cols={2}>
+  <Card title="base" icon="layer-group">
+    `mcr.microsoft.com/dotnet/aspnet:10.0` — runtime-only image. Sets `ASPNETCORE_URLS` and exposes 80. Everything that goes into the final image is layered on top.
+  </Card>
+  <Card title="build" icon="hammer">
+    `mcr.microsoft.com/dotnet/sdk:10.0` — full SDK. Copies the *entire repo* via `COPY . .` so projects can resolve project-references that point outside the host project's folder.
+  </Card>
+  <Card title="publish" icon="box">
+    Same base as build. Runs `dotnet publish --no-restore -c Release -o /app`. Re-uses the build output, no extra restore.
+  </Card>
+  <Card title="final" icon="ship">
+    Back to the runtime image. Copies `/app` from `publish` and entrypoints `dotnet <Assembly>.dll`. ~210 MB final image.
+  </Card>
+</CardGroup>
+
+### Why `COPY . .` and not just the project folder?
+
+ABP host projects have transitive `<ProjectReference>` entries that point at `framework/`, `modules/`, and `templates/` sibling folders. If you only copy the host project, the build stage fails restore with "Project not found". The whole-repo copy is wasteful in terms of layer cache but necessary for restore correctness.
+
+The `-nowarn:msb3202,nu1503` mutes:
+
+- **MSB3202** — "Project file does not exist" (raised because some referenced projects only exist under certain conditional `<ItemGroup>`s).
+- **NU1503** — "Skipping restore for project — restore not allowed for non-SDK style projects" (legacy projects in the source-code/ folder).
+
+### Other host Dockerfiles use the same pattern
+
+`modules/cms-kit/host/Volo.CmsKit.HttpApi.Host/Dockerfile`:
+
+```docker modules/cms-kit/host/Volo.CmsKit.HttpApi.Host/Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+WORKDIR /app
+EXPOSE 80
+ENV ASPNETCORE_URLS=http://+:80
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+WORKDIR /src/templates/service/host/Volo.CmsKit.HttpApi.Host
+RUN dotnet restore -nowarn:msb3202,nu1503
+RUN dotnet build --no-restore -c Release -o /app
+
+FROM build AS publish
+RUN dotnet publish --no-restore -c Release -o /app
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app .
+ENTRYPOINT ["dotnet", "Volo.CmsKit.HttpApi.Host.dll"]
+```
+
+And `modules/docs/app/VoloDocs.Web/Dockerfile` (docs.abp.io itself):
+
+```docker modules/docs/app/VoloDocs.Web/Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+WORKDIR /app
+EXPOSE 80
+ENV ASPNETCORE_URLS=http://+:80
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+WORKDIR "/src/modules/docs/app/VoloDocs.Web"
+RUN dotnet restore -nowarn:msb3202,nu1503
+RUN dotnet build --no-restore -c Release -o /app
+
+FROM build AS publish
+RUN dotnet publish --no-restore -c Release -o /app
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app .
+ENTRYPOINT ["dotnet", "VoloDocs.Web.dll"]
+```
+
+Same shape, different `WORKDIR` and `ENTRYPOINT`. This uniformity is intentional — the same maintainer-tooling can rebuild any host image.
+
+## The database migration Dockerfile
+
+A different shape for one-shot containers. From the module template:
+
+```docker templates/module/aspnet-core/database/Dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+COPY . .
+
+WORKDIR /templates/service/host/IdentityServerHost
+RUN dotnet restore
+RUN dotnet ef migrations script -i -o migrations-IdentityServerHost.sql
+
+WORKDIR /templates/service/host/MyCompanyName.MyProjectName.Host
+RUN dotnet restore
+RUN dotnet ef migrations script -i -o migrations-MyProjectName.sql
+
+FROM mcr.microsoft.com/mssql-tools AS final
+WORKDIR /src
+COPY --from=build /templates/service/host/IdentityServerHost/migrations-IdentityServerHost.sql migrations-IdentityServerHost.sql
+COPY --from=build /templates/service/host/MyCompanyName.MyProjectName.Host/migrations-MyProjectName.sql migrations-MyProjectName.sql
+COPY --from=build /templates/service/database/entrypoint.sh .
+RUN /bin/bash -c "sed -i $'s/\\r$//' entrypoint.sh"
+RUN chmod +x ./entrypoint.sh
+
+ENTRYPOINT ["./entrypoint.sh"]
+```
+
+### What's happening
+
+<Steps>
+  <Step title="Use the SDK to produce idempotent SQL">
+    `dotnet ef migrations script -i -o <file>.sql` emits a single SQL script with `IF NOT EXISTS` guards (the `-i` flag = idempotent) so re-running is safe.
+  </Step>
+  <Step title="Switch to mssql-tools for execution">
+    `mcr.microsoft.com/mssql-tools` ships `sqlcmd`. The final image is small and only does one job: connect and execute.
+  </Step>
+  <Step title="entrypoint.sh runs sqlcmd against the linked sqlserver">
+    The `sed` line strips CRLFs so the script works whether the file came from Windows or Linux.
+  </Step>
+</Steps>
+
+## The compose triplet
+
+All three files target the same project but cover different lifecycle moments.
+
+### `docker-compose.yml` — base topology
+
+```yaml templates/module/aspnet-core/docker-compose.yml
+version: '3.4'
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server
+    volumes:
+      - dbdata:/var/opt/mssql
+
+  identity-server:
+    build:
+      context: ../../
+      dockerfile: templates/service/host/IdentityServerHost/Dockerfile
+    depends_on:
+      - sqlserver
+
+  my-project-name:
+    build:
+      context: ../../
+      dockerfile: templates/service/host/MyCompanyName.MyProjectName.Host/Dockerfile
+    depends_on:
+      - sqlserver
+      - identity-server
+
+volumes:
+  dbdata:
+```
+
+Three services: SQL Server, the IdentityServer host, and the module host. The named volume `dbdata` survives `docker compose down` so the database isn't wiped on every rebuild.
+
+The `context: ../../` is important — it's set to the *repo root* so the host Dockerfiles can do their `COPY . .` and resolve `<ProjectReference>`s.
+
+### `docker-compose.override.yml` — dev knobs
+
+```yaml templates/module/aspnet-core/docker-compose.override.yml
+version: '3.4'
+
+services:
+  sqlserver:
+    environment:
+      - SA_PASSWORD=yourStrong(!)Password
+      - ACCEPT_EULA=Y
+    ports:
+      - "51599:1433"
+
+  identity-server:
+    environment:
+      - ASPNETCORE_URLS=http://0.0.0.0:80
+      - ConnectionStrings__Default=Server=sqlserver;Database=MyProjectName_Identity;Trusted_Connection=True;User=sa;Password=yourStrong(!)Password;Integrated Security=false
+      - ConnectionStrings__SqlServerCache=Server=sqlserver;Database=MyProjectName_Cache;Trusted_Connection=True;User=sa;Password=yourStrong(!)Password;Integrated Security=false
+    ports:
+      - "51600:80"
+
+  my-project-name:
+    environment:
+      - ASPNETCORE_URLS=http://0.0.0.0:80
+      - ConnectionStrings__Default=Server=sqlserver;Database=MyProjectName_ModuleDb;...
+      - ConnectionStrings__AbpSettingManagement=Server=sqlserver;Database=MyProjectName_Identity;...
+      - ConnectionStrings__AbpPermissionManagement=Server=sqlserver;Database=MyProjectName_Identity;...
+      - ConnectionStrings__AbpAuditLogging=Server=sqlserver;Database=MyProjectName_Identity;...
+      - ConnectionStrings__SqlServerCache=Server=sqlserver;Database=MyProjectName_Cache;...
+      - AuthServer__Authority=http://identity-server
+    ports:
+      - "51601:80"
+```
+
+Compose merges this on top of the base file automatically when running `docker compose up`. The pattern:
+
+| Service           | Override adds                                                            |
+| ----------------- | ------------------------------------------------------------------------ |
+| `sqlserver`       | SA password, EULA acceptance, port exposed to 51599 on the host          |
+| `identity-server` | Per-DB connection string for Identity + cache, port 51600                |
+| `my-project-name` | Multiple connection strings (one per ABP module's DB context), port 51601, `AuthServer__Authority` pointing at the linked IS container |
+
+The `ConnectionStrings__AbpSettingManagement` / `ConnectionStrings__AbpPermissionManagement` / `ConnectionStrings__AbpAuditLogging` overrides demonstrate ABP's **per-module connection string** feature — by default everything goes to `Default`, but you can route specific module databases elsewhere.
+
+### `docker-compose.migrations.yml` — one-shot DB seed
+
+```yaml templates/module/aspnet-core/docker-compose.migrations.yml
+version: '3.4'
+
+services:
+  migrations:
+    build:
+      context: ../../
+      dockerfile: templates/service/database/Dockerfile
+    depends_on:
+      - sqlserver
+    environment:
+      - IdentityServer_DB=MyProjectName_Identity
+      - MyProjectName_DB=MyProjectName_ModuleDb
+      - SA_PASSWORD=yourStrong(!)Password
+```
+
+Adds a `migrations` service that builds the `database/Dockerfile` from earlier. Run as:
+
+```bash
+docker compose -f docker-compose.yml \
+               -f docker-compose.override.yml \
+               -f docker-compose.migrations.yml \
+               up migrations
+```
+
+The container exits after the SQL scripts run, leaving the database seeded.
+
+## CMS Kit's stack — the same pattern, real names
+
+Module-level rather than template-level. Same three-file shape:
+
+```yaml modules/cms-kit/docker-compose.yml
+version: '3.4'
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server
+    volumes:
+      - dbdata:/var/opt/mssql
+
+  identity-server:
+    build:
+      context: ../../
+      dockerfile: templates/service/host/IdentityServerHost/Dockerfile
+    depends_on:
+      - sqlserver
+
+  cms-kit:
+    build:
+      context: ../../
+      dockerfile: templates/service/host/Volo.CmsKit.Host/Dockerfile
+    depends_on:
+      - sqlserver
+      - identity-server
+
+volumes:
+  dbdata:
+```
+
+The override file has the same shape as the template's, with `CmsKit_Identity` / `CmsKit_ModuleDb` / `CmsKit_Cache` as the database names instead of `MyProjectName_*`.
+
+## The Basic Theme demo
+
+A simpler single-container compose for theme testing:
+
+```docker modules/basic-theme/test/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.Demo/Dockerfile (shape)
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+WORKDIR /app
+EXPOSE 80
+ENV ASPNETCORE_URLS=http://+:80
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY . .
+...
+```
+
+Plus a `Dockerfile.azure` variant tuned for Azure App Service deployment (different ASPNETCORE_URLS, plus the App Service health-check endpoint).
+
+## Verdaccio — npm publish dry-run rig
+
+`npm/verdaccio-containers/` is a different beast: it's not for hosting ABP, it's for *testing* the npm publish pipeline against a local registry before pushing to npmjs.org.
+
+```yaml npm/verdaccio-containers/docker-compose.yml
+version: '3.9'
+
+services:
+  verdaccio:
+    image: verdaccio/verdaccio:4.0
+    container_name: 'verdaccio'
+    networks:
+      - docker_network
+    environment:
+      - VERDACCIO_PORT=4873
+    ports:
+      - '4873:4873'
+    expose:
+      - '4873/tcp'
+  publish:
+    build:
+      context: ./publish-packages
+      dockerfile: Dockerfile
+      args:
+        next_version: ''
+    container_name: 'verdaccio_publish'
+    networks:
+      - docker_network
+    depends_on:
+      - verdaccio
+    expose:
+      - '4872'
+  app:
+    build: ./serve-app
+    container_name: 'verdaccio_app'
+    networks:
+      - docker_network
+    depends_on:
+      - publish
+    ports:
+      - '4200:4200'
+    expose:
+      - '4200/tcp'
+networks:
+  docker_network:
+    driver: bridge
+```
+
+Three containers chained:
+
+<Steps>
+  <Step title="verdaccio">
+    Stock `verdaccio/verdaccio:4.0`. Acts as a private npm registry on port 4873.
+  </Step>
+  <Step title="publish">
+    Custom Node 14 container that runs `npm/preview-publish.ps1`-equivalent commands pointed at `http://verdaccio:4873` instead of `https://registry.npmjs.org`.
+  </Step>
+  <Step title="app">
+    Another Node 14 container that consumes from the local registry and serves an Angular app on port 4200, proving the just-published packages actually install and work end-to-end.
+  </Step>
+</Steps>
+
+```docker npm/verdaccio-containers/publish-packages/Dockerfile
+FROM node:14
+ARG next_version
+ENV next_version=$next_version
+RUN mkdir /publish
+COPY . /publish
+WORKDIR /publish
+EXPOSE 4872/tcp
+
+RUN apt-get update
+RUN apt-get install nano
+RUN chmod +x ./entrypoint.sh
+CMD /bin/bash ./entrypoint.sh
+```
+
+```docker npm/verdaccio-containers/serve-app/Dockerfile
+FROM node:14
+RUN mkdir /app
+COPY . /app
+WORKDIR /app
+EXPOSE 4200/tcp
+
+RUN apt-get update
+RUN apt-get install nano
+RUN chmod +x ./entrypoint.sh
+CMD /bin/bash ./entrypoint.sh
+```
+
+The `next_version` ARG is passed in by the maintainer (`docker compose build --build-arg next_version=10.0.1-test`) so the rig can validate both stable and prerelease shapes before a real npm publish runs.
+
+## Running the module template stack
+
+<Steps>
+  <Step title="Generate the template">
+    `abp new MyProject -t module` — see [/templates/overview](/templates/overview).
+  </Step>
+  <Step title="cd into the generated solution root">
+    The `docker-compose*.yml` files were copied to the root of the generated solution.
+  </Step>
+  <Step title="One-shot: migrate the DB">
+    ```bash
+    docker compose -f docker-compose.yml -f docker-compose.override.yml \
+                   -f docker-compose.migrations.yml up migrations
+    ```
+    This builds three images (sqlserver, migrations, plus implicit dependents), runs migrations to completion, and exits.
+  </Step>
+  <Step title="Bring up the stack">
+    ```bash
+    docker compose up -d
+    ```
+    Hits `localhost:51599` (SQL Server), `localhost:51600` (IdentityServer), `localhost:51601` (module HTTP API host).
+  </Step>
+  <Step title="Tear down">
+    ```bash
+    docker compose down              # keeps the dbdata volume
+    docker compose down -v           # also removes the volume
+    ```
+  </Step>
+</Steps>
+
+## Kubernetes
+
+ABP doesn't ship Kubernetes manifests or Helm charts in the OSS repo. The path is:
+
+<CardGroup cols={2}>
+  <Card title="Build images using the shipped Dockerfiles" icon="docker">
+    Tag and push them to your private registry. They are SDK-version-aligned (.NET 10) and runtime-optimized.
+  </Card>
+  <Card title="Write manifests against those images" icon="ship">
+    Mirror the compose topology — one Deployment per host service, one StatefulSet for SQL Server (or use a managed DB), Secrets for the connection strings that `docker-compose.override.yml` puts in `environment:`.
+  </Card>
+</CardGroup>
+
+The commercial ABP Studio product ships Kubernetes-aware tooling, but for the OSS framework the reference is always the compose triplet.
+
+## Common gotchas
+
+<Accordion title="`COPY failed: file not found in build context`">
+  The `context: ../../` in `docker-compose.yml` is relative to the compose file's directory. Running `docker build` directly inside `templates/module/aspnet-core/host/MyCompanyName.MyProjectName.HttpApi.Host/` doesn't work — you need to invoke from `templates/module/aspnet-core/` (or with `docker build -f .../Dockerfile <repo-root>`).
+</Accordion>
+
+<Accordion title="`Login failed for user 'sa'`">
+  The compose override sets `SA_PASSWORD=yourStrong(!)Password`. Recent SQL Server images require **strong** passwords (uppercase, lowercase, digit, symbol, 8+ chars). The provided one satisfies all four. If you customize it, satisfy the same complexity requirements.
+</Accordion>
+
+<Accordion title="`identity-server` container restarts on EF migration">
+  EF migrations happen at runtime in some ABP host configurations. If your DB isn't seeded (you skipped `docker-compose.migrations.yml`), the host may try to migrate, race with another host that also wants to migrate, and crash. Always run migrations first.
+</Accordion>
+
+<Accordion title="`The SSL connection could not be established`">
+  ABP's connection strings in the override use `Integrated Security=false` and `Trusted_Connection=True` — that combination works against the unencrypted dev SQL Server image. If you swap to a TLS-enabled SQL Server, add `Encrypt=False;TrustServerCertificate=True` to the connection string for dev.
+</Accordion>
+
+## Cross-references
+
+<CardGroup cols={3}>
+  <Card title="Build & release overview" icon="layer-group" href="/build/overview">
+    Landing page for this whole section.
+  </Card>
+  <Card title="Templates" icon="copy" href="/templates/overview">
+    The module template is the one with the most-complete Docker story; the application template intentionally leaves containerization to the generated solution.
+  </Card>
+  <Card title="Repository layout" icon="folder-tree" href="/overview/build-system">
+    Where modules/, templates/, and npm/verdaccio-containers/ sit.
+  </Card>
+</CardGroup>
+
+## Recap
+
+- The reference Docker stack is `templates/module/aspnet-core/`, not `templates/app/aspnet-core/`.
+- Every HTTP host Dockerfile is the same four-stage `base / build / publish / final` pattern with `mcr.microsoft.com/dotnet/{aspnet,sdk}:10.0` and `COPY . .` from the repo root.
+- The database Dockerfile uses `dotnet ef migrations script -i` + `mssql-tools` for one-shot idempotent migrations.
+- Every stack is a compose triplet: `.yml` (topology) + `.override.yml` (env) + `.migrations.yml` (one-shot seed).
+- ABP modules with HTTP hosts (`cms-kit`, `docs`) reuse the exact same shape.
+- `npm/verdaccio-containers/` is a self-contained rig for npm publish dry-runs against a local registry.
+- Kubernetes isn't shipped here — build the images and write your own manifests, mirroring the compose topology.

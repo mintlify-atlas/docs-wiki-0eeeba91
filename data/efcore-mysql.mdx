@@ -1,0 +1,300 @@
+---
+title: "EF Core MySQL Adapters: Oracle and Pomelo Variants"
+sidebarTitle: "EF Core: MySQL"
+description: "Two ABP MySQL adapters — Volo.Abp.EntityFrameworkCore.MySQL (Oracle) and .MySQL.Pomelo — with UseMySQL extensions and connection checkers."
+---
+
+ABP ships **two** MySQL provider adapters under `framework/src/Volo.Abp.EntityFrameworkCore.MySQL/` and `framework/src/Volo.Abp.EntityFrameworkCore.MySQL.Pomelo/`. They are independent NuGet packages — you pick one based on which EF Core MySQL provider you want to bring in. Both share the ABP behaviors documented on [`/data/entityframeworkcore`](/data/entityframeworkcore); the differences are which underlying provider library they wrap and what `Database.ProviderName` they identify as.
+
+This page covers both adapters side by side.
+
+## Why two packages?
+
+| Adapter package                          | EF Core provider              | `Database.ProviderName`                | Notes                                                                |
+| ---------------------------------------- | ----------------------------- | -------------------------------------- | -------------------------------------------------------------------- |
+| `Volo.Abp.EntityFrameworkCore.MySQL`         | `MySql.EntityFrameworkCore` (Oracle official) | `MySql.EntityFrameworkCore`        | Vendor‑official driver. Lighter dependency tree.                       |
+| `Volo.Abp.EntityFrameworkCore.MySQL.Pomelo`  | `Pomelo.EntityFrameworkCore.MySql`            | `Pomelo.EntityFrameworkCore.MySql` | Community provider. Wider EF Core feature parity, very widely used.   |
+
+`AbpDbContext.GetDatabaseProviderOrNull` returns `EfCoreDatabaseProvider.MySql` for `Pomelo.EntityFrameworkCore.MySql`. The Oracle variant is identified by its own provider name and treated as MySQL by the framework's conventions.
+
+<Note>
+Most ABP application templates default to **Pomelo** because it tracks EF Core releases more closely. The Oracle adapter is preferred when your operations team mandates only vendor‑signed drivers.
+</Note>
+
+## Oracle MySQL adapter (`Volo.Abp.EntityFrameworkCore.MySQL`)
+
+### Module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL/Volo/Abp/EntityFrameworkCore/MySQL/AbpEntityFrameworkCoreMySQLModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreMySQLModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+### UseMySQL extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsMySQLExtensions.cs
+public static class AbpDbContextOptionsMySQLExtensions
+{
+    public static void UseMySQL(
+        [NotNull] this AbpDbContextOptions options,
+        Action<MySql.EntityFrameworkCore.Infrastructure.MySQLDbContextOptionsBuilder>? mySQLOptionsAction = null)
+    {
+        options.Configure(context =>
+        {
+            context.UseMySQL(mySQLOptionsAction);
+        });
+    }
+
+    public static void UseMySQL<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<MySql.EntityFrameworkCore.Infrastructure.MySQLDbContextOptionsBuilder>? mySQLOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseMySQL(mySQLOptionsAction);
+        });
+    }
+}
+```
+
+The options builder type is `MySql.EntityFrameworkCore.Infrastructure.MySQLDbContextOptionsBuilder` (note the capitalisation — Oracle's provider).
+
+### Connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL/Volo/Abp/EntityFrameworkCore/ConnectionStrings/MySQLConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class MySQLConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new MySqlConnectionStringBuilder(connectionString)
+            {
+                ConnectionLifeTime = 1
+            };
+
+            var oldDatabaseName = connString.Database;
+            connString.Database = "mysql";
+
+            await using var conn = new MySqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Uses `MySql.Data.MySqlClient.MySqlConnection`. The `ConnectionLifeTime = 1` is a 1‑second cap, then `ChangeDatabaseAsync` confirms the requested DB exists.
+
+## Pomelo MySQL adapter (`Volo.Abp.EntityFrameworkCore.MySQL.Pomelo`)
+
+### Module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL.Pomelo/Volo/Abp/EntityFrameworkCore/MySQL/AbpEntityFrameworkCoreMySQLPomeloModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreMySQLPomeloModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+### UseMySQL extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL.Pomelo/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsMySQLExtensions.cs
+public static class AbpDbContextOptionsMySQLExtensions
+{
+    public static void UseMySQL(
+        [NotNull] this AbpDbContextOptions options,
+        Action<MySqlDbContextOptionsBuilder>? mySQLOptionsAction = null)
+    {
+        options.Configure(context =>
+        {
+            context.UseMySQL(mySQLOptionsAction);
+        });
+    }
+
+    public static void UseMySQL<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<MySqlDbContextOptionsBuilder>? mySQLOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseMySQL(mySQLOptionsAction);
+        });
+    }
+}
+```
+
+Same method name, different options builder (`Microsoft.EntityFrameworkCore.Infrastructure.MySqlDbContextOptionsBuilder` — Pomelo's). The `Configure(context => context.UseMySQL(...))` call is Pomelo's `UseMySQL` extension, not Oracle's.
+
+<Warning>
+Because both adapters expose `UseMySQL` on `AbpDbContextOptions`, you **cannot** reference both packages in the same project. The C# compiler will pick whichever overload it finds, but the runtime behavior depends on which `UseMySQL(...)` provider extension is in scope. Pick one.
+</Warning>
+
+### Connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.MySQL.Pomelo/Volo/Abp/EntityFrameworkCore/ConnectionStrings/PomeloMySQLConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class PomeloMySQLConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new MySqlConnectionStringBuilder(connectionString)
+            {
+                ConnectionLifeTime = 1
+            };
+
+            var oldDatabaseName = connString.Database;
+            connString.Database = "mysql";
+
+            await using var conn = new MySqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Almost identical to the Oracle variant but uses `MySqlConnector.MySqlConnection` instead of `MySql.Data.MySqlClient.MySqlConnection`. Pomelo's recommended ADO.NET driver is the open‑source `MySqlConnector` library.
+
+## Module wiring
+
+Pomelo flavor:
+
+```xml
+<PackageReference Include="Volo.Abp.EntityFrameworkCore.MySQL.Pomelo" Version="..." />
+```
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreMySQLPomeloModule))]
+public class MyAppEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseMySQL();
+        });
+
+        context.Services.AddAbpDbContext<MyAppDbContext>(opts =>
+        {
+            opts.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+}
+```
+
+Oracle flavor: swap `AbpEntityFrameworkCoreMySQLPomeloModule` for `AbpEntityFrameworkCoreMySQLModule`.
+
+`appsettings.json`:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=localhost;Port=3306;Database=MyApp;Uid=app;Pwd=...;"
+  }
+}
+```
+
+## GUID strategy
+
+Both adapters set `SequentialGuidType.SequentialAsString` as the default — same reasoning as PostgreSQL. MySQL stores GUIDs as `CHAR(36)` by default (string), so a string‑sequential GUID keeps the BTREE index hot.
+
+## DB function filters
+
+Both modules set `AbpEfCoreGlobalFilterOptions.UseDbFunction = true`. EF Core's MySQL providers translate ABP's `AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilter` and `MultiTenantFilter` to scalar functions; this keeps plan caches hot when filters toggle.
+
+## Choosing between the two
+
+<AccordionGroup>
+  <Accordion title="Pick Pomelo if...">
+    - You want widest EF Core feature parity (collation, JSON, spatial, RowVersion via `Timestamp`).
+    - You want a community‑maintained provider tracked closely against EF Core releases.
+    - You're starting fresh — this is ABP's recommended default.
+  </Accordion>
+  <Accordion title="Pick Oracle MySQL if...">
+    - Compliance / vendor policy mandates Oracle's official driver.
+    - You need a feature shipping only in the official driver (e.g. some X‑DevAPI/connector‑specific features).
+    - You're migrating from a legacy app already on Oracle MySQL Connector.
+  </Accordion>
+  <Accordion title="Do NOT install both">
+    You will get conflicting `UseMySQL(this AbpDbContextOptions)` extension methods, conflicting `IConnectionStringChecker` registrations, and confusing diagnostics. Pick one, reference one.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    What both adapters layer onto.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    Where the two `IConnectionStringChecker` implementations slot in.
+  </Card>
+  <Card title="SQL Server adapter" icon="server" href="/data/efcore-sqlserver">
+    Compare module shape.
+  </Card>
+  <Card title="Oracle adapter" icon="building-columns" href="/data/efcore-oracle">
+    Another two‑variant adapter (ODP and Devart).
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    Provider‑agnostic domain API.
+  </Card>
+  <Card title="UoW transaction flow" icon="diagram-project" href="/flows/unit-of-work-lifecycle">
+    End‑to‑end commit.
+  </Card>
+</CardGroup>

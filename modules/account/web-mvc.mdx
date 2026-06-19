@@ -1,0 +1,416 @@
+---
+title: "Account Razor Pages (MVC)"
+description: "Server-rendered login, register, password reset, profile management, and external-login pages shipped in Volo.Abp.Account.Web."
+---
+
+The **`Volo.Abp.Account.Web`** project is the Razor-Pages UI of the Account module. It is what end users see when they hit `/Account/Login`, `/Account/Register`, `/Account/ForgotPassword`, `/Account/ResetPassword`, `/Account/Manage`, or `/Account/Logout` in any ABP server-rendered application that uses the MVC / Blazor-Server / OpenIddict-host templates.
+
+```text modules/account/src/Volo.Abp.Account.Web/Pages/Account/
+├── _Layout.cshtml
+├── _ViewImports.cshtml
+├── _ViewStart.cshtml
+├── AccountPageModel.cs
+├── Login.cshtml(.cs) / Login.js
+├── Register.cshtml(.cs)
+├── ForgotPassword.cshtml(.cs)
+├── PasswordResetLinkSent.cshtml(.cs)
+├── ResetPassword.cshtml(.cs)
+├── ResetPasswordConfirmation.cshtml(.cs)
+├── Manage.cshtml(.cs) / Manage.css
+├── Logout.cshtml(.cs)
+├── LoggedOut.cshtml(.cs) / LoggedOut.css / LoggedOut.js
+├── AccessDenied.cshtml(.cs)
+└── Components/ProfileManagementGroup/
+    ├── Password/
+    └── PersonalInfo/
+```
+
+All page models inherit `AccountPageModel`, which itself extends `AbpPageModel` and pre-injects the services every flow needs: `IAccountAppService`, `SignInManager`, `UserManager`, `SchemeProvider`, `IdentitySecurityLogManager`, and the `IdentityDynamicClaimsPrincipalContributorCache`.
+
+## `LoginModel`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs
+public class LoginModel : AccountPageModel
+{
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrl     { get; set; }
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+    [BindProperty] public LoginInputModel LoginInput { get; set; }
+
+    public bool EnableLocalLogin { get; set; }
+    public IEnumerable<ExternalProviderModel> ExternalProviders { get; set; }
+    public IEnumerable<ExternalProviderModel> VisibleExternalProviders =>
+        ExternalProviders.Where(x => !String.IsNullOrWhiteSpace(x.DisplayName));
+
+    public bool   IsExternalLoginOnly => EnableLocalLogin == false && ExternalProviders?.Count() == 1;
+    public string ExternalLoginScheme => IsExternalLoginOnly ? ExternalProviders?.SingleOrDefault()?.AuthenticationScheme : null;
+}
+```
+
+### `OnGetAsync`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    LoginInput ??= new LoginInputModel();
+
+    ExternalProviders = await GetExternalProviders();
+    EnableLocalLogin  = await SettingProvider.IsTrueAsync(AccountSettingNames.EnableLocalLogin);
+
+    if (IsExternalLoginOnly)
+    {
+        return await OnPostExternalLogin(ExternalProviders.First().AuthenticationScheme);
+    }
+
+    return Page();
+}
+```
+
+Two responsibilities: discover the external providers via `IAuthenticationSchemeProvider`, and short-circuit to a challenge when local login is disabled **and** exactly one external scheme is configured. This is how the "single SSO" experience works without any extra wiring.
+
+### `OnPostAsync`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs
+var result = await SignInManager.PasswordSignInAsync(
+    LoginInput.UserNameOrEmailAddress,
+    LoginInput.Password,
+    LoginInput.RememberMe,
+    true /* lockoutOnFailure */
+);
+
+await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext()
+{
+    Identity = IdentitySecurityLogIdentityConsts.Identity,
+    Action   = result.ToIdentitySecurityLogAction(),
+    UserName = LoginInput.UserNameOrEmailAddress
+});
+
+if (result.RequiresTwoFactor) return await TwoFactorLoginResultAsync();
+if (result.IsLockedOut)       { Alerts.Warning(L["UserLockedOutMessage"]); return Page(); }
+if (result.IsNotAllowed)      { Alerts.Warning(L["LoginIsNotAllowed"]);    return Page(); }
+if (!result.Succeeded)        { Alerts.Danger (L["InvalidUserNameOrPassword"]); return Page(); }
+
+var user = await UserManager.FindByNameAsync(LoginInput.UserNameOrEmailAddress)
+        ?? await UserManager.FindByEmailAsync(LoginInput.UserNameOrEmailAddress);
+
+await IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(user.Id, user.TenantId);
+
+return await RedirectSafelyAsync(ReturnUrl, ReturnUrlHash);
+```
+
+Every outcome is logged through `IdentitySecurityLogManager` (success, 2FA-required, locked-out, not-allowed, invalid). On success the **dynamic claims cache is cleared** so the first request after login rebuilds the claim principal from current settings / roles / claim contributors.
+
+### External login
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs
+public virtual async Task<IActionResult> OnPostExternalLogin(string provider)
+{
+    var redirectUrl = Url.Page("./Login", pageHandler: "ExternalLoginCallback",
+                               values: new { ReturnUrl, ReturnUrlHash });
+    var properties  = SignInManager.ConfigureExternalAuthenticationProperties(provider, redirectUrl);
+    properties.Items["scheme"] = provider;
+    return await Task.FromResult(Challenge(properties, provider));
+}
+
+public virtual async Task<IActionResult> OnGetExternalLoginCallbackAsync(
+    string returnUrl = "", string returnUrlHash = "", string remoteError = null)
+{
+    var loginInfo = await SignInManager.GetExternalLoginInfoAsync();
+    var result = await SignInManager.ExternalLoginSignInAsync(
+        loginInfo.LoginProvider,
+        loginInfo.ProviderKey,
+        isPersistent: false,
+        bypassTwoFactor: true);
+
+    if (result.Succeeded)
+    {
+        var user = await UserManager.FindByLoginAsync(loginInfo.LoginProvider, loginInfo.ProviderKey);
+        await IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(user.Id, user.TenantId);
+        return await RedirectSafelyAsync(returnUrl, returnUrlHash);
+    }
+    // ... falls through to registration when no local user is linked
+}
+```
+
+The challenge → callback → `ExternalLoginSignInAsync` triad is the standard ASP.NET Core external-login pattern. ABP's contribution is the **dynamic claims cache invalidation** and the use of `RedirectSafelyAsync` (defined on `AccountPageModel`) which rejects open-redirect attempts by validating the URL against `Url.IsLocalUrl` plus the configured host.
+
+## `RegisterModel`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Register.cshtml.cs
+public class RegisterModel : AccountPageModel
+{
+    [BindProperty(SupportsGet = true)] public string ReturnUrl     { get; set; }
+    [BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+    [BindProperty]                     public PostInput Input      { get; set; }
+    [BindProperty(SupportsGet = true)] public bool   IsExternalLogin        { get; set; }
+    [BindProperty(SupportsGet = true)] public string ExternalLoginAuthSchema { get; set; }
+
+    public bool EnableLocalRegister { get; set; }
+}
+```
+
+`OnGetAsync` immediately checks self-registration through `CheckSelfRegistrationAsync`, which mirrors the application-service gate (`Abp.Account.IsSelfRegistrationEnabled`). When disabled, the page renders an alert; when disabled **and** an external provider exists, it short-circuits to the external challenge so the user can sign up via the IdP without seeing a "registration disabled" page.
+
+`OnPostAsync` calls `AccountAppService.RegisterAsync(...)` and, on success, signs the user in via `SignInManager.SignInAsync` so they don't have to log in again. If the original request was an external-callback rendezvous (`IsExternalLogin == true`), the post handler instead links the just-created user to the external `LoginProvider` / `ProviderKey` via `UserManager.AddLoginAsync` before signing in.
+
+## `ForgotPasswordModel`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/ForgotPassword.cshtml.cs
+public class ForgotPasswordModel : AccountPageModel
+{
+    [Required, EmailAddress]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxEmailLength))]
+    [BindProperty]
+    public string Email { get; set; }
+
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrl     { get; set; }
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        try
+        {
+            await AccountAppService.SendPasswordResetCodeAsync(
+                new SendPasswordResetCodeDto
+                {
+                    Email         = Email,
+                    AppName       = "MVC", // TODO: Const!
+                    ReturnUrl     = ReturnUrl,
+                    ReturnUrlHash = ReturnUrlHash
+                }
+            );
+        }
+        catch (UserFriendlyException e)
+        {
+            Alerts.Danger(GetLocalizeExceptionMessage(e));
+            return Page();
+        }
+
+        return RedirectToPage("./PasswordResetLinkSent",
+            new { returnUrl = ReturnUrl, returnUrlHash = ReturnUrlHash });
+    }
+}
+```
+
+The thin try/catch is intentional — when the email lookup fails, the application service throws `UserFriendlyException` which is rendered as an alert on the same page. After a successful send, the user is redirected to `PasswordResetLinkSent.cshtml` which is a static "check your email" view.
+
+## `ResetPasswordModel`
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/ResetPassword.cshtml.cs
+public class ResetPasswordModel : AccountPageModel
+{
+    [Required, HiddenInput] [BindProperty(SupportsGet = true)] public Guid   UserId        { get; set; }
+    [Required, HiddenInput] [BindProperty(SupportsGet = true)] public string ResetToken    { get; set; }
+    [HiddenInput]           [BindProperty(SupportsGet = true)] public string ReturnUrl     { get; set; }
+    [HiddenInput]           [BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+
+    [Required, BindProperty, DataType(DataType.Password), DisableAuditing]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxPasswordLength))]
+    public string Password { get; set; }
+
+    [Required, BindProperty, DataType(DataType.Password), DisableAuditing]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxPasswordLength))]
+    public string ConfirmPassword { get; set; }
+
+    public bool InvalidToken { get; set; }
+}
+```
+
+`OnGetAsync` verifies the token up front:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/ResetPassword.cshtml.cs
+InvalidToken = !await AccountAppService.VerifyPasswordResetTokenAsync(
+    new VerifyPasswordResetTokenInput { UserId = UserId, ResetToken = ResetToken });
+```
+
+so the view can render either the form or an "Invalid or expired link" message before the user even types a new password.
+
+`OnPostAsync` calls `AccountAppService.ResetPasswordAsync(...)`, surfaces `AbpIdentityResultException` as alerts, and on success redirects to `ResetPasswordConfirmation.cshtml`.
+
+<Note>
+`[DisableAuditing]` keeps the new password out of audit logs. Combined with `DynamicStringLength` (which reads `MaxPasswordLength` from `IdentityUserConsts` at runtime), the field correctly respects the host-level Identity options without recompilation.
+</Note>
+
+## `Manage` and the profile-management page contributors
+
+`Manage.cshtml` is registered as **`[Authorize]`** in the module:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountWebModule.cs
+Configure<RazorPagesOptions>(options =>
+{
+    options.Conventions.AuthorizePage("/Account/Manage");
+});
+
+Configure<ProfileManagementPageOptions>(options =>
+{
+    options.Contributors.Add(new AccountProfileManagementPageContributor());
+});
+
+Configure<AbpBundlingOptions>(options =>
+{
+    options.ScriptBundles
+        .Configure(typeof(ManageModel).FullName, configuration =>
+        {
+            configuration.AddFiles("/client-proxies/account-proxy.js");
+            configuration.AddFiles("/Pages/Account/Components/ProfileManagementGroup/Password/Default.js");
+            configuration.AddFiles("/Pages/Account/Components/ProfileManagementGroup/PersonalInfo/Default.js");
+        });
+});
+```
+
+The `Manage` page does not render any field directly — it iterates `ProfileManagementPageCreationContext.Groups` and asks each contributor to add tabs. The `AccountProfileManagementPageContributor` (`Volo.Abp.Account.Web/ProfileManagement/AccountProfileManagementPageContributor.cs`) ships two view components out of the box:
+
+- `Pages/Account/Components/ProfileManagementGroup/PersonalInfo/Default.cshtml` — the personal-info form (UserName, Email, Name, Surname, PhoneNumber).
+- `Pages/Account/Components/ProfileManagementGroup/Password/Default.cshtml` — the change-password form.
+
+Both are wired against `IProfileAppService` through the dynamic JS proxy bundle declared above.
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Manage.cshtml.cs
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    ProfileManagementPageCreationContext = new ProfileManagementPageCreationContext(ServiceProvider);
+
+    foreach (var contributor in Options.Contributors)
+    {
+        await contributor.ConfigureAsync(ProfileManagementPageCreationContext);
+    }
+
+    if (ReturnUrl != null)
+    {
+        if (!Url.IsLocalUrl(ReturnUrl) &&
+            !ReturnUrl.StartsWith(UriHelper.BuildAbsolute(Request.Scheme, Request.Host, Request.PathBase).RemovePostFix("/")))
+        // ... open-redirect guard continues
+    }
+
+    return Page();
+}
+```
+
+To add your own tab (for example, "API keys" or "Notifications"), implement `IProfileManagementPageContributor` and add it to `ProfileManagementPageOptions.Contributors` in your module — no changes to `Manage.cshtml` needed.
+
+## Logout
+
+```csharp modules/account/src/Volo.Abp.Account.Web/Pages/Account/Logout.cshtml.cs
+public class LogoutModel : AccountPageModel
+{
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrl     { get; set; }
+    [HiddenInput] [BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext()
+        {
+            Identity = IdentitySecurityLogIdentityConsts.Identity,
+            Action   = IdentitySecurityLogActionConsts.Logout
+        });
+
+        await SignInManager.SignOutAsync();
+
+        if (ReturnUrl != null)               return await RedirectSafelyAsync(ReturnUrl, ReturnUrlHash);
+        if (await SettingProvider.IsTrueAsync(AccountSettingNames.EnableLocalLogin))
+            return RedirectToPage("/Account/Login");
+        return RedirectToPage("/");
+    }
+}
+```
+
+The model logs the logout event before clearing the cookie, then chooses a destination: the requested `ReturnUrl` if safe, the login page if local login is on, or the root otherwise.
+
+## External login management
+
+The Account.Web project does not ship a dedicated `ManageLogins.cshtml` page — managing linked external providers is handled inside the **PersonalInfo** profile-management group via `IUserManager.GetLoginsAsync` / `AddLoginAsync` / `RemoveLoginAsync`. The same JavaScript bundle that backs `Manage.cshtml` exposes these calls through the account proxy.
+
+If you need a dedicated `/Account/ManageLogins` page (parity with the legacy ASP.NET Identity scaffolding), implement it as a custom Razor Page in your host that calls `UserManager.GetLoginsAsync(user)` directly — the building blocks live in the [Identity module](/modules/identity/overview).
+
+## Localization
+
+`AccountResource` is declared once in the contracts package and re-used everywhere — there is no separate `AccountWebSharedLocalizationModule` to register:
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/Localization/AccountResource.cs
+[LocalizationResourceName("AbpAccount")]
+public class AccountResource { }
+```
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/AbpAccountApplicationContractsModule.cs
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Add<AccountResource>("en")
+        .AddBaseTypes(typeof(AbpValidationResource))
+        .AddVirtualJson("/Volo/Abp/Account/Localization/Resources");
+});
+
+Configure<AbpExceptionLocalizationOptions>(options =>
+{
+    options.MapCodeNamespace("Volo.Account", typeof(AccountResource));
+});
+```
+
+The Web module then registers Data Annotations against the same resource so `[Required]` / `[EmailAddress]` errors get the same translations:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountWebModule.cs
+context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+{
+    options.AddAssemblyResource(
+        typeof(AccountResource),
+        typeof(AbpAccountWebModule).Assembly,
+        typeof(AbpAccountApplicationContractsModule).Assembly
+    );
+});
+```
+
+This is the equivalent of registering a shared-localization module: it pre-configures the MVC data-annotations localizer to look up keys in `AccountResource` for any model class defined in either assembly.
+
+## User menu contributor
+
+The user-menu dropdown ("My Account" / "Logout") in any Account-enabled MVC host comes from this contributor:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountUserMenuContributor.cs
+public class AbpAccountUserMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.User) return Task.CompletedTask;
+
+        var uiResource      = context.GetLocalizer<AbpUiResource>();
+        var accountResource = context.GetLocalizer<AccountResource>();
+
+        context.Menu.AddItem(new ApplicationMenuItem(
+            "Account.Manage", accountResource["MyAccount"],
+            url: "~/Account/Manage", icon: "fa fa-cog",
+            order: 1000));
+
+        context.Menu.AddItem(new ApplicationMenuItem(
+            "Account.Logout", uiResource["Logout"],
+            url: "~/Account/Logout", icon: "fa fa-power-off",
+            order: int.MaxValue - 1000));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Registered in `AbpAccountWebModule`:
+
+```csharp modules/account/src/Volo.Abp.Account.Web/AbpAccountWebModule.cs
+Configure<AbpNavigationOptions>(options =>
+{
+    options.MenuContributors.Add(new AbpAccountUserMenuContributor());
+});
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Application services" icon="cog" href="/modules/account/application">
+    The services these page models call into.
+  </Card>
+  <Card title="Blazor UI" icon="bolt" href="/modules/account/blazor">
+    The Blazor counterpart of `Manage.cshtml`.
+  </Card>
+  <Card title="OpenIddict host" icon="key" href="/modules/account/openiddict-host">
+    How the OpenIddict host overrides `LoginModel` to integrate with the authorization endpoint.
+  </Card>
+  <Card title="Security helpers" icon="lock" href="/security/security-helpers">
+    `RedirectSafelyAsync`, `ICurrentUser`, and the dynamic claims contributor cache used inside `AccountPageModel`.
+  </Card>
+</CardGroup>

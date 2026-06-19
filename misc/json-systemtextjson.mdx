@@ -1,0 +1,488 @@
+---
+title: "JSON — System.Text.Json: AbpSystemTextJsonSerializer, converter stack, TypeInfoResolver modifiers"
+sidebarTitle: "JSON — System.Text.Json"
+description: "The System.Text.Json provider for IJsonSerializer. Covers AbpSystemTextJsonSerializer, the bundled converters (AbpStringToBooleanConverter, AbpStringToGuidConverter, AbpStringToEnumConverter, AbpDateTimeConverter, ObjectToInferredTypesConverter) and the TypeInfoResolver modifiers."
+---
+
+`Volo.Abp.Json.SystemTextJson` is the **default** provider for ABP's [`IJsonSerializer`](/misc/json) abstraction. It's pulled in transitively by `AbpJsonModule`, so unless you opt into [Newtonsoft](/misc/json-newtonsoft) explicitly this is what runs.
+
+Source: `framework/src/Volo.Abp.Json.SystemTextJson/Volo/Abp/Json/SystemTextJson/`
+
+## The serializer
+
+```csharp
+// framework/src/Volo.Abp.Json.SystemTextJson/Volo/Abp/Json/SystemTextJson/AbpSystemTextJsonSerializer.cs
+public class AbpSystemTextJsonSerializer : IJsonSerializer, ITransientDependency
+{
+    protected AbpSystemTextJsonSerializerOptions Options { get; }
+
+    public AbpSystemTextJsonSerializer(IOptions<AbpSystemTextJsonSerializerOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public string Serialize(object obj, bool camelCase = true, bool indented = false)
+        => JsonSerializer.Serialize(obj, CreateJsonSerializerOptions(camelCase, indented));
+
+    public T Deserialize<T>(string jsonString, bool camelCase = true)
+        => JsonSerializer.Deserialize<T>(jsonString, CreateJsonSerializerOptions(camelCase))!;
+
+    public object Deserialize(Type type, string jsonString, bool camelCase = true)
+        => JsonSerializer.Deserialize(jsonString, type, CreateJsonSerializerOptions(camelCase))!;
+```
+
+No `[Dependency(ReplaceServices = true)]` here — that's how Newtonsoft can take over when its module is also loaded. This class is registered as the *default* `IJsonSerializer`.
+
+### Cache
+
+```csharp
+private static readonly ConcurrentDictionary<object, JsonSerializerOptions> JsonSerializerOptionsCache =
+    new ConcurrentDictionary<object, JsonSerializerOptions>();
+
+protected virtual JsonSerializerOptions CreateJsonSerializerOptions(bool camelCase = true, bool indented = false)
+{
+    return JsonSerializerOptionsCache.GetOrAdd(new
+    {
+        camelCase,
+        indented,
+        Options.JsonSerializerOptions
+    }, _ => new JsonSerializerOptions(Options.JsonSerializerOptions)
+    {
+        PropertyNamingPolicy = camelCase ? JsonNamingPolicy.CamelCase : null,
+        WriteIndented        = indented
+    });
+}
+```
+
+The cache key includes the *reference* to `Options.JsonSerializerOptions`, so if a downstream module replaces the entire options instance (rare) the cache is invalidated. The new `JsonSerializerOptions(other)` copy-constructor produces a fresh, mutable instance — `JsonSerializerOptions` is mutable only until first use, and copy semantics keep the cache safe.
+
+`JsonNamingPolicy.CamelCase` is the built-in policy used when `camelCase: true`. For `false`, the policy is `null` which means "use the property names as declared in C#".
+
+## The options
+
+```csharp
+// framework/src/Volo.Abp.Json.SystemTextJson/Volo/Abp/Json/SystemTextJson/AbpSystemTextJsonSerializerOptions.cs
+public class AbpSystemTextJsonSerializerOptions
+{
+    public JsonSerializerOptions JsonSerializerOptions { get; }
+
+    public AbpSystemTextJsonSerializerOptions()
+    {
+        JsonSerializerOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        };
+    }
+}
+```
+
+Two non-defaults applied on top of `JsonSerializerDefaults.Web` (which already gives camelCase, case-insensitive property names, and number-string coercion):
+
+- **`ReadCommentHandling = JsonCommentHandling.Skip`** — allows `// …` in input JSON. Handy when settings come from a sloppy config file.
+- **`AllowTrailingCommas = true`** — same reason; tolerant input parsing.
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Json.SystemTextJson/Volo/Abp/Json/SystemTextJson/AbpJsonSystemTextJsonModule.cs
+[DependsOn(typeof(AbpJsonAbstractionsModule), typeof(AbpTimingModule), typeof(AbpDataModule))]
+public class AbpJsonSystemTextJsonModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddOptions<AbpSystemTextJsonSerializerOptions>()
+            .Configure<IServiceProvider>((options, rootServiceProvider) =>
+            {
+                options.JsonSerializerOptions.Encoder ??= JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+
+                options.JsonSerializerOptions.Converters.Add(new AbpStringToEnumFactory());
+                options.JsonSerializerOptions.Converters.Add(new AbpStringToBooleanConverter());
+                options.JsonSerializerOptions.Converters.Add(new AbpStringToGuidConverter());
+                options.JsonSerializerOptions.Converters.Add(new AbpNullableStringToGuidConverter());
+                options.JsonSerializerOptions.Converters.Add(new ObjectToInferredTypesConverter());
+
+                options.JsonSerializerOptions.TypeInfoResolver = new AbpDefaultJsonTypeInfoResolver(rootServiceProvider
+                    .GetRequiredService<IOptions<AbpSystemTextJsonSerializerModifiersOptions>>());
+
+                var dateTimeConverter        = rootServiceProvider.GetRequiredService<AbpDateTimeConverter>().SkipDateTimeNormalization();
+                var nullableDateTimeConverter = rootServiceProvider.GetRequiredService<AbpNullableDateTimeConverter>().SkipDateTimeNormalization();
+
+                options.JsonSerializerOptions.TypeInfoResolver.As<AbpDefaultJsonTypeInfoResolver>().Modifiers.Add(
+                    new AbpDateTimeConverterModifier(dateTimeConverter, nullableDateTimeConverter)
+                        .CreateModifyAction());
+            });
+    }
+}
+```
+
+A lot happens in this one configurator. Walk through it:
+
+1. **`Encoder ??= JavaScriptEncoder.UnsafeRelaxedJsonEscaping`** — the default S.T.J. encoder escapes *every* non-ASCII character. The relaxed one keeps non-ASCII as-is, which matters for non-Latin scripts and emoji.
+2. **Five converters added** in order:
+   - `AbpStringToEnumFactory` — produces `AbpStringToEnumConverter<T>` per enum type (string → enum with fallback to integer).
+   - `AbpStringToBooleanConverter` — accepts `"true"`/`"false"` strings as booleans.
+   - `AbpStringToGuidConverter` — accepts all five `Guid` formats (`N`, `D`, `B`, `P`, `X`).
+   - `AbpNullableStringToGuidConverter` — same, for `Guid?`.
+   - `ObjectToInferredTypesConverter` — deserializes `object`-typed properties into `bool`/`long`/`double`/`DateTime`/`string`/`JsonElement` instead of `JsonElement`-always.
+3. **`TypeInfoResolver = new AbpDefaultJsonTypeInfoResolver(...)`** — installs ABP's resolver, which is a `DefaultJsonTypeInfoResolver` with modifiers added from `AbpSystemTextJsonSerializerModifiersOptions`.
+4. **The `AbpDateTimeConverterModifier`** is appended to the resolver — it walks every `JsonTypeInfo` and attaches `AbpDateTimeConverter` (or its nullable sibling) per-property.
+
+## The converter stack
+
+### `AbpStringToBooleanConverter`
+
+```csharp
+// JsonConverters/AbpStringToBooleanConverter.cs
+public class AbpStringToBooleanConverter : JsonConverter<bool>
+{
+    public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            var span = reader.HasValueSequence ? reader.ValueSequence.ToArray() : reader.ValueSpan;
+            if (Utf8Parser.TryParse(span, out bool b1, out var bytesConsumed) && span.Length == bytesConsumed)
+            {
+                return b1;
+            }
+
+            if (bool.TryParse(reader.GetString(), out var b2))
+            {
+                return b2;
+            }
+        }
+
+        return reader.GetBoolean();
+    }
+
+    public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options)
+    {
+        writer.WriteBooleanValue(value);
+    }
+}
+```
+
+Why bother? HTTP clients (and form-encoded sources) often deliver booleans as strings: `"true"`, `"false"`. Default S.T.J. throws. This converter accepts both, with a fast-path `Utf8Parser` for the common case.
+
+### `AbpStringToGuidConverter`
+
+```csharp
+public class AbpStringToGuidConverter : JsonConverter<Guid>
+{
+    public override Guid Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            var guidString = reader.GetString();
+            string[] formats = { "N", "D", "B", "P", "X" };
+            foreach (var format in formats)
+            {
+                if (Guid.TryParseExact(guidString, format, out var guid))
+                {
+                    return guid;
+                }
+            }
+        }
+
+        return reader.GetGuid();
+    }
+
+    public override void Write(Utf8JsonWriter writer, Guid value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value);
+    }
+}
+```
+
+Accepts every `Guid` format (`N` = no hyphens, `D` = standard, `B` = `{...}`, `P` = `(...)`, `X` = `{0xN,...}`). The default S.T.J. only accepts `D` strictly. `AbpNullableStringToGuidConverter` is the same for `Guid?` — returns `null` on parse failure.
+
+### `AbpStringToEnumConverter<T>` + `AbpStringToEnumFactory`
+
+```csharp
+public class AbpStringToEnumConverter<T> : JsonConverter<T> where T : struct, Enum
+{
+    public override T Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        _readJsonSerializerOptions ??= JsonSerializerOptionsHelper.Create(options, x =>
+                x == this ||
+                x.GetType() == typeof(AbpStringToEnumFactory),
+            _innerJsonStringEnumConverter.CreateConverter(typeToConvert, options));
+
+        return JsonSerializer.Deserialize<T>(ref reader, _readJsonSerializerOptions);
+    }
+    // …
+}
+```
+
+The clever bit: it builds a *new* `JsonSerializerOptions` that **excludes** itself and the factory, then adds the built-in `JsonStringEnumConverter`. That prevents infinite recursion when the built-in converter is invoked as the delegate. The result: `allowIntegerValues = true` (the default), so both `"Active"` and `1` deserialize to the same enum.
+
+The **factory** (`AbpStringToEnumFactory`) is what's actually registered; S.T.J. picks the right `AbpStringToEnumConverter<T>` per enum type via `CreateConverter`.
+
+### `ObjectToInferredTypesConverter`
+
+```csharp
+public class ObjectToInferredTypesConverter : JsonConverter<object>
+{
+    public override object Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        (reader.TokenType switch
+        {
+            JsonTokenType.True   => true,
+            JsonTokenType.False  => false,
+            JsonTokenType.Number when reader.TryGetInt64(out long l) => l,
+            JsonTokenType.Number => reader.GetDouble(),
+            JsonTokenType.String when reader.TryGetDateTime(out DateTime datetime) => datetime,
+            JsonTokenType.String => reader.GetString(),
+            _ => JsonDocument.ParseValue(ref reader).RootElement.Clone()
+        })!;
+```
+
+The default S.T.J. behaviour is to dump *every* `object` value into a `JsonElement`. That makes downstream code awkward — every property of `ExtraProperties` would need `JsonElement.GetString()` boilerplate. The Abp converter instead **infers** the most natural type:
+
+| Token | Becomes |
+|---|---|
+| `true` / `false` | `bool` |
+| `123` | `long` (preferred) or `double` |
+| `"2024-08-13T…"` | `DateTime` if parseable, else `string` |
+| `"abc"` | `string` |
+| `{ ... }` / `[ ... ]` | `JsonElement` (clone, so it survives the buffer) |
+
+The downstream code can now do `(string)dict["name"]`, `(long)dict["count"]`, etc. without parsing `JsonElement` everywhere.
+
+### Writing `object`
+
+```csharp
+public override void Write(Utf8JsonWriter writer, object objectToWrite, JsonSerializerOptions options)
+{
+    var runtimeType = objectToWrite.GetType();
+    if (runtimeType == typeof(object))
+    {
+        writer.WriteStartObject();
+        writer.WriteEndObject();
+        return;
+    }
+
+    JsonSerializer.Serialize(writer, objectToWrite, runtimeType, options);
+}
+```
+
+The `runtimeType == typeof(object)` guard prevents the infinite recursion you'd get otherwise: if you wrote `new object()`, S.T.J. would call this converter again, which would call `JsonSerializer.Serialize`, which would dispatch back here.
+
+## `AbpDateTimeConverter` and the TypeInfo modifier
+
+```csharp
+// JsonConverters/AbpDateTimeConverter.cs (excerpt)
+public class AbpDateTimeConverter : JsonConverter<DateTime>, ITransientDependency
+{
+    private readonly IClock _clock;
+    private readonly AbpJsonOptions _options;
+    private bool _skipDateTimeNormalization;
+
+    public override DateTime Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (_options.InputDateTimeFormats.Any())
+        {
+            if (reader.TokenType == JsonTokenType.String)
+            {
+                foreach (var format in _options.InputDateTimeFormats)
+                {
+                    var s = reader.GetString();
+                    if (DateTime.TryParseExact(s, format, CultureInfo.CurrentUICulture, DateTimeStyles.None, out var d1))
+                    {
+                        return Normalize(d1);
+                    }
+                }
+            }
+            else
+            {
+                throw new JsonException("Reader's TokenType is not String!");
+            }
+        }
+
+        if (reader.TryGetDateTime(out var d3)) return Normalize(d3);
+
+        var dateText = reader.GetString();
+        if (!dateText.IsNullOrWhiteSpace() &&
+            DateTime.TryParse(dateText, CultureInfo.CurrentUICulture, DateTimeStyles.None, out var d4))
+        {
+            return Normalize(d4);
+        }
+
+        throw new JsonException("Can't get datetime from the reader!");
+    }
+
+    public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions options)
+    {
+        if (_options.OutputDateTimeFormat.IsNullOrWhiteSpace())
+        {
+            writer.WriteStringValue(Normalize(value));
+        }
+        else
+        {
+            writer.WriteStringValue(Normalize(value).ToString(_options.OutputDateTimeFormat, CultureInfo.CurrentUICulture));
+        }
+    }
+
+    protected virtual DateTime Normalize(DateTime dateTime)
+        => _skipDateTimeNormalization ? dateTime : _clock.Normalize(dateTime);
+}
+```
+
+`AbpNullableDateTimeConverter` is the same for `DateTime?` and is silent on parse failure (returns `null` instead of throwing).
+
+### The TypeInfo modifier
+
+S.T.J. doesn't have Newtonsoft-style `IContractResolver.CreateProperty`. The replacement is **type-info modifiers** — actions that run against each generated `JsonTypeInfo` and can tweak per-property metadata. ABP uses one to attach the date converter selectively:
+
+```csharp
+// Modifiers/AbpDateTimeConverterModifier.cs
+public class AbpDateTimeConverterModifier
+{
+    private readonly AbpDateTimeConverter _abpDateTimeConverter;
+    private readonly AbpNullableDateTimeConverter _abpNullableDateTimeConverter;
+
+    public AbpDateTimeConverterModifier(AbpDateTimeConverter abpDateTimeConverter,
+        AbpNullableDateTimeConverter abpNullableDateTimeConverter)
+    {
+        _abpDateTimeConverter         = abpDateTimeConverter;
+        _abpNullableDateTimeConverter = abpNullableDateTimeConverter;
+    }
+
+    public Action<JsonTypeInfo> CreateModifyAction() => Modify;
+
+    private void Modify(JsonTypeInfo jsonTypeInfo)
+    {
+        if (ReflectionHelper.GetAttributesOfMemberOrDeclaringType<DisableDateTimeNormalizationAttribute>(jsonTypeInfo.Type).Any())
+        {
+            return;
+        }
+
+        foreach (var property in jsonTypeInfo.Properties.Where(x =>
+            x.PropertyType == typeof(DateTime) || x.PropertyType == typeof(DateTime?)))
+        {
+            if (property.AttributeProvider == null ||
+                !property.AttributeProvider.GetCustomAttributes(typeof(DisableDateTimeNormalizationAttribute), false).Any())
+            {
+                property.CustomConverter = property.PropertyType == typeof(DateTime)
+                    ? _abpDateTimeConverter
+                    : _abpNullableDateTimeConverter;
+            }
+        }
+    }
+}
+```
+
+Three branches:
+
+1. **Type-level opt-out** — `[DisableDateTimeNormalization]` on the class skips the whole type.
+2. **Property-level opt-out** — `[DisableDateTimeNormalization]` on the property skips that one property.
+3. Otherwise, attach the appropriate (nullable or non-nullable) converter.
+
+This is the System.Text.Json equivalent of Newtonsoft's `ShouldNormalize` check — same semantics, different machinery.
+
+## `AbpDefaultJsonTypeInfoResolver`
+
+```csharp
+public class AbpDefaultJsonTypeInfoResolver : DefaultJsonTypeInfoResolver
+{
+    public AbpDefaultJsonTypeInfoResolver(IOptions<AbpSystemTextJsonSerializerModifiersOptions> options)
+    {
+        foreach (var modifier in options.Value.Modifiers)
+        {
+            Modifiers.Add(modifier);
+        }
+    }
+}
+```
+
+A thin wrapper that copies modifiers from the options class into the resolver's `Modifiers` list (which S.T.J. invokes during type-info generation).
+
+## `AbpSystemTextJsonSerializerModifiersOptions`
+
+```csharp
+public class AbpSystemTextJsonSerializerModifiersOptions
+{
+    public List<Action<JsonTypeInfo>> Modifiers { get; }
+
+    public AbpSystemTextJsonSerializerModifiersOptions()
+    {
+        Modifiers = new List<Action<JsonTypeInfo>>
+        {
+            AbpIncludeExtraPropertiesModifiers.Modify,
+        };
+    }
+}
+```
+
+Out of the box, ABP installs **one** modifier here: `AbpIncludeExtraPropertiesModifiers.Modify`, which makes the `IHasExtraProperties.ExtraProperties` dictionary serialize as inline fields rather than a nested object. The data module relies on this for its extensible-objects feature.
+
+You can add more modifiers in your host module:
+
+```csharp
+Configure<AbpSystemTextJsonSerializerModifiersOptions>(o =>
+{
+    o.Modifiers.Add(typeInfo =>
+    {
+        if (typeInfo.Type == typeof(MySecretBag))
+        {
+            foreach (var prop in typeInfo.Properties)
+            {
+                if (prop.Name == "Password") prop.ShouldSerialize = (_, _) => false;
+            }
+        }
+    });
+});
+```
+
+## End-to-end flow
+
+```mermaid
+flowchart LR
+    A[Application calls<br/>IJsonSerializer.Serialize(obj)]
+    B[AbpSystemTextJsonSerializer]
+    C[JsonSerializerOptions<br/>cache lookup]
+    D[Converters chain<br/>StringToBoolean, StringToGuid,<br/>StringToEnum, InferredTypes]
+    E[AbpDefaultJsonTypeInfoResolver]
+    F[AbpDateTimeConverterModifier]
+    G[AbpIncludeExtraPropertiesModifiers]
+    H[Per-property:<br/>AbpDateTimeConverter]
+    I[IClock.Normalize]
+
+    A --> B --> C --> D
+    C --> E --> F --> H --> I
+    E --> G
+```
+
+## Custom converters
+
+You add custom converters by reaching into the options' `Converters` list — same as the converters above. The modifier slot is for **per-property** behaviour that can't be expressed as a global converter.
+
+```csharp
+Configure<AbpSystemTextJsonSerializerOptions>(opts =>
+{
+    opts.JsonSerializerOptions.Converters.Add(new MoneyJsonConverter());
+});
+```
+
+Per-property `[JsonConverter(typeof(MyConverter))]` attributes still take precedence over both the global converters list and the resolver modifiers.
+
+## Pitfalls
+
+<Warning>**The cache key includes `Options.JsonSerializerOptions` by reference.** That means if you keep the same options instance and mutate it after first use, the cached entries are stale. If you need a runtime swap, replace the entire instance.</Warning>
+
+<Warning>**`InputDateTimeFormats` strict mode.** When you set it, S.T.J. tries those formats *first*. If the input isn't a string token (e.g. it's a JSON date number), the converter throws — strict mode means strict. Leave the list empty for permissive parsing.</Warning>
+
+<Warning>**Source-gen resolvers.** Combining `JsonSerializerContext` with the framework's modifier-driven `TypeInfoResolver` requires you to compose resolvers via `JsonTypeInfoResolver.Combine(ctx, AbpDefaultJsonTypeInfoResolver)`. The framework doesn't do this for you — opt in only if you've measured a win from source gen.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="JSON core" icon="brackets-curly" href="/misc/json">
+    `IJsonSerializer`, `AbpJsonOptions`, provider-dispatch rules.
+  </Card>
+  <Card title="Newtonsoft provider" icon="brackets-curly" href="/misc/json-newtonsoft">
+    The same contract, backed by Json.NET.
+  </Card>
+  <Card title="Options & configuration" icon="gear" href="/core/options-and-configuration">
+    Layering `AbpSystemTextJsonSerializerOptions` and `AbpSystemTextJsonSerializerModifiersOptions`.
+  </Card>
+</CardGroup>

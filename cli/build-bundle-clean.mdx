@@ -1,0 +1,486 @@
+---
+title: "abp build, bundle, clean"
+description: "BuildCommand wraps a multi-repository dotnet build; BundleCommand bundles Blazor WASM static assets; CleanCommand removes bin/obj. Source: framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Build and Bundling."
+---
+
+These three commands all wrap shelled-out `dotnet` operations against the current working directory. They share zero code but ship together because they are the day-to-day "build my project" trio used by Studio and CI scripts.
+
+<Info>
+Source files:
+- [`BuildCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/BuildCommand.cs) + [`Build/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Build) — the multi-repo / single-solution `dotnet build` wrapper.
+- [`BundleCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/BundleCommand.cs) + [`Bundling/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling) — Blazor WASM & MAUI Blazor static-asset bundler.
+- [`CleanCommand.cs`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CleanCommand.cs) — `dotnet clean` plus recursive `bin`/`obj` wipe.
+</Info>
+
+## `abp build` — `BuildCommand`
+
+`abp build` is **not** just `dotnet build`. It is an opinionated dependency-aware multi-repo builder used by the framework team to rebuild several repos at once (e.g. abp + commercial + samples) only re-building the projects whose inputs changed since the last successful build.
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/BuildCommand.cs
+public class BuildCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "build";
+
+    public IDotNetProjectDependencyFiller DotNetProjectDependencyFiller { get; set; }
+
+    public IChangedProjectFinder ChangedProjectFinder { get; set; }
+
+    public IDotNetProjectBuilder DotNetProjectBuilder { get; set; }
+
+    public IRepositoryBuildStatusStore RepositoryBuildStatusStore { get; set; }
+
+    public IDotNetProjectBuildConfigReader DotNetProjectBuildConfigReader { get; set; }
+
+    public IBuildStatusGenerator BuildStatusGenerator { get; set; }
+
+    public IBuildProjectListSorter BuildProjectListSorter { get; set; }
+
+    public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var sw = new Stopwatch();
+        sw.Start();
+
+        var workingDirectory = commandLineArgs.Options.GetOrNull(
+            Options.WorkingDirectory.Short,
+            Options.WorkingDirectory.Long
+        );
+
+        var dotnetBuildArguments = commandLineArgs.Options.GetOrNull(
+            Options.DotnetBuildArguments.Short,
+            Options.DotnetBuildArguments.Long
+        );
+
+        var buildName = commandLineArgs.Options.GetOrNull(
+            Options.BuildName.Short,
+            Options.BuildName.Long
+        );
+
+        var forceBuild = commandLineArgs.Options.ContainsKey(Options.ForceBuild.Short) ||
+                         commandLineArgs.Options.ContainsKey(Options.ForceBuild.Long);
+
+        var buildConfig = DotNetProjectBuildConfigReader.Read(workingDirectory ?? Directory.GetCurrentDirectory());
+        buildConfig.BuildName = buildName;
+        buildConfig.ForceBuild = forceBuild;
+
+        if (string.IsNullOrEmpty(buildConfig.SlFilePath))
+        {
+            var changedProjectFiles = ChangedProjectFinder.FindByRepository(buildConfig);
+
+            var buildSucceededProjects = DotNetProjectBuilder.BuildProjects(
+                changedProjectFiles,
+                dotnetBuildArguments ?? ""
+            );
+
+            var buildStatus = BuildStatusGenerator.Generate(
+                buildConfig,
+                changedProjectFiles,
+                buildSucceededProjects
+            );
+
+            RepositoryBuildStatusStore.Set(buildName, buildConfig.GitRepository, buildStatus);
+        }
+        else
+        {
+            DotNetProjectBuilder.BuildSolution(
+                buildConfig.SlFilePath,
+                dotnetBuildArguments ?? ""
+            );
+        }
+
+        sw.Stop();
+        Console.WriteLine("Build operation is completed in " + sw.ElapsedMilliseconds + " (ms)");
+
+        return Task.CompletedTask;
+    }
+    // ... GetUsageInfo, Options, GetShortDescription ...
+}
+```
+
+### Two modes
+
+`DotNetProjectBuildConfigReader.Read(workingDirectory)` reads an `abp-build-config.json` file from disk (if present) and produces a `DotNetProjectBuildConfig`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Build/DotNetProjectBuildConfig.cs
+public class DotNetProjectBuildConfig
+{
+    public string BuildName { get; set; }
+
+    public string SlFilePath { get; set; }
+
+    public GitRepository GitRepository { get; set; }
+
+    public bool ForceBuild { get; set; }
+}
+```
+
+The branch in `ExecuteAsync` depends on whether `SlFilePath` was specified:
+
+| Mode | Trigger | What runs |
+| --- | --- | --- |
+| **Single solution** | `SlFilePath` set in `abp-build-config.json` | `DotNetProjectBuilder.BuildSolution(slPath, args)` → `dotnet build <sln> /graphBuild <args>`. |
+| **Multi-repo incremental** | `SlFilePath` empty | `ChangedProjectFinder` walks the configured git repos for changes since the last successful build; `DotNetProjectBuilder.BuildProjects` builds each changed `.csproj` individually in dependency order; `BuildStatusGenerator` rolls up succeed/fail; `IRepositoryBuildStatusStore` persists status under `CliPaths.Build` (`~/.abp/build/`). |
+
+`DefaultDotNetProjectBuilder` is the implementation that actually shells out:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Build/DefaultDotNetProjectBuilder.cs
+public List<string> BuildProjects(List<DotNetProjectInfo> projects, string arguments)
+{
+    var builtProjects = new ConcurrentBag<string>();
+    var totalProjectCountToBuild = projects.Count;
+    var buildingProjectIndex = 0;
+
+    try
+    {
+        foreach (var project in projects)
+        {
+            if (builtProjects.Contains(project.CsProjPath))
+            {
+                continue;
+            }
+
+            buildingProjectIndex++;
+
+            Console.WriteLine(
+                "Building....: " + " (" + buildingProjectIndex + "/" +
+                totalProjectCountToBuild + ")" + project.CsProjPath
+            );
+
+            BuildInternal(project, arguments, builtProjects);
+        }
+    }
+    catch (Exception e)
+    {
+        Console.WriteLine(e);
+    }
+
+    return builtProjects.ToList();
+}
+
+public void BuildSolution(string slnPath, string arguments)
+{
+    var buildArguments = "/graphBuild " + arguments.TrimStart('\"').TrimEnd('\"');
+    Console.WriteLine("Executing...: dotnet build " + slnPath + " " + buildArguments);
+
+    var output = CmdHelper.RunCmdAndGetOutput(
+        "dotnet build " + slnPath + " " + buildArguments,
+        out int buildStatus
+    );
+    // ...
+}
+```
+
+`/graphBuild` is the MSBuild graph-build mode — it builds projects in dependency order and respects `Directory.Build.props`.
+
+### Build config layout
+
+A typical `abp-build-config.json` (consumed by `FileSystemDotNetProjectBuildConfigReader`) declares the repositories and known build dependencies. For example, the abp repo's own `build-config.json` enumerates every `.csproj` it expects to be rebuilt when `framework/Directory.Build.props` changes. Status files (`build-status-<name>.json`) live in `CliPaths.Build` (`~/.abp/build/`), keyed by `BuildName`.
+
+### Options block (verbatim)
+
+```text
+Usage:
+  abp build [options]
+
+Options:
+
+-wd|--working-directory <directory-path>                (default: empty)
+-m |--max-parallel-builds <parallel-build-count>        (default: 1)
+-a |--dotnet-build-arguments <arguments>                (default: empty)
+-n |--build-name <name>                                 (default: empty)
+-f |--force                                             (default: false)
+```
+
+Use `-f` to force a full rebuild even if no inputs changed. `-a "--no-restore --configuration Release"` passes arbitrary args to MSBuild.
+
+## `abp bundle` — `BundleCommand`
+
+`abp bundle` materialises the static asset references for **Blazor WebAssembly** (and MAUI Blazor) projects. It compiles the project (so it can reflect on the startup module), finds every `IBundleContributor` declared by the modules in the dependency graph, calls their `AddScripts(context)` / `AddStyles(context)` hooks, and writes the result into a bundle file referenced from `index.html` (or `App.razor` for Blazor Web App).
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/BundleCommand.cs
+public class BundleCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "bundle";
+
+    public ILogger<BundleCommand> Logger { get; set; }
+
+    public IBundlingService BundlingService { get; set; }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var workingDirectoryArg = commandLineArgs.Options.GetOrNull(
+            Options.WorkingDirectory.Short,
+            Options.WorkingDirectory.Long
+        );
+
+        var workingDirectory = workingDirectoryArg ?? Directory.GetCurrentDirectory();
+
+        var forceBuild = commandLineArgs.Options.ContainsKey(Options.ForceBuild.Short) ||
+                         commandLineArgs.Options.ContainsKey(Options.ForceBuild.Long);
+
+        var projectType = GetProjectType(commandLineArgs);
+
+        if (!Directory.Exists(workingDirectory))
+        {
+            throw new CliUsageException(
+                "Specified directory does not exist." +
+                Environment.NewLine + Environment.NewLine +
+                GetUsageInfo()
+            );
+        }
+
+        await BundlingService.BundleAsync(workingDirectory, forceBuild, projectType);
+    }
+    // ...
+    private string GetProjectType(CommandLineArgs commandLineArgs)
+    {
+        var projectType = commandLineArgs.Options.GetOrNull(Options.ProjectType.Short, Options.ProjectType.Long);
+        projectType ??= BundlingConsts.WebAssembly;
+
+        return projectType.ToLower() switch {
+            "webassembly" => BundlingConsts.WebAssembly,
+            "maui-blazor" => BundlingConsts.MauiBlazor,
+            _ => throw new CliUsageException(ExceptionMessageHelper.GetInvalidOptionExceptionMessage("Project Type"))
+        };
+    }
+}
+```
+
+### `BundlingService` — the heart
+
+The constants the bundler injects into `index.html`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/BundlingConsts.cs
+internal const string StylePlaceholderStart = "<!--ABP:Styles-->";
+internal const string StylePlaceholderEnd = "<!--/ABP:Styles-->";
+internal const string ScriptPlaceholderStart = "<!--ABP:Scripts-->";
+internal const string ScriptPlaceholderEnd = "<!--/ABP:Scripts-->";
+internal const string SupportedWebAssemblyProjectType = "Microsoft.NET.Sdk.BlazorWebAssembly";
+internal const string SupportedMauiBlazorProjectType = "Microsoft.NET.Sdk.Razor";
+internal const string WebAssembly = "webassembly";
+internal const string MauiBlazor = "maui-blazor";
+```
+
+The bundling flow is in `BundlingService.BundleAsync`:
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/BundlingService.cs
+public async Task BundleAsync(string directory, bool forceBuild, string projectType = BundlingConsts.WebAssembly)
+{
+    if(RuntimeInformation.IsOSPlatform(OSPlatform.OSX) && projectType == BundlingConsts.MauiBlazor)
+    {
+        Logger.LogWarning("ABP bundle command does not support OSX for MAUI Blazor");
+        return;
+    }
+
+    var projectFiles = Directory.GetFiles(directory, "*.csproj");
+    if (!projectFiles.Any())
+    {
+        throw new BundlingException(
+            "No project file found in the directory. The working directory must have a Blazor project file.");
+    }
+
+    var projectFilePath = projectFiles[0];
+
+    await CheckProjectIsSupportedTypeAsync(projectFilePath, projectType);
+
+    var config = projectType == BundlingConsts.WebAssembly
+        ? ConfigReader.Read(PathHelper.GetWwwRootPath(directory))
+        : ConfigReader.Read(directory);
+    var bundleConfig = config.Bundle;
+
+    if (forceBuild)
+    {
+        var projects = new List<DotNetProjectInfo>()
+        {
+            new DotNetProjectInfo(string.Empty, projectFilePath, true)
+        };
+
+        DotNetProjectBuilder.BuildProjects(projects, string.Empty);
+    }
+
+    var frameworkVersion = GetTargetFrameworkVersion(projectFilePath, projectType);
+    var projectName = Path.GetFileNameWithoutExtension(projectFilePath);
+    var assemblyFilePath = projectType == BundlingConsts.WebAssembly
+        ? PathHelper.GetWebAssemblyFilePath(directory, frameworkVersion, projectName)
+        : PathHelper.GetMauiBlazorAssemblyFilePath(directory, projectName);
+    if (assemblyFilePath == null)
+    {
+        throw new BundlingException("No assembly file found. Please build the project first.");
+    }
+
+    var startupModule = GetStartupModule(assemblyFilePath);
+
+    var bundleDefinitions = new List<BundleTypeDefinition>();
+    FindBundleContributorsRecursively(startupModule, 0, bundleDefinitions);
+    bundleDefinitions = bundleDefinitions.OrderByDescending(t => t.Level).ToList();
+
+    var styleContext = GetStyleContext(bundleDefinitions, bundleConfig);
+    var scriptContext = GetScriptContext(bundleDefinitions, bundleConfig, projectType);
+    // ...
+}
+```
+
+The algorithm:
+
+1. **Locate the project.** Demands exactly one `.csproj` in the working directory.
+2. **Check the SDK type.** Only `Microsoft.NET.Sdk.BlazorWebAssembly` (for WASM) or `Microsoft.NET.Sdk.Razor` (for MAUI Blazor) are supported.
+3. **Read `wwwroot/appsettings.json` or `appsettings.json`.** Pulls a `BundleConfig` (see below).
+4. **Optionally rebuild** the project (`forceBuild` flag from `abp bundle -f`).
+5. **Reflect** on the compiled assembly to find the `AbpModule` startup type.
+6. **Walk the module dependency tree** recursively (`FindBundleContributorsRecursively`), collecting every type that implements `IBundleContributor`. Ordered by descending dependency depth so contributors in low-level modules contribute first.
+7. **Build the two contexts** (`styleContext`, `scriptContext`) and let each contributor add its sources.
+8. **Bundle** (if `BundlingMode.Bundle` or `BundleAndMinify`) using `StyleBundler` / `ScriptBundler`, or generate `<link>` / `<script>` tags directly if `BundlingMode.None`.
+9. **Inject** the bundle definitions into `index.html` (or `App.razor` for Blazor Web App) between the marker comments.
+
+### `BundleConfig` and `BundlingMode`
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/BundleConfig.cs
+public class BundleConfig
+{
+    public bool IsBlazorWebApp { get; set; } = false;
+
+    public bool InteractiveAuto { get; set; } = false;
+
+    public BundlingMode Mode { get; set; } = BundlingMode.BundleAndMinify;
+
+    public string Name { get; set; } = "global";
+
+    public BundleParameterDictionary Parameters { get; set; } = new();
+}
+```
+
+`BundlingMode` selects between `None` (write `<link>`/`<script>` tags individually), `Bundle` (concatenate), or `BundleAndMinify` (concatenate then minify with `IJavascriptMinifier`/`ICssMinifier` from `AbpMinifyModule`).
+
+### `ScriptBundler` — concrete bundler
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/Scripts/ScriptBundler.cs
+public class ScriptBundler : BundlerBase, IScriptBundler, ITransientDependency
+{
+    public override string FileExtension => ".js";
+
+    public ScriptBundler(IJavascriptMinifier minifier)
+        : base(minifier)
+    {
+    }
+
+    public override string GenerateDefinition(string bundleFilePath,
+        List<BundleDefinition> bundleDefinitionsExcludingFromBundle)
+    {
+        var lastModifiedTicks = File.GetLastWriteTime(bundleFilePath).Ticks;
+        var builder = new StringBuilder();
+        builder.AppendLine($"{BundlingConsts.ScriptPlaceholderStart}");
+        builder.AppendLine(
+            $"    <script src=\"{Path.GetFileName(bundleFilePath)}?_v={lastModifiedTicks}\"></script>");
+        // ... external scripts that were not bundled (e.g. absolute URLs) emitted as <script src="..."> ...
+        builder.Append($"    {BundlingConsts.ScriptPlaceholderEnd}");
+        return builder.ToString();
+    }
+}
+```
+
+The `_v={lastModifiedTicks}` query string is the cache-busting marker so browsers reload after every bundle. `StyleBundler` is the symmetric implementation for CSS.
+
+### Options block (verbatim)
+
+```text
+Usage:
+  abp bundle [options]
+
+Options:
+
+-wd|--working-directory <directory-path>                (default: empty)
+-f |--force                                             (default: false)
+-t |--project-type                                      (default: webassembly)
+```
+
+### Where this fits
+
+The Blazor WASM template's `Program.cs` does **not** itself reference `abp bundle` — it expects the bundle to already be on disk. So:
+
+- `abp new Acme.BookStore -u blazor` runs `abp bundle` automatically (see [new-command](/cli/new-command#bundling)).
+- After modifying a `IBundleContributor` (e.g. `BookStoreBlazorContributor.cs`), run `abp bundle` manually to refresh `wwwroot/global.styles.css` and `wwwroot/global.scripts.js`.
+- See [ASP.NET Core MVC UI packages](/aspnetcore/mvc-ui-packages) for the equivalent client-side mechanism on MVC — it uses LibMan (`libman.json`) instead, populated by [`abp install-libs`](/cli/install-libs-and-add-package#installlibs).
+
+## `abp clean` — `CleanCommand`
+
+A small but useful command: runs `dotnet clean`, then walks every `bin/` and `obj/` folder under the current directory and deletes them (skipping anything under `node_modules`).
+
+```csharp framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CleanCommand.cs
+public class CleanCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "clean";
+
+    public ILogger<CleanCommand> Logger { get; set; }
+
+    protected ICmdHelper CmdHelper { get; }
+
+    public CleanCommand(ICmdHelper cmdHelper)
+    {
+        CmdHelper = cmdHelper;
+        Logger = NullLogger<CleanCommand>.Instance;
+    }
+
+    public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var binEntries = Directory.EnumerateDirectories(Directory.GetCurrentDirectory(), "bin", SearchOption.AllDirectories);
+        var objEntries = Directory.EnumerateDirectories(Directory.GetCurrentDirectory(), "obj", SearchOption.AllDirectories);
+
+        Logger.LogInformation("Cleaning the solution with 'dotnet clean' command...");
+        CmdHelper.RunCmd($"dotnet clean", workingDirectory: Directory.GetCurrentDirectory());
+
+        Logger.LogInformation($"Removing 'bin' and 'obj' folders...");
+        foreach (var path in binEntries.Concat(objEntries))
+        {
+            if (path.IndexOf("node_modules", StringComparison.OrdinalIgnoreCase) > 0)
+            {
+                Logger.LogInformation($"Skipping: {path}");
+            }
+            else
+            {
+                Logger.LogInformation($"Deleting: {path}");
+                Directory.Delete(path, true);
+            }
+        }
+        Logger.LogInformation($"'bin' and 'obj' folders removed successfully!");
+
+        Logger.LogInformation("Solution cleaned successfully!");
+        return Task.CompletedTask;
+    }
+
+    public string GetUsageInfo()
+    {
+        var sb = new StringBuilder();
+
+        sb.AppendLine("");
+        sb.AppendLine("Usage:");
+        sb.AppendLine("  abp clean");
+        sb.AppendLine("");
+        sb.AppendLine("See the documentation for more info: https://abp.io/docs/latest/cli");
+
+        return sb.ToString();
+    }
+
+    public static string GetShortDescription()
+    {
+        return "Delete all BIN and OBJ folders in current folder.";
+    }
+}
+```
+
+There are no options. The `node_modules` skip is the only piece of policy — it stops the command nuking compiled npm packages that contain their own `bin` folders.
+
+## When to use which
+
+| You want to… | Run |
+| --- | --- |
+| Compile a single solution | `dotnet build` (or `abp build` if `abp-build-config.json` declares `SlFilePath`). |
+| Incrementally build several inter-dependent repos | `abp build -n nightly -wd D:\repos\abp -a "-c Release"`. |
+| Refresh Blazor WASM bundle after editing a contributor | `abp bundle` (in the host project folder). |
+| Refresh MAUI Blazor bundle | `abp bundle -t maui-blazor`. |
+| Wipe build artefacts before a fresh checkout | `abp clean`. |
+
+## Related
+
+- [Project building pipeline](/cli/project-building) — what `abp new` invokes before the user's first `abp build`.
+- [`abp install-libs` / `add-package` / `add-module`](/cli/install-libs-and-add-package) — front-end asset & package operations the bundler does not touch.
+- [Startup templates overview](/templates/overview) — which templates need `abp bundle` (any Blazor WASM template).
+- [ASP.NET Core MVC UI packages](/aspnetcore/mvc-ui-packages) — the MVC-side bundling story (LibMan + LeptonX), distinct from this command.

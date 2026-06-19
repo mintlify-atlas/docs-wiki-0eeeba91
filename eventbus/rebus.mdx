@@ -1,0 +1,327 @@
+---
+title: "Rebus Event Bus: Multi-Transport via Rebus Pipeline"
+sidebarTitle: "Rebus"
+description: "Configure RebusDistributedEventBus over any Rebus-supported transport: AbpRebusEventBusOptions, pipeline step, custom Configurer, IRebusSerializer."
+---
+
+`Volo.Abp.EventBus.Rebus` plugs ABP's distributed event bus into [Rebus](https://github.com/rebus-org/Rebus), an abstraction layer that supports many transports — RabbitMQ, Azure Service Bus, Amazon SQS, MSMQ, MongoDB, SQL Server, in-memory and more. You configure the transport once on `AbpRebusEventBusOptions.Configurer`; ABP handles publish/subscribe semantics and outbox/inbox bookkeeping on top.
+
+All sources for this page live under `framework/src/Volo.Abp.EventBus.Rebus/`.
+
+## Package layout
+
+```text
+framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/
+├── AbpEventBusRebusModule.cs
+├── AbpRebusEventBusOptions.cs
+├── AbpRebusEventHandlerStep.cs
+├── IRebusDistributedEventHandlerAdapter.cs
+├── IRebusSerializer.cs
+├── RebusDistributedEventBus.cs
+├── RebusDistributedEventHandlerAdapter.cs
+└── Utf8JsonRabbitMqSerializer.cs
+```
+
+## `AbpRebusEventBusOptions`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/AbpRebusEventBusOptions.cs
+public class AbpRebusEventBusOptions
+{
+    public string InputQueueName { get; set; } = null!;
+
+    public string RebusInstanceName { get; set; } = "default-instance";
+
+    public Action<RebusConfigurer> Configurer
+    {
+        get => _configurer;
+        set => _configurer = Check.NotNull(value, nameof(value));
+    }
+    private Action<RebusConfigurer> _configurer;
+
+    public Func<IBus, Type, object, Task>? Publish { get; set; }
+
+    public AbpRebusEventBusOptions()
+    {
+        _configurer = DefaultConfigure;
+    }
+
+    private void DefaultConfigure(RebusConfigurer configure)
+    {
+        configure.Transport(t => t.UseInMemoryTransport(new InMemNetwork(), InputQueueName));
+    }
+}
+```
+
+| Property | Purpose |
+| --- | --- |
+| `InputQueueName` | The service's input queue. Per service. Used by the default in-memory transport and by all real transports. |
+| `RebusInstanceName` | Key for the Rebus instance registry — supports running multiple Rebus buses side by side. |
+| `Configurer` | Hook where you set transport, persistence, routing. Defaults to the in-memory transport for tests. |
+| `Publish` | Optional override for the publish action. If set, ABP delegates `PublishToEventBusAsync` to your delegate instead of calling `Rebus.Publish(...)`. |
+
+## Module
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/AbpEventBusRebusModule.cs
+[DependsOn(typeof(AbpEventBusModule))]
+public class AbpEventBusRebusModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(
+            typeof(IHandleMessages<>),
+            typeof(RebusDistributedEventHandlerAdapter<>));
+
+        var preActions = context.Services.GetPreConfigureActions<AbpRebusEventBusOptions>();
+        var rebusOptions = preActions.Configure();
+        Configure<AbpRebusEventBusOptions>(options =>
+        {
+            preActions.Configure(options);
+        });
+
+        context.Services.AddRebus(configure =>
+        {
+            configure.Options(options =>
+            {
+                options.Decorate<IPipeline>(d =>
+                {
+                    var step = new AbpRebusEventHandlerStep();
+                    var pipeline = d.Get<IPipeline>();
+                    return new PipelineStepInjector(pipeline)
+                        .OnReceive(step, PipelineRelativePosition.After, typeof(ActivateHandlersStep));
+                });
+            });
+
+            rebusOptions.Configurer?.Invoke(configure);
+            return configure;
+        }, startAutomatically: false, key: rebusOptions.RebusInstanceName);
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        context.ServiceProvider
+            .GetRequiredService<RebusDistributedEventBus>()
+            .Initialize();
+
+        var rebusOptions = context.ServiceProvider
+            .GetRequiredService<IOptions<AbpRebusEventBusOptions>>().Value;
+        context.ServiceProvider
+            .GetRequiredService<IBusRegistry>()
+            .StartBus(rebusOptions.RebusInstanceName);
+    }
+}
+```
+
+Three notable wiring details:
+
+1. **`IHandleMessages<>` → `RebusDistributedEventHandlerAdapter<>`.** Rebus delivers messages to an `IHandleMessages<T>`. ABP registers a generic adapter that forwards each delivery into `RebusDistributedEventBus.ProcessEventAsync`.
+2. **`AbpRebusEventHandlerStep`.** A custom pipeline step injected after `ActivateHandlersStep` so ABP can hook into every received message — capturing the message id, swapping the correlation id provider, and running the ABP handler resolution path.
+3. **`startAutomatically: false`.** ABP starts the Rebus bus from `OnApplicationInitialization` after `RebusDistributedEventBus.Initialize()` has wired the subscriptions.
+
+## `RebusDistributedEventBus`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/RebusDistributedEventBus.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IDistributedEventBus), typeof(RebusDistributedEventBus))]
+public class RebusDistributedEventBus : DistributedEventBusBase, ISingletonDependency
+{
+    protected IBus Rebus { get; }
+    protected IRebusSerializer Serializer { get; }
+    protected ConcurrentDictionary<Type, List<IEventHandlerFactory>> HandlerFactories { get; }
+    protected ConcurrentDictionary<string, Type> EventTypes { get; }
+    protected AbpRebusEventBusOptions AbpRebusEventBusOptions { get; }
+}
+```
+
+It hands the actual transport work to `IBus` (Rebus's main entry point) and uses `IRebusSerializer` for outbox payload conversion.
+
+### Subscribe = `IBus.Subscribe`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/RebusDistributedEventBus.cs
+public override IDisposable Subscribe(Type eventType, IEventHandlerFactory factory)
+{
+    var handlerFactories = GetOrCreateHandlerFactories(eventType);
+
+    if (factory.IsInFactories(handlerFactories))
+    {
+        return NullDisposable.Instance;
+    }
+
+    handlerFactories.Add(factory);
+
+    if (handlerFactories.Count == 1)
+    {
+        Rebus.Subscribe(eventType);
+    }
+
+    return new EventHandlerFactoryUnregistrar(this, eventType, factory);
+}
+```
+
+The first handler for a CLR event type triggers `Rebus.Subscribe(eventType)` — for transports that have a notion of subscription (Service Bus topic, RabbitMQ exchange bind, etc.), this is what installs the routing. Additional handlers just append a factory.
+
+### Publishing
+
+```csharp
+protected async override Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    var headers = new Dictionary<string, string>();
+    if (CorrelationIdProvider.Get() != null)
+    {
+        headers.Add(EventBusConsts.CorrelationIdHeaderName, CorrelationIdProvider.Get()!);
+    }
+    await PublishAsync(eventType, eventData, headersArguments: headers);
+}
+
+protected virtual async Task PublishAsync(
+    Type eventType,
+    object eventData,
+    Guid? eventId = null,
+    Dictionary<string, string>? headersArguments = null)
+{
+    if (AbpRebusEventBusOptions.Publish != null)
+    {
+        await AbpRebusEventBusOptions.Publish(Rebus, eventType, eventData);
+        return;
+    }
+
+    headersArguments ??= new Dictionary<string, string>();
+    if (!headersArguments.ContainsKey(Headers.MessageId))
+    {
+        headersArguments[Headers.MessageId] = (eventId ?? GuidGenerator.Create()).ToString("N");
+    }
+
+    await Rebus.Publish(eventData, headersArguments);
+}
+```
+
+If you provide an `AbpRebusEventBusOptions.Publish` delegate, ABP defers to it entirely. Otherwise it calls `Rebus.Publish(eventData, headers)` with `Headers.MessageId` populated — Rebus uses that as the message identity, and the consumer-side `AbpRebusEventHandlerStep` reads it back for inbox dedup.
+
+## Receiving
+
+`AbpRebusEventHandlerStep` is the receive-side hook ABP adds to the Rebus pipeline. It extracts the headers, sets the correlation id on the ambient `ICorrelationIdProvider`, then lets the message flow into `RebusDistributedEventHandlerAdapter<TEvent>`, which calls back into `RebusDistributedEventBus.ProcessEventAsync(eventType, eventData)`:
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/RebusDistributedEventBus.cs (excerpt)
+var messageId     = MessageContext.Current.Headers.GetOrDefault(Headers.MessageId);
+var correlationId = MessageContext.Current.Headers.GetOrDefault(EventBusConsts.CorrelationIdHeaderName);
+
+if (await AddToInboxAsync(messageId, eventName, eventType, eventData, correlationId))
+{
+    return;
+}
+
+using (CorrelationIdProvider.Change(correlationId))
+{
+    await TriggerHandlersDirectAsync(eventType, eventData);
+}
+```
+
+So Rebus deliveries get the same inbox dedup and same handler invocation path as every other broker adapter.
+
+## Serializer
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Rebus/Volo/Abp/EventBus/Rebus/IRebusSerializer.cs
+public interface IRebusSerializer
+{
+    byte[] Serialize(object obj);
+    object Deserialize(byte[] value, Type type);
+    T Deserialize<T>(byte[] value);
+}
+```
+
+The default implementation is `Utf8JsonRabbitMqSerializer` (UTF-8 `System.Text.Json`). Replace it via DI if you need a custom format.
+
+## Configuring the transport
+
+The `Configurer` action is where you replace the default in-memory transport with a real one. Example with Rebus + RabbitMQ:
+
+```csharp
+[DependsOn(typeof(AbpEventBusRebusModule))]
+public class OrdersModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpRebusEventBusOptions>(o =>
+        {
+            o.InputQueueName    = "MyApp.OrdersService";
+            o.RebusInstanceName = "orders";
+            o.Configurer = configure =>
+            {
+                configure.Transport(t =>
+                    t.UseRabbitMq("amqp://abp:abp@rabbit", o.InputQueueName));
+
+                configure.Subscriptions(s =>
+                    s.StoreInMemory()); // or .StoreInSqlServer / .StoreInMongoDb
+            };
+        });
+
+        Configure<AbpDistributedEventBusOptions>(o =>
+        {
+            o.Outboxes.Configure(c => c.UseDbContext<OrdersDbContext>());
+            o.Inboxes.Configure(c => c.UseDbContext<OrdersDbContext>());
+        });
+    }
+}
+```
+
+### When to use Rebus
+
+<AccordionGroup>
+  <Accordion title="You already use Rebus elsewhere">
+    Reuse the same transport configuration, sagas and routing for ABP distributed events.
+  </Accordion>
+  <Accordion title="You need a transport ABP does not ship natively">
+    SQS, MSMQ, file system, in-memory, file-based mailbox — Rebus has adapters for all of them.
+  </Accordion>
+  <Accordion title="You need Rebus-style retries / sagas">
+    Rebus has its own retry strategy, dead-letter queue and saga state machine; ABP's outbox/inbox runs underneath without replacing them.
+  </Accordion>
+  <Accordion title="You want to use the same transport ABP ships natively">
+    Prefer the dedicated adapter (`Volo.Abp.EventBus.RabbitMQ`, etc.) when ABP ships it. Rebus adds one more abstraction layer between you and the wire.
+  </Accordion>
+</AccordionGroup>
+
+## Worked example
+
+```csharp
+[EventName("orders.order_placed.v1")]
+public class OrderPlacedEto
+{
+    public Guid OrderId { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class FulfillOrderHandler
+    : IDistributedEventHandler<OrderPlacedEto>, ITransientDependency
+{
+    private readonly IFulfillmentService _fulfillment;
+    public FulfillOrderHandler(IFulfillmentService fulfillment) => _fulfillment = fulfillment;
+
+    public Task HandleEventAsync(OrderPlacedEto eventData)
+        => _fulfillment.StartAsync(eventData.OrderId);
+}
+```
+
+The handler looks identical to any other broker adapter — that is the point of `IDistributedEventHandler<T>`. You can switch from RabbitMQ to Service Bus to in-memory by changing only the `Configurer`.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Distributed Event Bus" icon="network-wired" href="/eventbus/distributed-event-bus">
+    Outbox/inbox machinery shared across every broker adapter.
+  </Card>
+  <Card title="Background workers" icon="gears" href="/background/overview">
+    `OutboxSenderManager` and `InboxProcessManager` host the periodic jobs.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Outbox rows commit transactionally with the business write.
+  </Card>
+  <Card title="Publication flow" icon="diagram-project" href="/flows/distributed-event-publish-consume">
+    End-to-end publish/receive sequence.
+  </Card>
+</CardGroup>

@@ -1,0 +1,166 @@
+---
+title: "OAuth Authentication Helpers — Claim Action Utilities"
+sidebarTitle: "OAuth"
+description: "Volo.Abp.AspNetCore.Authentication.OAuth — MultipleClaimAction and RemoveDuplicateClaimAction helpers consumed by OIDC and external login handlers."
+---
+
+`Volo.Abp.AspNetCore.Authentication.OAuth` is a small helper module shared by the OpenID Connect, Google, Microsoft Account and Twitter authentication packages. It does not register any handler itself — it ships two reusable `ClaimAction` derivatives that the upstream Microsoft handlers consume to copy claims from the user‑info endpoint payload into the resulting `ClaimsPrincipal`.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.Authentication.OAuth/Volo/Abp/AspNetCore/Authentication/OAuth/`.
+
+## Module declaration
+
+```csharp
+// AbpAspNetCoreAuthenticationOAuthModule.cs
+[DependsOn(typeof(AbpSecurityModule))]
+public class AbpAspNetCoreAuthenticationOAuthModule : AbpModule
+{
+}
+```
+
+The module exists so any OAuth‑family handler can list it in `[DependsOn(...)]` and get the `Claims/` helpers without taking a transitive dependency on the full OpenID Connect package.
+
+## `Claims/MultipleClaimAction`
+
+ASP.NET Core's OAuth/OIDC `ClaimsOptions` is built around a `ClaimActionCollection` whose entries each copy one JSON token (e.g. `email`) to one claim (e.g. `ClaimTypes.Email`). When a payload contains the same claim type **multiple times** — for example multiple `role` entries — the default `ClaimAction` happens to skip the rest. ABP's `MultipleClaimAction` walks the JSON array and adds one claim per element.
+
+Schematic usage from an OAuth handler:
+
+```csharp
+services
+    .AddAuthentication()
+    .AddOAuth("MyOAuth", options =>
+    {
+        options.ClaimActions.Add(new MultipleClaimAction("role", ClaimValueTypes.String, "roles"));
+        options.ClaimActions.Add(new MultipleClaimAction(
+            AbpClaimTypes.UserName, ClaimValueTypes.String, "preferred_username"));
+    });
+```
+
+After authentication, `ClaimsPrincipal.Claims` contains one `role` claim per element of the JSON `roles` array — which `IAuthorizationService` and `IPermissionChecker` then enumerate.
+
+## `Claims/RemoveDuplicateClaimAction`
+
+The complementary helper runs after all other claim actions and de‑duplicates a target claim type — useful when both the access token and the user‑info endpoint contribute the same claim. Typical use:
+
+```csharp
+options.ClaimActions.Add(new RemoveDuplicateClaimAction(AbpClaimTypes.Email));
+options.ClaimActions.Add(new RemoveDuplicateClaimAction(AbpClaimTypes.UserName));
+```
+
+This keeps the principal compact and prevents `ICurrentUser.Email` (which reads the first `email` claim) from accidentally returning the access‑token's stale value when the user‑info endpoint shipped a fresh one.
+
+## How OIDC consumes these helpers
+
+The OpenID Connect package (see [/aspnetcore/auth-openidconnect](/aspnetcore/auth-openidconnect)) registers these actions in its handler configuration to translate the OpenIddict / IdentityServer payload into ABP's claim shape:
+
+```csharp
+.AddOpenIdConnect("oidc", options =>
+{
+    // ... oidc options
+    options.ClaimActions.MapJsonKey(AbpClaimTypes.UserName, "preferred_username");
+    options.ClaimActions.Add(new MultipleClaimAction("role", ClaimValueTypes.String, "role"));
+    options.ClaimActions.Add(new RemoveDuplicateClaimAction(AbpClaimTypes.UserName));
+});
+```
+
+Both helpers are also consumed by:
+
+- The Google login handler (`Volo.Abp.AspNetCore.Authentication.OAuth` is a transitive dependency of `Volo.Abp.Account.Web.Google`).
+- The Microsoft Account handler.
+- Twitter and Twitch handlers in the social login modules.
+
+## Why this lives in its own module
+
+Three reasons:
+
+| Reason | Detail |
+| --- | --- |
+| Decoupling | The `Volo.Abp.AspNetCore.Authentication.JwtBearer` module does not need OIDC; the OIDC module does not need the JWT bearer handler. Both want claim helpers. Putting them in a third module avoids cycles. |
+| Stable surface | `AbpClaimTypes` lives in `Volo.Abp.Security`. The OAuth module declares `[DependsOn(typeof(AbpSecurityModule))]` so any consumer that uses these claim actions automatically pulls in the canonical claim names. |
+| Small footprint | The package adds two files to the app's deployment — sub‑kilobyte assembly that doesn't ship a handler or middleware. |
+
+## Combining with the JWT bearer module
+
+When an app exposes its own API and also accepts external OAuth providers:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(AbpAspNetCoreAuthenticationJwtBearerModule),
+    typeof(AbpAspNetCoreAuthenticationOAuthModule)
+)]
+public class MyHybridApiModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services
+            .AddAuthentication()
+            .AddJwtBearer(o => { /* ... */ })
+            .AddOAuth("GitHub", o =>
+            {
+                o.ClaimActions.Add(new MultipleClaimAction("role", ClaimValueTypes.String, "roles"));
+                o.ClaimActions.Add(new RemoveDuplicateClaimAction(AbpClaimTypes.Email));
+            });
+    }
+}
+```
+
+`AbpAspNetCoreAuthenticationJwtBearerModule` brings the dynamic claims refresh; `AbpAspNetCoreAuthenticationOAuthModule` brings the claim helpers.
+
+## File layout
+
+```
+Volo.Abp.AspNetCore.Authentication.OAuth/
+└── Volo/
+    └── Abp/
+        └── AspNetCore/
+            └── Authentication/
+                └── OAuth/
+                    ├── AbpAspNetCoreAuthenticationOAuthModule.cs
+                    └── Claims/
+                        ├── MultipleClaimAction.cs
+                        └── RemoveDuplicateClaimAction.cs
+```
+
+That's the whole package — minimal but pulled by every social login module in the framework.
+
+## Common claim mappings used across the framework
+
+ABP's canonical claim names are in `Volo.Abp.Security.Claims.AbpClaimTypes`. The OAuth helpers are usually paired with these mappings:
+
+| OIDC / OAuth payload field | Mapped to (`AbpClaimTypes.*`) | Helper used |
+| --- | --- | --- |
+| `sub` | `UserId` | Built‑in `JwtMapClaim`. |
+| `preferred_username` | `UserName` | `ClaimActions.MapJsonKey` + `RemoveDuplicateClaimAction`. |
+| `email` | `Email` | `ClaimActions.MapJsonKey` + `RemoveDuplicateClaimAction`. |
+| `email_verified` | `EmailVerified` | `ClaimActions.MapJsonKey`. |
+| `phone_number` | `PhoneNumber` | `ClaimActions.MapJsonKey`. |
+| `phone_number_verified` | `PhoneNumberVerified` | `ClaimActions.MapJsonKey`. |
+| `role` (array) | `Role` (one per entry) | `MultipleClaimAction("role", ...)`. |
+| `tenantid` | `TenantId` | `ClaimActions.MapJsonKey` — consumed by `CurrentUserTenantResolveContributor`. |
+| `name` | `Name` | `ClaimActions.MapJsonKey`. |
+| `surname` | `SurName` | `ClaimActions.MapJsonKey`. |
+
+Without the `MultipleClaimAction` helper, an OIDC payload like `{"role": ["admin", "user"]}` would yield exactly one `role` claim — and `IPermissionChecker` would not find policies attached to the `user` role.
+
+## Subtleties when targeting older auth servers
+
+Some auth servers (older IdentityServer 4 setups, certain Azure AD configurations) emit a comma‑separated string `"admin,user"` instead of a JSON array. The helper does the array path; ABP's `AbpClaimsTransformation` (in `Volo.Abp.Security.Claims`) handles the comma case separately. Combining both means apps don't have to choose at design time which format the upstream uses.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="OpenID Connect" icon="lock" href="/aspnetcore/auth-openidconnect">
+    The main consumer of these claim actions — cookie + OIDC for browser apps.
+  </Card>
+  <Card title="JWT Bearer" icon="key" href="/aspnetcore/auth-jwt-bearer">
+    The other half of an authenticated API stack — adds dynamic claims refresh on top of validated JWTs.
+  </Card>
+  <Card title="Current user" icon="shield-halved" href="/security/overview">
+    `AbpClaimTypes` constants and `ICurrentUser` accessors used by `MultipleClaimAction` callers.
+  </Card>
+  <Card title="Modularity" icon="diagram-project" href="/core/modularity">
+    The `[DependsOn]` chain that lets the OAuth helpers be shared without cycles.
+  </Card>
+</CardGroup>

@@ -1,0 +1,697 @@
+---
+title: "deploy/ — Release Scripts"
+description: "Every PowerShell script in deploy/ enumerated: the eight numbered release steps, _run_all.ps1, and the nupkg/ and npm/ helpers they call. Parameters, secrets, and real excerpts."
+---
+
+The `deploy/` folder is the maintainer-facing entry point for a full ABP release. It's a chain of eight numbered scripts plus an orchestrator, and they shell out to two other folders — `nupkg/` (NuGet) and `npm/` (npm) — for the heavy lifting.
+
+## Folder contents
+
+```text deploy/
+1-fetch-and-build.ps1          # git pull + bump common.props + build-all-release.ps1
+2-nuget-pack.ps1               # → nupkg/pack.ps1 (dotnet pack ~400 projects)
+3-nuget-push.ps1               # → nupkg/push_packages.ps1 (dotnet nuget push)
+4-npm-publish-mvc.ps1          # → npm/publish-mvc.ps1 (lerna publish)
+5-npm-publish-angular.ps1      # → npm/publish-ng.ps1 (publish-packages script)
+6-git-commit.ps1               # git add . && git commit && git push
+7-publish-github-release.ps1   # POST https://api.github.com/repos/.../releases
+8-download-release-zip.ps1     # plink ssh into release host → download zip
+_run_all.ps1                   # Orchestrator: runs 1 → 8 with Start-Transcript
+new-github-release-function.psm1  # Helper module imported by step 7
+plink.exe                      # PuTTY's ssh client, used by step 8
+readme.md                      # Maintainer checklist (secret files + run order)
+```
+
+<Warning>
+**Secrets are file-based, not env-var-based.** Before running any of these scripts, create three ignored files in `deploy/`:
+
+- `npm-auth-token.txt` — npmjs.org auth token (GUID)
+- `nuget-api-key.txt` — nuget.org API key
+- `ssh-password.txt` — SSH password for the release-zip host
+
+The scripts read these files with `Get-Content`. They will *also* prompt with `Read-Host` if the files don't exist, but in CI/headless contexts you need them on disk.
+</Warning>
+
+## The README (verbatim)
+
+```text deploy/readme.md
+# ABP Framework Release Steps
+
+## 1-) Set your secret keys
+
+The following files are ignored from GitHub, therefore you need to
+create these files in your local environment.
+
+* create `npm-auth-token.txt` file in this folder and write the
+  npmjs.org auth token. it's a GUID type.
+* create `nuget-api-key.txt` file this folder and write your nuget.org
+  API key.
+* create `ssh-password.txt` file and write `jenkins` user SSH password.
+
+## 2-) Run the commands
+
+- 1-fetch-and-build.ps1
+- 2-nuget-pack.ps1
+- 3-nuget-push.ps1
+- 4-npm-publish.ps1
+- 5-git-commit.ps1
+- 6-new-github-release.ps1
+- 7-download-release-zip.ps1
+```
+
+(The README's step numbering is slightly out of date relative to the current files — the current order is fetch → pack → nuget-push → npm-mvc → npm-ng → commit → github-release → download-zip. `_run_all.ps1` is the canonical reference for the actual order.)
+
+## The orchestrator — `_run_all.ps1`
+
+This is what a maintainer actually invokes. It prompts for the things that must vary per release (branch, version, RC flag), wraps the whole thing in a `Start-Transcript` so a log file is produced, then calls the eight numbered scripts in order:
+
+```powershell deploy/_run_all.ps1
+param(
+  [string]$branch,
+  [string]$newVersion,
+  [string]$isRcVersion
+)
+
+. ..\nupkg\common.ps1
+
+Start-Transcript -Append _run_all_log.txt
+
+if (!$branch)      { $branch     = Read-Host "Enter the branch name" }
+if (!$newVersion)  {
+    $currentVersion = Get-Current-Version
+    $newVersion = Read-Host "Current version is '$currentVersion'. Enter the new version (empty for no change) "
+    if ($newVersion -eq "") { $newVersion = $currentVersion }
+}
+if ($isRcVersion -eq "") { $isRcVersion = Read-Host "Is this a RC/Preview version? (y/n)" }
+
+$publishGithubReleaseParams = @{
+    branchName=$branch
+    isRcVersion=$isRcVersion
+}
+
+./1-fetch-and-build.ps1 $branch $newVersion
+./2-nuget-pack.ps1
+./3-nuget-push.ps1
+./4-npm-publish-mvc.ps1
+./5-npm-publish-angular.ps1
+./6-git-commit.ps1
+./7-publish-github-release.ps1 @publishGithubReleaseParams
+./8-download-release-zip.ps1
+
+Stop-Transcript
+```
+
+### Parameters
+
+| Name            | Type     | Prompt if missing | Forwarded to                          |
+| --------------- | -------- | ----------------- | ------------------------------------- |
+| `$branch`       | string   | yes               | `1-fetch-and-build.ps1`, step 7       |
+| `$newVersion`   | string   | yes (shows current) | `1-fetch-and-build.ps1`             |
+| `$isRcVersion`  | string   | yes (y/n)         | step 7                                |
+
+The dot-source `. ..\nupkg\common.ps1` is what gives this script access to `Get-Current-Version`, `Get-Current-Branch`, `Read-File`, and `Write-Info` — see [the helpers section](#nupkg-common-ps1) below.
+
+## Step 1 — `1-fetch-and-build.ps1`
+
+Pulls the branch, edits `common.props` in place to set the new version, then calls into `build/`:
+
+```powershell deploy/1-fetch-and-build.ps1
+param(
+  [string]$branch,
+  [string]$newVersion
+)
+
+. ..\nupkg\common.ps1
+
+if (!$branch) { $branch = Read-Host "Enter the branch name" }
+
+#----------- Read the current version from common.props -----------
+$commonPropsFilePath = resolve-path "../common.props"
+$commonPropsXmlCurrent = [xml](Get-Content $commonPropsFilePath )
+$currentVersion = $commonPropsXmlCurrent.Project.PropertyGroup.Version.Trim()
+
+if (!$newVersion) {
+    $newVersion = Read-Host "Current version is '$currentVersion'. Enter the new version (empty for no change) "
+    if($newVersion -eq "") { $newVersion = $currentVersion }
+}
+
+if ($newVersion -ne $currentVersion){
+    # Update common.props for version attribute
+    $commonPropsXmlCurrent.Project.PropertyGroup.Version = $newVersion
+    $commonPropsXmlCurrent.Save( $commonPropsFilePath )
+    $commonPropsXmlNew = [xml](Get-Content $commonPropsFilePath )
+    $newVersionAfterUpdate = $commonPropsXmlNew.Project.PropertyGroup.Version
+    echo "`n`nNew version updated as '$newVersionAfterUpdate' in $commonPropsFilePath`n"
+}
+
+################################################################
+Write-Info "Pulling ABP $branch branch from GitHub"
+cd ..
+git switch $branch
+git pull origin
+
+################################################################
+Write-Info "Building ABP repository"
+cd build
+.\build-all-release.ps1
+```
+
+**What it does, in order:**
+
+<Steps>
+  <Step title="Reads current common.props Version">
+    XML-loads `../common.props`, pulls `Project.PropertyGroup.Version`. This is the single source of truth.
+  </Step>
+  <Step title="Writes the new version">
+    If `$newVersion` differs, edits the XML and `Save()`s it. Reloads to verify.
+  </Step>
+  <Step title="git switch + git pull">
+    Moves to the target branch (e.g. `rel-10.0`) and pulls latest. Anything uncommitted in `common.props` is lost.
+  </Step>
+  <Step title="Calls build-all-release.ps1">
+    `cd build; .\build-all-release.ps1`. That's the full `-f` Release build documented on [/build/build-scripts](/build/build-scripts#build-all-release-ps1).
+  </Step>
+</Steps>
+
+## Step 2 — `2-nuget-pack.ps1` and `nupkg/pack.ps1`
+
+The deploy-level wrapper is tiny — it just changes directory and calls the real pack script:
+
+```powershell deploy/2-nuget-pack.ps1
+. ..\nupkg\common.ps1
+Write-Info "Creating NuGet packages"
+
+echo "`n-----=====[ CREATING NUGET PACKAGES ]=====-----`n"
+cd ..\nupkg
+powershell -File pack.ps1
+echo "`n-----=====[ CREATING NUGET PACKAGES COMPLETED ]=====-----`n"
+
+Write-Info "Completed: Creating NuGet packages"
+cd ..\deploy
+```
+
+### `nupkg/pack.ps1` — the real work
+
+```powershell nupkg/pack.ps1 (excerpt)
+. ".\common.ps1"
+# Delete existing nupkg files
+del *.nupkg
+
+# Rebuild all solutions
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet restore
+}
+
+# Create all packages
+$i = 0
+$projectsCount = $projects.length
+Write-Info "Running dotnet pack on $projectsCount projects..."
+
+foreach($project in $projects) {
+    $i += 1
+    $projectFolder = Join-Path $rootFolder $project
+    $projectName = ($project -split '/')[-1]
+
+    Write-Info "[$i / $projectsCount] - Packing project: $projectName"
+    Set-Location $projectFolder
+
+    dotnet pack -c Release --no-build -- /maxcpucount
+
+    if (-Not $?) {
+        Write-Error "Packaging failed for the project: $projectName"
+        exit $LASTEXITCODE
+    }
+
+    # Move nuget package
+    $projectName = $project.Substring($project.LastIndexOf("/") + 1)
+    $projectPackPath = Join-Path $projectFolder ("/bin/Release/" + $projectName + ".*.nupkg")
+    Move-Item -Force $projectPackPath $packFolder
+
+    Seperator
+}
+
+# Go back to the pack folder
+Set-Location $packFolder
+```
+
+**Two lists drive this:**
+
+- `$solutions` — ~19 solution folders, used only to run `dotnet restore`.
+- `$projects` — ~400 individual project paths, one `dotnet pack` per project.
+
+Both lists are defined in `nupkg/common.ps1`. They have to be edited by hand when a new project is added to the framework or modules.
+
+### Pack behaviour notes
+
+- `--no-build` is what couples this to `build-all-release.ps1` — see [build-all-release explanation](/build/build-scripts#build-all-release-ps1).
+- `-c Release` matches the build configuration so the binaries line up.
+- `Move-Item -Force` puts every `.nupkg` into `nupkg/` itself, ready for `push_packages.ps1`.
+- Existing `.nupkg`s are deleted at the start with `del *.nupkg` — no leftover-from-last-release contamination.
+
+## Step 3 — `3-nuget-push.ps1` and `nupkg/push_packages.ps1`
+
+```powershell deploy/3-nuget-push.ps1
+param(
+  [string]$nugetApiKey
+)
+
+. ..\nupkg\common.ps1
+
+if (!$nugetApiKey)
+{
+    $passwordFileName = "nuget-api-key.txt"
+    $pathExists = Test-Path -Path $passwordFileName -PathType Leaf
+    if ($pathExists)
+    {
+        $nugetApiKey = Get-Content $passwordFileName
+        echo "Using NuGet API Key from $passwordFileName ..."
+    }
+}
+
+if (!$nugetApiKey) { $nugetApiKey = Read-Host "Enter the NuGet API KEY" }
+
+Write-Info "Pushing packages to NuGet"
+cd ..\nupkg
+powershell -File push_packages.ps1 $nugetApiKey
+cd ..\deploy
+```
+
+### The actual push
+
+```powershell nupkg/push_packages.ps1 (excerpt)
+$apiKey = $args[0]
+[xml]$commonPropsXml = Get-Content (Join-Path $rootFolder "common.props")
+$version = $commonPropsXml.Project.PropertyGroup.Version
+
+$nugetUrl = "https://api.nuget.org/v3/index.json"
+Set-Location $packFolder
+
+foreach($project in $projects) {
+    $projectName = ($project -split '/')[-1]
+    $nugetPackageName = $projectName + "." + $version + ".nupkg"
+    $nugetPackageExists = Test-Path $nugetPackageName -PathType leaf
+
+    Write-Info "[$i / $totalProjectsCount] - Pushing: $nugetPackageName"
+
+    if ($nugetPackageExists) {
+        dotnet nuget push $nugetPackageName --skip-duplicate -s $nugetUrl --api-key "$apiKey"
+    } else {
+        Write-Host ("********** ERROR PACKAGE NOT FOUND: " + $nugetPackageName) -ForegroundColor red
+        $errorCount += 1
+    }
+}
+```
+
+**Key behaviours:**
+
+- Version is read fresh from `common.props` — never trusted from a parameter.
+- `--skip-duplicate` is critical: it makes retries idempotent. If 397/400 succeed and 3 fail (network blip), you re-run the whole script and nuget.org returns 409 Conflict for the 397 already-pushed packages, which `--skip-duplicate` swallows.
+- Missing packages are logged but don't abort — by design, so partial successes still ship.
+
+### Nightly preview push — `nupkg/push-nightly-packages-myget.ps1`
+
+There's a separate nightly push script that targets a configurable source (originally MyGet, now also used for nightly nuget.org pushes):
+
+```powershell nupkg/push-nightly-packages-myget.ps1
+param(
+  [string]$source,
+  [string]$apikey
+)
+
+if (!$source) { $source = "https://nuget.org/" }
+if (!$apikey) { $apikey = "dummy" }
+
+dotnet nuget push '*.nupkg' -s $source --skip-duplicate --api-key $apikey
+```
+
+This is *not* called by `_run_all.ps1` — it's invoked manually or from a separate nightly CI job.
+
+## Step 4 — `4-npm-publish-mvc.ps1` and `npm/publish-mvc.ps1`
+
+```powershell deploy/4-npm-publish-mvc.ps1
+param(
+  [string]$npmAuthToken
+)
+
+. ..\nupkg\common.ps1
+
+if (!$npmAuthToken) {
+    $passwordFileName = "npm-auth-token.txt"
+    $pathExists = Test-Path -Path $passwordFileName -PathType Leaf
+    if ($pathExists) {
+        $npmAuthToken = Get-Content $passwordFileName
+        echo "Using NPM Auth Token from $passwordFileName ..."
+    }
+}
+if (!$npmAuthToken) { $npmAuthToken = Read-Host "Enter the NPM Auth Token" }
+
+cd ..\npm
+
+echo "`nSetting npmjs.org auth-token token`n"
+npm set //registry.npmjs.org/:_authToken $npmAuthToken
+
+Write-Info "Pushing MVC packages to NPM"
+powershell -File publish-mvc.ps1
+Write-Info "Completed: Pushing MVC packages to NPM"
+
+cd ..\deploy
+```
+
+### The actual MVC publish
+
+```powershell npm/publish-mvc.ps1
+param(
+  [string]$Version,
+  [string]$Registry
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if (-Not $Version)  { $Version = $NextVersion }
+if (-Not $Registry) { $Registry = "https://registry.npmjs.org" }
+
+$PacksPublishCommand = "npm run lerna -- exec 'npm publish --registry $Registry'"
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true"
+
+if ($IsPrerelease) {
+    $PacksPublishCommand = $PacksPublishCommand.Substring(0, $PacksPublishCommand.Length - 1) + " --tag next'"
+}
+
+$commands = (
+  "npm run lerna -- version $Version --yes --no-commit-hooks --no-git-tag-version --no-push --force-publish",
+  "yarn replace-with-tilde",
+  "cd scripts",
+  "yarn install",
+  "yarn validate-versions --compareVersion $Version --path ../packs",
+  "cd ..",
+  $PacksPublishCommand
+)
+
+foreach ($command in $commands) {
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host $command
+    Invoke-Expression $command
+    ...
+}
+```
+
+**What it does:**
+
+- Runs `lerna version` to write the new version into every `package.json` under `npm/packs/`.
+- `yarn replace-with-tilde` rewrites inter-pack version ranges to `~x.y.z` so they upgrade on patch.
+- `yarn validate-versions` (a script under `npm/scripts/`) double-checks no pack was missed.
+- Final command is `npm run lerna -- exec 'npm publish --registry ...'` — fans out one publish per pack.
+- For pre-release versions, `--tag next` is appended so `npm install @abp/foo@next` pulls the RC and `@abp/foo` still pulls stable.
+
+## Step 5 — `5-npm-publish-angular.ps1` and `npm/publish-ng.ps1`
+
+```powershell deploy/5-npm-publish-angular.ps1
+# Same shape as step 4, but calls publish-ng.ps1 instead
+cd ..\npm
+npm set //registry.npmjs.org/:_authToken $npmAuthToken
+powershell -File publish-ng.ps1
+cd ..\deploy
+```
+
+### `npm/publish-ng.ps1`
+
+```powershell npm/publish-ng.ps1 (excerpt)
+param(
+  [string]$Version,
+  [string]$Registry,
+  [string]$LeptonXVersion
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+if (-Not $Version)  { $Version = $NextVersion }
+if (-Not $Registry) { $Registry = "https://registry.npmjs.org" }
+
+$UpdateNgPacksCommand    = "yarn update-version $Version"
+$NgPacksPublishCommand   = "npm run publish-packages -- --nextVersion $Version --skipGit --registry $Registry --skipVersionValidation"
+$UpdateGulpCommand       = "yarn update-gulp --registry $Registry"
+$UpdateLeptonXCommand    = "yarn update-lepton-x-versions -v $LeptonXVersion"
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true"
+
+if ($IsPrerelease) {
+    $UpdateGulpCommand    += " --prerelease"
+    $UpdateNgPacksCommand += " --prerelease"
+}
+
+$commands = (
+  "cd ng-packs",
+  "yarn install",
+  $UpdateNgPacksCommand,
+  "cd scripts",
+  "yarn install",
+  $NgPacksPublishCommand,
+  "cd ../../",
+  "cd scripts",
+  "yarn remove-lock-files",
+  "cd ..",
+  $UpdateGulpCommand,
+  "cd scripts",
+  $UpdateLeptonXCommand
+)
+```
+
+The Angular side is more complex than MVC because it has to:
+
+- Bump versions across all `npm/ng-packs/packages/*/package.json` files.
+- Publish via the custom `publish-packages` script (rather than `lerna publish`).
+- Update gulp dependencies in `npm/packs/*`.
+- Refresh LeptonX UI theme versions via `update-lepton-x-versions`.
+
+### `npm/preview-publish.ps1`
+
+Convenience wrapper that runs both MVC and Angular for a Verdaccio dry-run:
+
+```powershell npm/preview-publish.ps1
+param(
+  [string]$Version,
+  [string]$Registry,
+  [string]$LeptonXVersion
+)
+
+$commands = (
+  ".\publish-mvc.ps1 $Version $Registry",
+  ".\publish-ng.ps1 $Version $Registry $LeptonXVersion"
+)
+
+foreach ($command in $commands) {
+    Write-Host $command
+    Invoke-Expression $command
+    ...
+}
+```
+
+Used together with the `npm/verdaccio-containers/` setup to verify a release against a local registry before pushing to npmjs.org.
+
+## Step 6 — `6-git-commit.ps1`
+
+After steps 4 and 5 have rewritten lots of `package.json` files (via `lerna version` and `update-version`), this commits the result back:
+
+```powershell deploy/6-git-commit.ps1
+. ..\nupkg\common.ps1
+
+cd ..
+
+Write-Info "Committing changes to GitHub"
+git add .
+git commit -m Update_NPM_Package_Versions
+git push
+
+Write-Info "Completed: Committing changes to GitHub"
+cd deploy
+```
+
+The commit message `Update_NPM_Package_Versions` is a fixed marker. The `update-versions.yml` workflow watches for a similar marker after the GitHub Release event to bump `latest-versions.json`.
+
+## Step 7 — `7-publish-github-release.ps1`
+
+POSTs directly to the GitHub REST API to create the release entry:
+
+```powershell deploy/7-publish-github-release.ps1
+param(
+  [string]$branchName,
+  [string]$version,
+  [string]$isRcVersion,
+  [string]$isDraft,
+  [string]$gitHubApiKey
+)
+
+. ..\nupkg\common.ps1
+
+if ($isRcVersion -eq "") { $isRcVersion = Read-Host "Is this a RC/Preview version? (y/n)" }
+if ($gitHubApiKey -eq "") {
+    $gitHubApiKey = Read-File "github-api-key.txt"
+}
+if(!$gitHubApiKey)       { $gitHubApiKey = Read-Host "Enter the GitHub API Key" }
+if ($version -eq "")     { $version    = Get-Current-Version }
+if ($branchName -eq "")  { $branchName = Get-Current-Branch }
+if ($isDraft -eq "")     { $draft = $FALSE } else { $draft = [boolean]::Parse($isDraft) }
+
+$preRelease = ( ($isRcVersion -eq "true") -or ($isRcVersion -eq "y") -or ($isRcVersion -eq "rc") )
+
+$releaseData = @{
+   tag_name = $version;
+   target_commitish = $branchName;
+   name = $version;
+   body = $releaseNotes;
+   draft = $draft;
+   prerelease = $preRelease;
+ }
+
+$releaseParams = @{
+   Uri = "https://api.github.com/repos/$gitHubUsername/$gitHubRepository/releases";
+   Method = 'POST';
+   Headers = @{
+     Authorization = 'Basic ' + [Convert]::ToBase64String(
+       [Text.Encoding]::ASCII.GetBytes($gitHubApiKey + ":x-oauth-basic"))
+   }
+   ContentType = 'application/json';
+   Body = (ConvertTo-Json $releaseData -Compress)
+ }
+
+$response = Invoke-RestMethod @releaseParams
+```
+
+### Side effects on GitHub
+
+| Field on release | Source                                                       |
+| ---------------- | ------------------------------------------------------------ |
+| `tag_name`       | `common.props` `<Version>`                                   |
+| `target_commitish` | Current branch (e.g. `rel-10.0`)                           |
+| `name`           | Same as `tag_name`                                           |
+| `prerelease`     | `true` if `-isRcVersion` was `y`, `true`, or `rc`            |
+| `body`           | Empty in the script — release notes added manually on GitHub |
+
+After this POST, the `update-versions.yml` workflow fires (it listens for `release.types: [published]`) and runs `.github/scripts/update_versions.py` to bump `latest-versions.json` and open a PR.
+
+## Step 8 — `8-download-release-zip.ps1`
+
+The final step SSHes into the release host using `plink.exe` and triggers a server-side script:
+
+```powershell deploy/8-download-release-zip.ps1
+param(
+  [string]$password
+)
+
+. ..\nupkg\common.ps1
+
+if (!$password) {
+    $sshPasswordFileName = "ssh-password.txt"
+    $password = Get-Content $sshPasswordFileName
+}
+if (!$password) { $password = Read-Host "Enter the Natro jenkins user password" }
+
+[xml]$commonPropsXml = Get-Content "../common.props"
+$version = $commonPropsXml.Project.PropertyGroup.Version
+echo "`n---===[ Current version: $version ]===---"
+
+Write-Info "Downloading release zip into Natro"
+
+plink.exe -ssh jenkins@94.73.164.234 -pw $password -P 22 -batch `
+  "powershell -File c:\ci\scripts\download-latest-abp-release.ps1 ${version}"
+
+Write-Info "Completed: Downloading release zip into Natro completed"
+```
+
+The host downloads the `Compress-Archive`'d template zips produced by `templates/zip-templates.ps1`. Those zips are what the ABP CLI (`abp new`) fetches for offline template creation — see [/cli/overview](/cli/overview).
+
+## Supporting files
+
+### `nupkg/common.ps1`
+
+Provides `Write-Info`, `Get-Current-Version`, `Get-Current-Branch`, `Read-File`, plus the `$solutions` and `$projects` arrays:
+
+```powershell nupkg/common.ps1 (excerpt)
+function Write-Info {
+    param([Parameter(Mandatory = $true)][string]$text)
+    Write-Host $text -ForegroundColor Black -BackgroundColor Green
+    try { $host.UI.RawUI.WindowTitle = $text } catch { }
+}
+
+function Get-Current-Version {
+    $commonPropsFilePath = resolve-path "../common.props"
+    $commonPropsXmlCurrent = [xml](Get-Content $commonPropsFilePath )
+    $currentVersion = $commonPropsXmlCurrent.Project.PropertyGroup.Version.Trim()
+    return $currentVersion
+}
+
+function Get-Current-Branch {
+    return git branch --show-current
+}
+
+function Read-File {
+    param([Parameter(Mandatory = $true)][string]$filePath)
+    $pathExists = Test-Path -Path $filePath -PathType Leaf
+    if ($pathExists) { return Get-Content $filePath }
+    else             { Write-Error "$filePath path does not exist!" }
+}
+```
+
+### `templates/zip-templates.ps1`
+
+Called outside `_run_all.ps1` but is part of the release artifact set:
+
+```powershell templates/zip-templates.ps1
+$version = $args[0]
+$folders = Get-ChildItem -Directory
+
+foreach ($folder in $folders) {
+    $zipFile = "./" + $folder.Name + "-" + $version + ".zip"
+
+    if (Test-Path $zipFile) { Remove-Item $zipFile }
+
+    Compress-Archive -Path "$($folder.FullName)\*" -DestinationPath $zipFile
+}
+
+Write-Host "All templates have been zipped."
+```
+
+Run from `templates/` with the version as `$args[0]`, e.g. `.\zip-templates.ps1 10.0.1`. Produces `app-10.0.1.zip`, `module-10.0.1.zip`, `console-10.0.1.zip`, etc.
+
+### `deploy/new-github-release-function.psm1`
+
+A PowerShell module imported by older versions of step 7. The current step 7 inlines the equivalent logic, so the module is kept for backward-compat but not actively called.
+
+### `deploy/plink.exe`
+
+PuTTY's CLI SSH client. Bundled in the repo so step 8 doesn't depend on the maintainer having `ssh`/PuTTY installed. Windows-only.
+
+## Re-running after a failure
+
+The pipeline is designed for partial-retry. Pack failures → re-run `2-nuget-pack.ps1` (it starts with `del *.nupkg`, so leftovers are cleared). Push failures → re-run `3-nuget-push.ps1` (`--skip-duplicate` ignores already-pushed packages). npm 401 → refresh `npm-auth-token.txt`, re-run step 4/5 (lerna publish is idempotent per version). GitHub release 422 → tag exists or `target_commitish` is wrong; safe to re-run after fixing.
+
+## Cross-references
+
+<CardGroup cols={3}>
+  <Card title="Build scripts" icon="hammer" href="/build/build-scripts">
+    What `build-all-release.ps1` (called by step 1) actually does.
+  </Card>
+  <Card title="CI workflows" icon="github" href="/build/ci-and-versioning">
+    How `publish-release.yml` and `update-versions.yml` interact with step 7.
+  </Card>
+  <Card title="CLI" icon="terminal" href="/cli/overview">
+    Where the template zips produced by step 8 end up.
+  </Card>
+</CardGroup>
+
+## Recap
+
+- Eight numbered scripts in `deploy/`, chained by `_run_all.ps1`.
+- All version info flows through `common.props`. Never pass a version as a script parameter unless you also save it.
+- Secrets are file-based (`*.txt` files in `deploy/`) with `Read-Host` fallback.
+- `nupkg/pack.ps1` and `nupkg/push_packages.ps1` are the real heavy lifters for NuGet.
+- `npm/publish-mvc.ps1` (lerna) and `npm/publish-ng.ps1` (custom `publish-packages`) handle npm.
+- Step 7 is a direct REST POST to `api.github.com/repos/abpframework/abp/releases`.
+- Step 8 uses `plink.exe` to trigger a server-side zip download — that zip serves `abp new`.

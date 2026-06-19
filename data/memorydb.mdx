@@ -1,0 +1,321 @@
+---
+title: "MemoryDb: In-Process Store for Tests, Prototypes and Demos"
+sidebarTitle: "MemoryDb"
+description: "Volo.Abp.MemoryDb gives every IRepository an in-process backing store with full UoW integration — ideal for unit tests, prototypes and demos."
+---
+
+`Volo.Abp.MemoryDb` is the framework's tiny in‑process repository provider. There is no real database — entities live in `List<TEntity>` collections held by a process‑wide `MemoryDatabaseManager`. Source: `framework/src/Volo.Abp.MemoryDb/`.
+
+It exists for two reasons:
+
+1. **Tests.** Spinning up SQLite is fast; spinning up a `Dictionary<string, List<T>>` is faster, and you don't need to mock anything.
+2. **Module demos / prototypes.** You can boot a brand‑new ABP module in `dotnet run --project DemoApp` and start clicking around without provisioning a DB.
+
+The provider plugs into the same UoW machinery as EF Core and Mongo — see [`/data/unit-of-work`](/data/unit-of-work) — but skips the transactional commit step because writes mutate in‑memory lists directly.
+
+## Package layout
+
+```
+framework/src/Volo.Abp.MemoryDb/
+├── Microsoft/Extensions/DependencyInjection/AbpMemoryDbServiceCollectionExtensions.cs
+└── Volo/Abp/
+    ├── Domain/Repositories/MemoryDb/
+    │   ├── IMemoryDatabase.cs              <- per-context store
+    │   ├── IMemoryDatabaseCollection.cs    <- per-entity list
+    │   ├── IMemoryDbRepository.cs
+    │   ├── MemoryDbRepository.cs           <- IRepository implementation
+    │   ├── MemoryDatabase.cs
+    │   ├── MemoryDatabaseCollection.cs
+    │   ├── MemoryDatabaseManager.cs        <- process-wide registry
+    │   ├── InMemoryIdGenerator.cs
+    │   ├── IMemoryDbSerializer.cs
+    │   └── Utf8JsonMemoryDbSerializer.cs   <- clone-on-write isolation
+    ├── MemoryDb/
+    │   ├── MemoryDbContext.cs              <- IAbpDbContext analogue
+    │   ├── IMemoryDatabaseProvider.cs
+    │   ├── AbpMemoryDbModule.cs
+    │   └── DependencyInjection/
+    │       ├── AbpMemoryDbContextRegistrationOptions.cs
+    │       └── MemoryDbRepositoryRegistrar.cs
+    └── Uow/MemoryDb/
+        ├── MemoryDbDatabaseApi.cs          <- IDatabaseApi wrapper
+        └── UnitOfWorkMemoryDatabaseProvider.cs
+```
+
+## MemoryDbContext
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/MemoryDb/MemoryDbContext.cs
+public abstract class MemoryDbContext : ISingletonDependency
+{
+    private static readonly Type[] EmptyTypeList = new Type[0];
+
+    public virtual IReadOnlyList<Type> GetEntityTypes()
+    {
+        return EmptyTypeList;
+    }
+}
+```
+
+A `MemoryDbContext` *is just a marker singleton* that exposes the list of entity types it holds. Override `GetEntityTypes()` in your derived context to enumerate which entities are stored in this "database":
+
+```csharp
+[ConnectionStringName("MyApp")]
+public class MyAppMemoryDbContext : MemoryDbContext
+{
+    public override IReadOnlyList<Type> GetEntityTypes() => new[]
+    {
+        typeof(Book),
+        typeof(Author),
+    };
+}
+```
+
+The registrar (`MemoryDbRepositoryRegistrar`) reflects over the list at startup and registers `MemoryDbRepository<MyAppMemoryDbContext, Book>` etc.
+
+## IMemoryDatabase
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Domain/Repositories/MemoryDb/IMemoryDatabase.cs
+public interface IMemoryDatabase
+{
+    IMemoryDatabaseCollection<TEntity> Collection<TEntity>() where TEntity : class, IEntity;
+    TKey GenerateNextId<TEntity, TKey>();
+}
+```
+
+Stored values are accessed through `Collection<T>().AsQueryable()`. `MemoryDatabase` (the concrete) uses an `IMemoryDbSerializer` to round‑trip entities through JSON on write, so callers can't accidentally mutate state held by the database without going through the repository.
+
+## UnitOfWorkMemoryDatabaseProvider
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Uow/MemoryDb/UnitOfWorkMemoryDatabaseProvider.cs
+public class UnitOfWorkMemoryDatabaseProvider<TMemoryDbContext> : IMemoryDatabaseProvider<TMemoryDbContext>
+    where TMemoryDbContext : MemoryDbContext
+{
+    public TMemoryDbContext DbContext { get; }
+
+    public async Task<IMemoryDatabase> GetDatabaseAsync()
+    {
+        var unitOfWork = _unitOfWorkManager.Current
+            ?? throw new AbpException($"A {nameof(IMemoryDatabase)} instance can only be created inside a unit of work!");
+
+        var connectionString = await _connectionStringResolver.ResolveAsync<TMemoryDbContext>();
+        var dbContextKey     = $"{typeof(TMemoryDbContext).FullName}_{connectionString}";
+
+        var databaseApi = unitOfWork.GetOrAddDatabaseApi(
+            dbContextKey,
+            () => new MemoryDbDatabaseApi(_memoryDatabaseManager.Get(connectionString))
+        );
+
+        return ((MemoryDbDatabaseApi)databaseApi).Database;
+    }
+}
+```
+
+Even though there is no real database, the provider still demands an ambient UoW. That makes test code symmetric: replace `UseSqlite` with `AddMemoryDbContext` and your `using (var uow = manager.Begin(...))` blocks keep working.
+
+The `MemoryDbDatabaseApi` is the slimmest possible `IDatabaseApi`:
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Uow/MemoryDb/MemoryDbDatabaseApi.cs
+public class MemoryDbDatabaseApi : IDatabaseApi
+{
+    public IMemoryDatabase Database { get; }
+    public MemoryDbDatabaseApi(IMemoryDatabase database) { Database = database; }
+}
+```
+
+It does **not** implement `ISupportsSavingChanges` or `ISupportsRollback`. Writes apply immediately on the underlying `List<T>`, and the UoW's `CompleteAsync` is a no‑op for the in‑memory provider. That's why MemoryDb isn't safe for production: a half‑written aggregate from a failing UoW is observable to the next call.
+
+## MemoryDbRepository
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Domain/Repositories/MemoryDb/MemoryDbRepository.cs
+public class MemoryDbRepository<TMemoryDbContext, TEntity> : RepositoryBase<TEntity>, IMemoryDbRepository<TEntity>
+    where TMemoryDbContext : MemoryDbContext
+    where TEntity : class, IEntity
+{
+    public virtual async Task<IMemoryDatabaseCollection<TEntity>> GetCollectionAsync()
+        => (await GetDatabaseAsync()).Collection<TEntity>();
+
+    public Task<IMemoryDatabase> GetDatabaseAsync()
+        => DatabaseProvider.GetDatabaseAsync();
+
+    public override async Task<IQueryable<TEntity>> GetQueryableAsync()
+        => ApplyDataFilters((await GetCollectionAsync()).AsQueryable());
+
+    // ... InsertAsync, UpdateAsync, DeleteAsync mutate the collection synchronously
+}
+```
+
+Key behaviors:
+
+- **`ApplyDataFilters`** — same `ISoftDelete` / `IMultiTenant` filters as EF Core and Mongo. The base class plugs into `IDataFilter`. See [`/data/data-filtering`](/data/data-filtering).
+- **Domain events** — the repository pulls `localEvents` and `distributedEvents` from `IGeneratesDomainEvents` and pushes them into `UnitOfWorkManager.Current.AddOrReplaceLocalEvent(...)`. Even with an in‑memory store, your aggregates' events still fire on `CompleteAsync`.
+- **Audit + GuidGenerator** — `AuditPropertySetter.SetCreationPropertiesAsync(entity)`, `GuidGenerator.Create()` for empty Guid Ids — same as the relational providers.
+
+## Module wiring
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/MemoryDb/AbpMemoryDbModule.cs
+[DependsOn(typeof(AbpDddDomainModule))]
+public class AbpMemoryDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.TryAddTransient(typeof(IMemoryDatabaseProvider<>), typeof(UnitOfWorkMemoryDatabaseProvider<>));
+        context.Services.TryAddTransient(typeof(IMemoryDatabaseCollection<>), typeof(MemoryDatabaseCollection<>));
+    }
+}
+```
+
+And in your application/test module:
+
+```csharp
+[DependsOn(typeof(AbpMemoryDbModule))]
+public class MyAppMemoryDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMemoryDbContext<MyAppMemoryDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+}
+```
+
+## Cloning via serializer
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Domain/Repositories/MemoryDb/Utf8JsonMemoryDbSerializer.cs
+public class Utf8JsonMemoryDbSerializer : IMemoryDbSerializer { /* JSON round-trip clone */ }
+```
+
+Every `Insert`/`Update` serializes the entity to JSON and back so the caller's instance is not held by the store. This mirrors EF Core's behavior — once you `SaveChanges`, your instance is independent of the row.
+
+<Tip>
+If you have entities with `[BsonIgnoreExtraElements]`-style fields or value‑typed records that don't round‑trip through `Utf8Json`, register your own `IMemoryDbSerializer` with `Configure<Utf8JsonMemoryDbSerializerOptions>` overrides or replace the serializer entirely.
+</Tip>
+
+## When to use MemoryDb (and when not)
+
+<AccordionGroup>
+  <Accordion title="Use it for unit/integration tests">
+    Faster than SQLite, no native interop, deterministic state per test (just newup a fresh `MemoryDatabaseManager` per fixture).
+  </Accordion>
+  <Accordion title="Use it for read-only sample data">
+    Demo applications, module templates, "click around the UI" scenarios.
+  </Accordion>
+  <Accordion title="Do NOT use it in production">
+    No transaction. No durability. Memory is process‑local, so a multi‑instance deployment sees divergent state. Use SQL Server / PostgreSQL / Mongo for production.
+  </Accordion>
+  <Accordion title="Watch out for cross-context queries">
+    Each `MemoryDbContext` has its own `IMemoryDatabase`. Joining entities across contexts won't work — keep all related entities in one context.
+  </Accordion>
+</AccordionGroup>
+
+## A complete demo module
+
+A "click‑around‑without‑a‑database" demo:
+
+```csharp
+[DependsOn(
+    typeof(BooksDomainModule),
+    typeof(AbpMemoryDbModule)
+)]
+public class BooksMemoryDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMemoryDbContext<BooksMemoryDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+
+    public override async Task OnApplicationInitializationAsync(
+        ApplicationInitializationContext context)
+    {
+        // Seed once at startup so every page has data.
+        using var scope = context.ServiceProvider.CreateScope();
+        var seeder = scope.ServiceProvider.GetRequiredService<IDataSeeder>();
+        await seeder.SeedAsync();
+    }
+}
+```
+
+```csharp
+[ConnectionStringName("Books")]
+public class BooksMemoryDbContext : MemoryDbContext
+{
+    public override IReadOnlyList<Type> GetEntityTypes() => new[]
+    {
+        typeof(Book),
+        typeof(Author),
+    };
+}
+```
+
+```csharp
+public class BookDemoSeedContributor : IDataSeedContributor, ITransientDependency
+{
+    private readonly IRepository<Book, Guid> _books;
+    private readonly IGuidGenerator _guids;
+
+    public BookDemoSeedContributor(IRepository<Book, Guid> books, IGuidGenerator guids)
+    {
+        _books = books;
+        _guids = guids;
+    }
+
+    public async Task SeedAsync(DataSeedContext context)
+    {
+        if (await _books.GetCountAsync() > 0) return;
+
+        await _books.InsertManyAsync(new[]
+        {
+            new Book(_guids.Create(), "Domain-Driven Design", 49.95m),
+            new Book(_guids.Create(), "Implementing DDD",      59.95m),
+            new Book(_guids.Create(), "Patterns of EAA",       54.00m),
+        });
+    }
+}
+```
+
+Start the application, get three books visible immediately, click through pages — no database, no migrations, no Docker.
+
+## Provider quirks
+
+<AccordionGroup>
+  <Accordion title="Process-local state">
+    `MemoryDatabaseManager` is a singleton. State persists for the life of the host process. Restart the app → empty database again.
+  </Accordion>
+  <Accordion title="No multi-instance support">
+    Two replicas of the same app each have their own MemoryDb. A user hitting replica A sees different data than the same user on replica B. Always run a single instance during demos.
+  </Accordion>
+  <Accordion title="ConcurrencyStamp behavior">
+    `MemoryDbRepository.UpdateAsync` increments `IHasConcurrencyStamp.ConcurrencyStamp` automatically, but won't fail if the incoming stamp is stale (no real concurrency check). For optimistic‑concurrency tests prefer SQLite or an actual DB.
+  </Accordion>
+  <Accordion title="No relational joins">
+    `IQueryable<TEntity>` from MemoryDb is a LINQ‑to‑Objects query. Cross‑collection joins work but materialize whole collections into memory — fine for tests, dangerous in any real workload.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core SQLite" icon="feather" href="/data/efcore-sqlite">
+    The other test-friendly provider.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Even MemoryDb requires an ambient UoW.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    `IMemoryDbRepository<TEntity>` is just `IRepository<TEntity>` with collection access.
+  </Card>
+  <Card title="Data filtering" icon="filter" href="/data/data-filtering">
+    `ApplyDataFilters` honors the same toggles as EF Core / Mongo.
+  </Card>
+</CardGroup>

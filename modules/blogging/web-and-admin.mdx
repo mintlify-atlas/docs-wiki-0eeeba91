@@ -1,0 +1,653 @@
+---
+title: "Blogging — Web & Admin UI"
+description: "End-user Razor Pages for blog browsing (Volo.Blogging.Web) and admin pages for blog management (Volo.Blogging.Admin.Web), including BloggingUrlOptions and the BloggingRouteConstraint."
+---
+
+The Blogging module ships two complete Razor Pages UIs:
+
+- **`Volo.Blogging.Web`** — the public reader/author experience mounted under the configurable `/blog` route prefix.
+- **`Volo.Blogging.Admin.Web`** — the management UI mounted under `/Blogging/Admin/Blogs`, surfaced through the standard ABP **Administration** menu.
+
+Both modules register against the Bootstrap MVC UI (`AbpAspNetCoreMvcUiBootstrapModule`), use Mapperly for view-model mapping (`AbpMapperlyModule`) and embed all their views, JS and SCSS through `AbpVirtualFileSystemOptions.FileSets.AddEmbedded<...>()`.
+
+```text Volo.Blogging.Web/
+BloggingWebModule.cs
+BloggingUrlOptions.cs
+BloggingRouteConstraint.cs
+Pages/Blogs/
+  Index.cshtml(.cs)            ← list of blogs (multi-blog mode)
+  BloggingPageModel.cs         ← base PageModel with GetBlogAsync helper
+  BloggingPageHelper.cs
+  Members/Index.cshtml(.cs)    ← per-author profile + post list
+  Posts/
+    Index.cshtml(.cs)          ← post listing for a blog (optionally filtered by tag)
+    Detail.cshtml(.cs)         ← single post + comment thread + latest posts sidebar
+    New.cshtml(.cs)            ← author "new post" editor
+    Edit.cshtml(.cs)           ← author "edit post" editor
+  Shared/
+    Helpers/BlogNameControlHelper.cs
+    Scripts/blog.js
+    Styles/*.scss
+Bundling/                       ← Prism.js bundle contributors
+SocialMedia/                    ← share-button helpers
+wwwroot/                        ← CSS, JS, images, fonts
+
+Volo.Blogging.Admin.Web/
+BloggingAdminWebModule.cs
+Navigation/
+  BloggingAdminMenuContributor.cs
+  BloggingAdminMenuNames.cs
+Pages/
+  BloggingAdminPage.cs
+  BloggingAdminPageModel.cs
+  Blogging/Admin/Blogs/
+    Index.cshtml(.cs)          ← DataTables list with row actions
+    Create.cshtml(.cs)         ← create modal
+    Edit.cshtml(.cs)           ← edit page
+    index.js   create.js   edit.js
+wwwroot/
+```
+
+## Public UI — `Volo.Blogging.Web`
+
+### URL options
+
+The whole front-of-house URL space is steered by `BloggingUrlOptions`. The default route prefix is `/blog/`; it can be set to `/` to mount the blog at the site root, or to any other path. When the route prefix is `/`, `IgnoredPaths` lets you exclude top-level paths that should not be treated as blog short names (the framework auto-adds the bundling folder).
+
+```csharp BloggingUrlOptions.cs
+public class BloggingUrlOptions
+{
+    private string _routePrefix = "blog";
+
+    /// <summary>Default value: "blog";</summary>
+    public string RoutePrefix
+    {
+        get => GetFormattedRoutePrefix();
+        set => _routePrefix = value;
+    }
+
+    /// <summary>Used to specify ignore paths if the route prefix is null or empty.</summary>
+    public List<string> IgnoredPaths { get; } = new();
+
+    public SingleBlogModeOptions SingleBlogMode { get; } = new();
+
+    private string GetFormattedRoutePrefix()
+    {
+        if (string.IsNullOrWhiteSpace(_routePrefix)) return "/";
+        return _routePrefix.EnsureEndsWith('/').EnsureStartsWith('/');
+    }
+}
+
+public class SingleBlogModeOptions
+{
+    /// <summary>
+    /// Determines whether to enable single blog mode by removing the
+    /// blog name from the routing. When enabled, only a single blog is
+    /// allowed within the module.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    public string BlogName { get; set; }
+}
+```
+
+A typical override in a host:
+
+```csharp YourHostModule.cs
+Configure<BloggingUrlOptions>(options =>
+{
+    options.RoutePrefix             = "/";        // mount at site root
+    options.SingleBlogMode.Enabled  = true;
+    options.SingleBlogMode.BlogName = "news";     // ShortName of the one Blog
+    options.IgnoredPaths.Add("about");
+    options.IgnoredPaths.Add("contact");
+});
+```
+
+### `BloggingRouteConstraint`
+
+When the blog lives at `/` the framework needs to know which top-level path segments to *not* treat as `{blogShortName}`. That's the job of `BloggingRouteConstraint`, registered in `BloggingWebModule.ConfigureServices`:
+
+```csharp BloggingRouteConstraint.cs
+public class BloggingRouteConstraint : IRouteConstraint
+{
+    protected BloggingUrlOptions BloggingUrlOptions { get; }
+
+    public BloggingRouteConstraint(IOptions<BloggingUrlOptions> bloggingUrlOptions)
+        => BloggingUrlOptions = bloggingUrlOptions.Value;
+
+    public virtual bool Match(HttpContext httpContext, IRouter route, string routeKey,
+        RouteValueDictionary values, RouteDirection routeDirection)
+    {
+        if (BloggingUrlOptions.RoutePrefix != "/" || !BloggingUrlOptions.IgnoredPaths.Any())
+            return true;
+
+        if (!values.TryGetValue(routeKey, out var routeValue) || routeValue is not string s)
+            return true;
+
+        return !BloggingUrlOptions.IgnoredPaths.Any(
+            path => s.StartsWith(path, StringComparison.InvariantCultureIgnoreCase));
+    }
+}
+```
+
+It is bound to the `blogNameConstraint` token used in the page-route convention block in `BloggingWebModule`:
+
+```csharp BloggingWebModule.cs
+Configure<RouteOptions>(options =>
+{
+    options.ConstraintMap.Add("blogNameConstraint", typeof(BloggingRouteConstraint));
+});
+```
+
+### Routing convention
+
+```csharp BloggingWebModule.cs
+Configure<RazorPagesOptions>(options =>
+{
+    var urlOptions = context.Services
+        .GetRequiredServiceLazy<IOptions<BloggingUrlOptions>>().Value.Value;
+
+    var routePrefix = urlOptions.RoutePrefix;
+
+    if (urlOptions.SingleBlogMode.Enabled)
+    {
+        options.Conventions.AddPageRoute("/Blogs/Posts/Index",  routePrefix);
+        options.Conventions.AddPageRoute("/Blogs/Posts/Detail", routePrefix + "{postUrl}");
+        options.Conventions.AddPageRoute("/Blogs/Posts/Edit",   routePrefix + "posts/{postId}/edit");
+        options.Conventions.AddPageRoute("/Blogs/Posts/New",    routePrefix + "posts/new");
+    }
+    else
+    {
+        if (!routePrefix.IsNullOrWhiteSpace())
+            options.Conventions.AddPageRoute("/Blogs/Index", routePrefix);
+
+        options.Conventions.AddPageRoute("/Blogs/Posts/Index",  routePrefix + "{blogShortName:blogNameConstraint}");
+        options.Conventions.AddPageRoute("/Blogs/Posts/Detail", routePrefix + "{blogShortName:blogNameConstraint}/{postUrl}");
+        options.Conventions.AddPageRoute("/Blogs/Posts/Edit",   routePrefix + "{blogShortName}/posts/{postId}/edit");
+        options.Conventions.AddPageRoute("/Blogs/Posts/New",    routePrefix + "{blogShortName}/posts/new");
+    }
+
+    options.Conventions.AddPageRoute("/Blogs/Members/Index", routePrefix + "members/{userName}");
+});
+```
+
+### Route table
+
+With defaults (`RoutePrefix = "/blog/"`, multi-blog), users see:
+
+| URL | Razor page |
+| --- | --- |
+| `/blog/` | `Pages/Blogs/Index.cshtml` (list of blogs) |
+| `/blog/{blogShortName}` | `Pages/Blogs/Posts/Index.cshtml` (post list, optional `?tagName=`) |
+| `/blog/{blogShortName}/{postUrl}` | `Pages/Blogs/Posts/Detail.cshtml` |
+| `/blog/{blogShortName}/posts/new` | `Pages/Blogs/Posts/New.cshtml` |
+| `/blog/{blogShortName}/posts/{postId}/edit` | `Pages/Blogs/Posts/Edit.cshtml` |
+| `/blog/members/{userName}` | `Pages/Blogs/Members/Index.cshtml` |
+
+In single-blog mode the `{blogShortName}` segment disappears and posts live directly under `/blog/{postUrl}`.
+
+### `BloggingPageModel`
+
+All public pages derive from a shared `BloggingPageModel` that knows how to resolve the active blog from either the route value or the single-blog override:
+
+```csharp Pages/Blogs/BloggingPageModel.cs
+public abstract class BloggingPageModel : AbpPageModel
+{
+    public BloggingPageModel()
+    {
+        ObjectMapperContext = typeof(BloggingWebModule);
+    }
+
+    protected async Task<BlogDto> GetBlogAsync(
+        IBlogAppService blogAppService,
+        BloggingUrlOptions blogOptions,
+        string blogShortName)
+    {
+        if (!blogOptions.SingleBlogMode.Enabled)
+            return await blogAppService.GetByShortNameAsync(blogShortName);
+
+        if (!blogOptions.SingleBlogMode.BlogName.IsNullOrEmpty())
+            return await blogAppService.GetByShortNameAsync(blogOptions.SingleBlogMode.BlogName);
+
+        var blogs = await blogAppService.GetListAsync();
+        return blogs.Items.Count == 1
+            ? blogs.Items[0]
+            : blogs.Items.SingleOrDefault(x => x.ShortName == blogShortName);
+    }
+}
+```
+
+### `Pages/Blogs/Index` — list of blogs
+
+```csharp Pages/Blogs/Index.cshtml.cs
+public class IndexModel : AbpPageModel
+{
+    private readonly IBlogAppService _blogAppService;
+    private readonly BloggingUrlOptions _blogOptions;
+
+    public IReadOnlyList<BlogDto> Blogs { get; private set; }
+
+    public IndexModel(IBlogAppService blogAppService, IOptions<BloggingUrlOptions> blogOptions)
+    {
+        _blogAppService = blogAppService;
+        _blogOptions    = blogOptions.Value;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        if (_blogOptions.SingleBlogMode.Enabled)
+            return RedirectToPage("./Posts/Index");
+
+        var result = await _blogAppService.GetListAsync();
+
+        if (result.Items.Count == 1)
+        {
+            var blog = result.Items[0];
+            return RedirectToPage("./Posts/Index", new { blogShortName = blog.ShortName });
+        }
+
+        Blogs = result.Items;
+        return Page();
+    }
+}
+```
+
+When the host has a single blog, the index transparently redirects into the post listing — there is no "empty cover" page.
+
+### `Pages/Blogs/Posts/Index` — post listing
+
+The post listing pulls a `BlogDto`, the post list (optionally filtered by `tagName`), and the popular tags sidebar in one round-trip-per-call:
+
+```csharp Pages/Blogs/Posts/Index.cshtml.cs
+public class IndexModel : BloggingPageModel
+{
+    private readonly IPostAppService _postAppService;
+    private readonly IBlogAppService _blogAppService;
+    private readonly ITagAppService  _tagAppService;
+    public BloggingUrlOptions BlogOptions { get; }
+
+    [BindProperty(SupportsGet = true)] public string BlogShortName { get; set; }
+    [BindProperty(SupportsGet = true)] public string TagName       { get; set; }
+
+    public BlogDto                       Blog        { get; set; }
+    public IReadOnlyList<PostWithDetailsDto> Posts   { get; set; }
+    public IReadOnlyList<TagDto>             PopularTags { get; set; }
+
+    public virtual async Task<ActionResult> OnGetAsync()
+    {
+        if (BlogNameControlHelper.IsProhibitedFileFormatName(BlogShortName)) return NotFound();
+
+        try
+        {
+            Blog = await GetBlogAsync(_blogAppService, BlogOptions, BlogShortName);
+            if (Blog == null) return BlogNotFoundResult();
+            BlogShortName = Blog.ShortName;
+        }
+        catch (EntityNotFoundException) { return BlogNotFoundResult(); }
+
+        Posts       = (await _postAppService.GetListByBlogIdAndTagNameAsync(Blog.Id, TagName)).Items;
+        PopularTags = await _tagAppService.GetPopularTagsAsync(
+            Blog.Id, new GetPopularTagsInput { ResultCount = 10, MinimumPostCount = 2 });
+
+        return Page();
+    }
+
+    protected virtual ActionResult BlogNotFoundResult()
+    {
+        if (BlogOptions.SingleBlogMode.Enabled) return NotFound();
+        return RedirectToPage("/Blogs/Index");
+    }
+}
+```
+
+`BlogNameControlHelper.IsProhibitedFileFormatName` rejects short names that would clash with common static-file extensions (`.css`, `.js`, `.ico`, etc.) so the route constraint never matches a static-file request.
+
+### `Pages/Blogs/Posts/Detail` — single post + comments
+
+The detail page calls `_postAppService.GetForReadingAsync(new GetPostInput { BlogId, Url })` — which bumps `ReadCount` — then fetches the threaded comment list and the "latest posts" sidebar. (`Detail.cshtml.cs` snippet shown abbreviated.)
+
+```csharp Pages/Blogs/Posts/Detail.cshtml.cs
+public class DetailModel : BloggingPageModel
+{
+    private readonly IPostAppService    _postAppService;
+    private readonly IBlogAppService    _blogAppService;
+    private readonly ICommentAppService _commentAppService;
+    private readonly BloggingUrlOptions _blogOptions;
+
+    [BindProperty(SupportsGet = true)] public string BlogShortName { get; set; }
+    [BindProperty(SupportsGet = true)] public string PostUrl       { get; set; }
+
+    public PostWithDetailsDto                Post              { get; set; }
+    public BlogDto                           Blog              { get; set; }
+    public IReadOnlyList<CommentWithRepliesDto> CommentsWithReplies { get; set; }
+    public IReadOnlyList<PostWithDetailsDto>    LatestPosts      { get; set; }
+    public int                               CommentCount      { get; set; }
+    /* ...OnGetAsync resolves the blog, calls GetForReadingAsync, builds the
+        comment tree via GetHierarchicalListOfPostAsync, fills LatestPosts via
+        GetLatestBlogPostsAsync, and renders the page... */
+}
+```
+
+### `Pages/Blogs/Posts/New` & `Edit` — authoring
+
+The author pages are guarded against the `Blogging.Post.Create` / `.Update` permissions and use a view-model that mirrors `CreatePostDto`:
+
+```csharp Pages/Blogs/Posts/New.cshtml.cs
+public virtual async Task<ActionResult> OnGetAsync()
+{
+    if (!await _authorization.IsGrantedAsync(BloggingPermissions.Posts.Create))
+        return Redirect("/");
+    if (BlogNameControlHelper.IsProhibitedFileFormatName(BlogShortName))
+        return NotFound();
+
+    Blog = await GetBlogAsync(_blogAppService, _blogOptions, BlogShortName);
+    BlogShortName = Blog.ShortName;
+    Post = new CreatePostViewModel { BlogId = Blog.Id };
+    return Page();
+}
+
+public virtual async Task<ActionResult> OnPost()
+{
+    var blog = await _blogAppService.GetAsync(Post.BlogId);
+
+    if (string.IsNullOrEmpty(Post.Description))
+        Post.Description = Post.Content.Truncate(PostConsts.MaxSeoFriendlyDescriptionLength);
+
+    Post.Url = WebUtility.UrlEncode(Post.Url);
+
+    var postWithDetailsDto = await _postAppService.CreateAsync(
+        ObjectMapper.Map<CreatePostViewModel, CreatePostDto>(Post));
+
+    var routeValues = new Dictionary<string, object>
+    {
+        { nameof(DetailModel.PostUrl), postWithDetailsDto.Url }
+    };
+    if (!_blogOptions.SingleBlogMode.Enabled)
+        routeValues.Add(nameof(DetailModel.BlogShortName), blog.ShortName);
+
+    return RedirectToPage("/Blogs/Posts/Detail", routeValues);
+}
+```
+
+Notice the SEO-friendly default for `Description` (truncated content) and the URL encoding. The `Edit` page is structurally similar — it loads the existing `PostWithDetailsDto`, fills the form, then routes through `_postAppService.UpdateAsync(id, UpdatePostDto)`.
+
+### `Pages/Blogs/Members/Index` — author profile
+
+```csharp Pages/Blogs/Members/Index.cshtml.cs
+public class IndexModel : AbpPageModel
+{
+    private readonly IPostAppService   _postAppService;
+    private readonly IMemberAppService _memberAppService;
+    private readonly IBlogAppService   _blogAppService;
+    private readonly BloggingUrlOptions _blogOptions;
+
+    public BlogUserDto                User { get; set; }
+    public List<PostWithDetailsDto>   Posts { get; set; }
+    public Dictionary<Guid, string>   BlogShortNameMap { get; set; }
+
+    [BindProperty] public CustomIdentityBlogUserUpdateDto CustomUserUpdate { get; set; }
+
+    public async Task<IActionResult> OnGetAsync(string userName) { /* ... */ }
+}
+```
+
+It uses `IMemberAppService.FindAsync(userName)` to pull the `BlogUserDto` projection, `IPostAppService.GetListByUserIdAsync(userId)` to list the author's posts, and renders the social links (`Twitter`, `Github`, `Linkedin`, `WebSite`) defined on `BlogUser`.
+
+When the current user is the same as the viewed user, the `CustomUserUpdate` form lets them edit their `Name`, `Surname`, `Biography`, `WebSite`, `Twitter`, `Github`, `Linkedin`, `Company` and `JobTitle` via `IMemberAppService.UpdateUserProfileAsync(...)`.
+
+### Where view-models live
+
+Each Razor page contains its own nested view-model class (`CreatePostViewModel`, `EditPostViewModel`, `PostDetailsViewModel`) so that data-annotations + `DynamicStringLength` validation are bound to the form's own shape rather than to the cross-tier DTO. Mapping is done with Mapperly through `AbpBloggingWebMappers`, registered as `context.Services.AddMapperlyObjectMapper<BloggingWebModule>();`.
+
+### Asset bundling — Prism.js for syntax highlighting
+
+`BloggingWebModule` extends the default Prism.js CSS and JS bundles with Blogging-specific language packs, so author content with `<pre><code class="language-csharp">…</code></pre>` blocks renders correctly out of the box:
+
+```csharp BloggingWebModule.cs
+Configure<AbpBundleContributorOptions>(options =>
+{
+    options.Extensions<PrismjsStyleBundleContributor>()
+        .Add<PrismjsStyleBundleContributorBloggingExtension>();
+
+    options.Extensions<PrismjsScriptBundleContributor>()
+        .Add<PrismjsScriptBundleContributorBloggingExtension>();
+});
+```
+
+## Admin UI — `Volo.Blogging.Admin.Web`
+
+The admin module is mounted into the host's **Administration** menu through a single `IMenuContributor`:
+
+```csharp Volo.Blogging.Admin.Web/Navigation/BloggingAdminMenuContributor.cs
+public class BloggingAdminMenuContributor : IMenuContributor
+{
+    public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name == StandardMenus.Main)
+            await ConfigureMainMenuAsync(context);
+    }
+
+    private Task ConfigureMainMenuAsync(MenuConfigurationContext context)
+    {
+        var l = context.GetLocalizer<BloggingResource>();
+
+        var managementRootMenuItem = new ApplicationMenuItem(
+                BloggingAdminMenuNames.GroupName, l["Menu:BlogManagement"])
+            .RequirePermissions(BloggingPermissions.Blogs.Management);
+
+        managementRootMenuItem.AddItem(
+            new ApplicationMenuItem(BloggingAdminMenuNames.Blogs, l["Menu:Blogs"],
+                                    "~/Blogging/Admin/Blogs")
+                .RequirePermissions(BloggingPermissions.Blogs.Management));
+
+        context.Menu.GetAdministration().AddItem(managementRootMenuItem);
+        return Task.CompletedTask;
+    }
+}
+```
+
+```csharp Navigation/BloggingAdminMenuNames.cs
+public class BloggingAdminMenuNames
+{
+    public const string GroupName = "BlogManagement";
+    public const string Blogs     = GroupName + ".Blogs";
+}
+```
+
+The whole menu group is hidden unless the user holds `Blogging.Blog.Management`.
+
+### `Pages/Blogging/Admin/Blogs/Index`
+
+```csharp Pages/Blogging/Admin/Blogs/Index.cshtml.cs
+public class IndexModel : BloggingAdminPageModel
+{
+    private readonly IAuthorizationService _authorization;
+
+    public IndexModel(IAuthorizationService authorization)
+        => _authorization = authorization;
+
+    public virtual async Task<ActionResult> OnGetAsync()
+    {
+        if (!await _authorization.IsGrantedAsync(BloggingPermissions.Blogs.Management))
+            return Redirect("/");
+        return Page();
+    }
+}
+```
+
+The view itself renders a Datatables.net grid that is hydrated on the client (`index.js`) from `volo.blogging.admin.blogManagement.getList()` — the dynamic proxy registered for the `bloggingAdmin` area. Row actions wire up:
+
+- **Edit** → navigate to `~/Blogging/Admin/Blogs/Edit?BlogId={guid}`
+- **Delete** → `blogManagement.delete(id)` (DELETE `api/blogging/blogs/admin/{id}`)
+- **Clear cache** → `blogManagement.clearCache(id)` (GET `api/blogging/blogs/admin/clear-cache/{id}`)
+
+The corresponding permissions are `Blogging.Blog.Update`, `Blogging.Blog.Delete` and `Blogging.Blog.ClearCache` — see [HTTP API](/modules/blogging/http-api#blogmanagementcontroller--apibloggingblogsadmin).
+
+### `Pages/Blogging/Admin/Blogs/Create`
+
+Opens as a modal. The view-model carries the same `DynamicStringLength` annotations as `CreateBlogDto`:
+
+```csharp Pages/Blogging/Admin/Blogs/Create.cshtml.cs
+public class CreateModel : BloggingAdminPageModel
+{
+    private readonly IBlogManagementAppService _blogAppService;
+    private readonly IAuthorizationService     _authorization;
+
+    [BindProperty] public BlogCreateModalView Blog { get; set; } = new();
+
+    public CreateModel(IBlogManagementAppService blogAppService,
+                       IAuthorizationService authorization)
+    {
+        _blogAppService = blogAppService;
+        _authorization  = authorization;
+    }
+
+    public virtual async Task<ActionResult> OnGetAsync()
+    {
+        if (!await _authorization.IsGrantedAsync(BloggingPermissions.Blogs.Create))
+            return Redirect("/");
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        var blogDto = ObjectMapper.Map<BlogCreateModalView, CreateBlogDto>(Blog);
+        await _blogAppService.CreateAsync(blogDto);
+        return NoContent();
+    }
+
+    public class BlogCreateModalView
+    {
+        [Required]
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxNameLength))]
+        public string Name { get; set; }
+
+        [Required]
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxShortNameLength))]
+        public string ShortName { get; set; }
+
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxDescriptionLength))]
+        public string Description { get; set; }
+    }
+}
+```
+
+### `Pages/Blogging/Admin/Blogs/Edit`
+
+Loads the `BlogDto` through `GetAsync`, projects into an `IHasConcurrencyStamp` view-model and posts back to `UpdateAsync`:
+
+```csharp Pages/Blogging/Admin/Blogs/Edit.cshtml.cs
+public class EditModel : BloggingAdminPageModel
+{
+    private readonly IBlogManagementAppService _blogAppService;
+    private readonly IAuthorizationService     _authorization;
+
+    [BindProperty(SupportsGet = true)] public Guid BlogId { get; set; }
+    [BindProperty]                     public BlogEditViewModel Blog { get; set; } = new();
+
+    public virtual async Task<ActionResult> OnGetAsync()
+    {
+        if (!await _authorization.IsGrantedAsync(BloggingPermissions.Blogs.Update))
+            return Redirect("/");
+
+        var blog = await _blogAppService.GetAsync(BlogId);
+        Blog = ObjectMapper.Map<BlogDto, BlogEditViewModel>(blog);
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        await _blogAppService.UpdateAsync(Blog.Id, new UpdateBlogDto
+        {
+            Name        = Blog.Name,
+            ShortName   = Blog.ShortName,
+            Description = Blog.Description
+        });
+        return Page();
+    }
+
+    public class BlogEditViewModel : IHasConcurrencyStamp
+    {
+        [HiddenInput, Required] public Guid Id { get; set; }
+
+        [Required]
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxNameLength))]
+        public string Name { get; set; }
+
+        [Required]
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxShortNameLength))]
+        public string ShortName { get; set; }
+
+        [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxDescriptionLength))]
+        public string Description { get; set; }
+
+        [HiddenInput] public string ConcurrencyStamp { get; set; }
+    }
+}
+```
+
+## Putting it together
+
+A vanilla MVC host that consumes the Blogging module typically wires up:
+
+```csharp YourHostModule.cs
+[DependsOn(
+    typeof(BloggingWebModule),
+    typeof(BloggingHttpApiModule),
+    typeof(BloggingApplicationModule),
+    typeof(BloggingEntityFrameworkCoreModule),
+
+    typeof(BloggingAdminWebModule),
+    typeof(BloggingAdminHttpApiModule),
+    typeof(BloggingAdminApplicationModule)
+)]
+public class YourHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<BloggingUrlOptions>(options =>
+        {
+            options.RoutePrefix = "/blog/";
+            // options.SingleBlogMode.Enabled = true;
+        });
+    }
+}
+```
+
+The Razor Pages and the admin pages then come up automatically — no Startup-level route registration needed.
+
+## When to use this UI vs CMS Kit
+
+The Blogging UI is **dedicated** — it owns the URL space, the author profile concept, the comment thread renderer and the Prism.js bundling. It looks and feels like a stand-alone blog.
+
+The [CMS Kit Blogs](/modules/cms-kit/blogs) feature is **integrated** — it expects to live inside the broader CMS Kit experience and reuses CMS Kit's comments, ratings, reactions, tags and page-rendering pipeline.
+
+<CardGroup cols={2}>
+  <Card title="Stick with Blogging.Web/Admin.Web" icon="newspaper">
+    - You want a turn-key, multi-blog reader UI with author profiles, popular-tag sidebars and post detail/comment thread already laid out.
+    - You want an admin UI that only manages blogs, separate from any other CMS surface.
+    - You're happy with the `/blog/...` route prefix conventions.
+  </Card>
+  <Card title="Use CMS Kit Blogs instead" icon="grid-2" href="/modules/cms-kit/blogs">
+    - Your app already uses [CMS Kit](/modules/cms-kit/overview) for pages, menus, comments and tags — the [CMS Kit Blogs feature](/modules/cms-kit/blogs) inherits all of that.
+    - You want global CMS Kit feature toggles and URL forwarding to govern blogs the same way they govern pages.
+  </Card>
+</CardGroup>
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Module overview" icon="circle-info" href="/modules/blogging/overview">
+    Landing page, layered diagram, package map, Blogging-vs-CMS-Kit decision matrix.
+  </Card>
+  <Card title="Domain layer" icon="cube" href="/modules/blogging/domain">
+    Aggregate roots, repositories and the user-sync / cache-invalidation infrastructure the pages depend on.
+  </Card>
+  <Card title="Application layer" icon="layer-group" href="/modules/blogging/application">
+    All app services consumed by the pages above — including the permission map and resource-based authorization.
+  </Card>
+  <Card title="HTTP API" icon="cloud" href="/modules/blogging/http-api">
+    Every URL the pages call in the background (and the dynamic JS proxy notes).
+  </Card>
+</CardGroup>

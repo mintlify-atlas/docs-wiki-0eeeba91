@@ -1,0 +1,319 @@
+---
+title: "Imaging — SkiaSharp: Skia-backed resizing with sampling and quality control"
+sidebarTitle: "Imaging — SkiaSharp"
+description: "SkiaSharpImageResizerContributor uses Google's Skia engine (via SkiaSharp) to resize JPEG/PNG/WebP. Sampling options and per-encode quality are configurable through SkiaSharpResizerOptions."
+---
+
+`Volo.Abp.Imaging.SkiaSharp` plugs **SkiaSharp** (the .NET binding for Google's Skia graphics engine) into ABP's [imaging pipeline](/misc/imaging-abstractions). It implements **only the resizer** — there's no Skia compressor in this package because Skia's encoders are quality-driven, which is more naturally expressed as part of resize/save.
+
+Use this backend when:
+
+- You already use SkiaSharp elsewhere in your stack (Avalonia, custom drawing).
+- You need fine control over sampling options (mipmap, cubic, linear).
+- You're targeting JPEG/PNG/WebP only — Skia doesn't decode GIF or BMP usefully here.
+
+Source: `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/`
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/AbpImagingSkiaSharpModule.cs
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingSkiaSharpModule : AbpModule
+{
+}
+```
+
+Empty — the contributor registers via `ITransientDependency`.
+
+## The resizer contributor
+
+```csharp
+// framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpImageResizerContributor.cs
+public class SkiaSharpImageResizerContributor : IImageResizerContributor, ITransientDependency
+{
+    protected SkiaSharpResizerOptions Options { get; }
+
+    public SkiaSharpImageResizerContributor(IOptions<SkiaSharpResizerOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public virtual async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var (memoryBitmapStream, memorySkCodecStream) = await CreateMemoryStream(stream);
+
+        using var original = SKBitmap.Decode(memoryBitmapStream);
+        using var resized  = original.Resize(
+            new SKImageInfo((int)resizeArgs.Width, (int)resizeArgs.Height),
+            Options.SKSamplingOptions);
+
+        using var image  = SKImage.FromBitmap(resized);
+        using var codec  = SKCodec.Create(memorySkCodecStream);
+
+        var memoryStream = new MemoryStream();
+        using var skData = image.Encode(codec.EncodedFormat, Options.Quality);
+        skData.SaveTo(memoryStream);
+
+        return new ImageResizeResult<Stream>(memoryStream, ImageProcessState.Done);
+    }
+```
+
+A few Skia-specific details worth understanding:
+
+1. **`CreateMemoryStream` returns *two* streams.** Skia needs the bytes twice — once for the bitmap decoder (`SKBitmap.Decode`) and once for the codec detector (`SKCodec.Create`). The first one consumes the stream entirely; reusing it for the codec would fail. So the contributor duplicates the bytes up-front:
+
+    ```csharp
+    protected virtual async Task<(MemoryStream, MemoryStream)> CreateMemoryStream(Stream stream)
+    {
+        var streamPosition = stream.Position;
+
+        var memoryBitmapStream = new MemoryStream();
+        var memorySkCodecStream = new MemoryStream();
+
+        await stream.CopyToAsync(memoryBitmapStream);
+        stream.Position = streamPosition;
+        await stream.CopyToAsync(memorySkCodecStream);
+        stream.Position = streamPosition;
+
+        memoryBitmapStream.Position = 0;
+        memorySkCodecStream.Position = 0;
+
+        return (memoryBitmapStream, memorySkCodecStream);
+    }
+    ```
+
+    Yes, the input bytes live in memory twice during resize. For thumbnail-style work that's fine; if you're handling 50 MP source images at scale, ImageSharp or Magick.NET will be lighter.
+
+2. **`codec.EncodedFormat` preserves the input format.** Encoder is picked from the detected format, not from the caller — so a JPEG round-trips as JPEG, a WebP as WebP, etc.
+
+3. **No `ImageResizeMode` mapping** — `original.Resize(new SKImageInfo(W, H), sampling)` always **stretches** to W×H. There's no "min" / "max" / "crop" branching. If you need those, override `TryResizeAsync` and pre-compute the target size yourself before calling Skia.
+
+4. **`SKSamplingOptions`** controls the actual interpolation kernel. Defaults to `SKSamplingOptions.Default` which is a balanced trilinear-like filter; `SKCubicResampler.Mitchell` gives sharper down-scales.
+
+### Byte-array overload
+
+```csharp
+public virtual async Task<ImageResizeResult<byte[]>> TryResizeAsync(byte[] bytes, ImageResizeArgs resizeArgs, string? mimeType = null, CancellationToken cancellationToken = default)
+{
+    if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+        return new ImageResizeResult<byte[]>(bytes, ImageProcessState.Unsupported);
+
+    using var memoryStream = new MemoryStream(bytes);
+    var result = await TryResizeAsync(memoryStream, resizeArgs, mimeType, cancellationToken);
+
+    if (result.State != ImageProcessState.Done)
+        return new ImageResizeResult<byte[]>(bytes, result.State);
+
+    var newBytes = await result.Result.GetAllBytesAsync(cancellationToken);
+    result.Result.Dispose();
+    return new ImageResizeResult<byte[]>(newBytes, result.State);
+}
+```
+
+Trampolines into the stream version, same pattern as the other backends.
+
+### Supported mime types
+
+```csharp
+protected virtual bool CanResize(string? mimeType)
+{
+    return mimeType switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Webp => true,
+        _ => false
+    };
+}
+```
+
+Three formats. Notably missing: GIF, BMP, TIFF. Skia can encode/decode them under some configurations but the contributor sticks to the three you'd actually use on the web.
+
+## `SkiaSharpResizerOptions`
+
+```csharp
+// framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpResizerOptions.cs
+using SkiaSharp;
+
+namespace Volo.Abp.Imaging;
+
+public class SkiaSharpResizerOptions
+{
+    public SKSamplingOptions SKSamplingOptions { get; set; }
+    public int Quality { get; set; }
+
+    public SkiaSharpResizerOptions()
+    {
+        SKSamplingOptions = SKSamplingOptions.Default;
+        Quality           = 75;
+    }
+}
+```
+
+| Property | Default | Notes |
+|---|---|---|
+| `SKSamplingOptions` | `SKSamplingOptions.Default` | The interpolation filter. Tighten for higher-quality downscales. |
+| `Quality` | `75` | Passed to `image.Encode(format, quality)`. JPEG and WebP honour it; PNG ignores it. |
+
+### Picking a sampling mode
+
+`SKSamplingOptions` is a small value type with two flavours of construction:
+
+```csharp
+// Built-in
+SKSamplingOptions.Default
+SKSamplingOptions.AntiAlias
+
+// Mipmap + filter
+new SKSamplingOptions(SKMipmapMode.Linear, SKFilterMode.Linear)
+
+// Cubic
+new SKSamplingOptions(new SKCubicResampler(0.0f, 0.5f))                 // Catmull–Rom-ish
+new SKSamplingOptions(SKCubicResampler.Mitchell)                        // Mitchell–Netravali
+```
+
+A practical heuristic:
+
+| Scenario | Pick |
+|---|---|
+| Avatar / thumbnail (downscale) | `SKCubicResampler.Mitchell` — sharp, low ringing. |
+| Product photo (large downscale) | `SKSamplingOptions(SKMipmapMode.Linear, SKFilterMode.Linear)` — mipmaps avoid aliasing. |
+| Upscale (rare) | `SKSamplingOptions.Default` is fine. |
+
+```csharp
+[DependsOn(typeof(AbpImagingSkiaSharpModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<SkiaSharpResizerOptions>(o =>
+        {
+            o.SKSamplingOptions = new SKSamplingOptions(SKCubicResampler.Mitchell);
+            o.Quality           = 85;
+        });
+    }
+}
+```
+
+## Picking SkiaSharp vs the alternatives
+
+| Need | Best fit |
+|---|---|
+| Pure-managed, "just works" everywhere | [ImageSharp](/misc/imaging-imagesharp) |
+| GIF compression / optimization | [Magick.NET](/misc/imaging-magick) |
+| Cubic / mipmap sampling control | **SkiaSharp** (this page) |
+| Already drawing with SkiaSharp elsewhere | **SkiaSharp** |
+| Tightest memory footprint | ImageSharp (Skia duplicates the input) |
+
+You **can** register SkiaSharp alongside ImageSharp. The contributor chain picks whichever responds with `Done`; load order decides priority (last-registered wins because `ImageResizer` reverses the contributor list before iterating). If you want SkiaSharp to take precedence over ImageSharp, list `AbpImagingSkiaSharpModule` *after* `AbpImagingImageSharpModule` in your host module's `[DependsOn]`.
+
+## Practical extensibility
+
+### Adding mode awareness
+
+The default contributor ignores `ImageResizeArgs.Mode` and always stretches. To respect "Min" / "Max" / "Crop", subclass and pre-compute:
+
+```csharp
+[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]
+[ExposeServices(typeof(IImageResizerContributor))]
+public class ModeAwareSkiaSharpResizerContributor : SkiaSharpImageResizerContributor
+{
+    public ModeAwareSkiaSharpResizerContributor(IOptions<SkiaSharpResizerOptions> options)
+        : base(options) { }
+
+    public override async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs, string? mimeType = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        // Peek dimensions to compute Min/Max targets
+        var preview = new MemoryStream();
+        await stream.CopyToAsync(preview, cancellationToken);
+        stream.Position = 0;
+        preview.Position = 0;
+
+        using var inspect = SKBitmap.Decode(preview);
+        var (targetW, targetH) = resizeArgs.Mode switch
+        {
+            ImageResizeMode.Min => ScaleMin(inspect.Width, inspect.Height, (int)resizeArgs.Width, (int)resizeArgs.Height),
+            ImageResizeMode.Max => ScaleMax(inspect.Width, inspect.Height, (int)resizeArgs.Width, (int)resizeArgs.Height),
+            _                   => ((int)resizeArgs.Width, (int)resizeArgs.Height)
+        };
+
+        var rewritten = new ImageResizeArgs((uint)targetW, (uint)targetH, ImageResizeMode.Stretch);
+        return await base.TryResizeAsync(stream, rewritten, mimeType, cancellationToken);
+    }
+
+    private static (int w, int h) ScaleMin(int sw, int sh, int tw, int th)
+    {
+        var scale = Math.Min((double)tw / sw, (double)th / sh);
+        return ((int)(sw * scale), (int)(sh * scale));
+    }
+
+    private static (int w, int h) ScaleMax(int sw, int sh, int tw, int th)
+    {
+        var scale = Math.Max((double)tw / sw, (double)th / sh);
+        return ((int)(sw * scale), (int)(sh * scale));
+    }
+}
+```
+
+Now your callers can pass `ImageResizeMode.Min` against SkiaSharp the same way they do against ImageSharp.
+
+### Quality per-mime
+
+If you want Quality 92 for JPEG and Quality 75 for WebP, that's a `protected virtual int GetQuality(SKEncodedImageFormat format)` override away:
+
+```csharp
+protected virtual int GetQuality(SKEncodedImageFormat format)
+{
+    return format switch
+    {
+        SKEncodedImageFormat.Jpeg => 92,
+        SKEncodedImageFormat.Webp => 80,
+        _                          => Options.Quality
+    };
+}
+```
+
+…and use it inside `image.Encode(codec.EncodedFormat, GetQuality(codec.EncodedFormat))`.
+
+## Deployment
+
+SkiaSharp ships per-runtime-identifier native binaries (`SkiaSharp.NativeAssets.Linux`, `SkiaSharp.NativeAssets.macOS`, etc.). For typical ASP.NET Core deployment:
+
+- **Linux x64**: install `SkiaSharp.NativeAssets.Linux` — it includes `libSkiaSharp.so` for glibc-based distros.
+- **Alpine / musl**: `SkiaSharp.NativeAssets.Linux.NoDependencies` + `libfontconfig1` in your image.
+- **Windows / macOS**: native bits ship with the main `SkiaSharp` package.
+
+The `Volo.Abp.Imaging.SkiaSharp` package pulls `SkiaSharp` transitively but does **not** pin a native-assets package — your host project needs to add the correct one for your target.
+
+## Pitfalls
+
+<Warning>**Aspect-ratio loss.** The default contributor stretches to W×H without aspect preservation. If your callers pass `ImageResizeMode.Default`, the global `ImageResizeOptions.DefaultResizeMode` decides the *intent* (Min/Max/Crop), but the SkiaSharp contributor ignores it — see the [extensibility example](#adding-mode-awareness) above.</Warning>
+
+<Warning>**Bytes are duplicated.** `CreateMemoryStream` copies the source into two memory streams. For multi-megabyte uploads this is real RAM. Prefer the byte-array overload if you already have the buffer.</Warning>
+
+<Warning>**PNG quality knob is ignored.** PNG is lossless; `image.Encode(SKEncodedImageFormat.Png, quality)` ignores the second argument. Don't tune `Options.Quality` expecting PNG savings.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Imaging abstractions" icon="image" href="/misc/imaging-abstractions">
+    The contributor pipeline that orchestrates this backend.
+  </Card>
+  <Card title="ImageSharp" icon="palette" href="/misc/imaging-imagesharp">
+    Pure-managed alternative for the same three formats.
+  </Card>
+  <Card title="Magick.NET" icon="wand-magic-sparkles" href="/misc/imaging-magick">
+    Pair with this when you also need GIF.
+  </Card>
+</CardGroup>

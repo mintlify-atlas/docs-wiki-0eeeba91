@@ -1,0 +1,379 @@
+---
+title: "Admin Application Layer"
+description: "Back-office app services for CMS Kit: BlogAdminAppService, BlogPostAdminAppService, BlogFeatureAdminAppService, PageAdminAppService, CommentAdminAppService, TagAdminAppService, EntityTagAdminAppService, MenuItemAdminAppService, MediaDescriptorAdminAppService, GlobalResourceAdminAppService. Implements every admin DTO contract and is permission-gated by CmsKitAdminPermissions.*."
+---
+
+The admin application layer is where back-office UI talks to the domain. Each capability has at least one `*AdminAppService`, decorated with `[Authorize(CmsKitAdminPermissions.X)]` and feature attributes. DTOs and interfaces live in `Volo.CmsKit.Admin.Application.Contracts`; implementations live in `Volo.CmsKit.Admin.Application`.
+
+**Source:**
+
+- Contracts: [`modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin)
+- Impl: [`modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin)
+
+## Project layout
+
+```
+Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/
+├── CmsKitAdminApplicationContractsModule.cs
+├── CmsKitAdminRemoteServiceConsts.cs          # RemoteServiceName, ModuleName
+├── Blogs/                                     # IBlogAdminAppService, BlogDto, ...
+├── Comments/
+├── Contents/                                  # ContentWidgetDto (for embed widgets)
+├── GlobalResources/
+├── MediaDescriptors/
+├── Menus/
+├── Pages/
+└── Tags/
+
+Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/
+├── CmsKitAdminApplicationModule.cs
+├── CmsKitAdminAppServiceBase.cs               # base class
+├── CmsKitAdminApplicationMappers.cs           # AutoMapper profile
+├── Blogs/                                     # BlogAdminAppService, BlogPostAdminAppService, BlogFeatureAdminAppService
+├── Comments/                                  # CommentAdminAppService
+├── GlobalResources/
+├── MediaDescriptors/
+├── Menus/
+├── Pages/
+└── Tags/
+```
+
+## Remote service identity
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/CmsKitAdminRemoteServiceConsts.cs
+public class CmsKitAdminRemoteServiceConsts
+{
+    public const string RemoteServiceName = "CmsKitAdmin";
+    public const string ModuleName = "cms-kit-admin";
+}
+```
+
+Every admin controller carries `[RemoteService(Name = "CmsKitAdmin")]` and `[Area("cms-kit-admin")]`. This is how ABP's dynamic-C#-client generates `IBlogPostAdminAppService` proxies that hit the right base address — the consuming app configures one base URL for the `CmsKitAdmin` remote service in `appsettings.json`.
+
+## App services at a glance
+
+| Service | DTO list | Base interface | Notes |
+| --- | --- | --- | --- |
+| `BlogAdminAppService` | `BlogDto`, `CreateBlogDto`, `UpdateBlogDto`, `BlogGetListInput` | `ICrudAppService<BlogDto, Guid, ...>` + `MoveAllBlogPostsAsync` | Move posts from blog A to blog B before deleting A. |
+| `BlogPostAdminAppService` | `BlogPostDto`, `BlogPostListDto`, `CreateBlogPostDto`, `UpdateBlogPostDto`, `BlogPostGetListInput` | `ICrudAppService<...>` + lifecycle methods | Status transitions: `Publish`, `Draft`, `SendToReview`. Combined `CreateAndPublish`, `CreateAndSendToReview`. |
+| `BlogFeatureAdminAppService` | `BlogFeatureDto`, `BlogFeatureInputDto` | (custom) | Per-blog feature flag table. |
+| `PageAdminAppService` | `PageDto`, `CreatePageInputDto`, `UpdatePageInputDto`, `GetPagesInputDto` | `ICrudAppService<...>` + `SetAsHomePageAsync` | Invalidates the `PageCacheItem` cache on every mutation. |
+| `CommentAdminAppService` | `CommentWithAuthorDto`, `CommentGetListInput`, `CommentApprovalDto`, `CommentSettingsDto` | (custom) | Moderation queue. `UpdateApprovalStatusAsync`, `GetWaitingCountAsync`. |
+| `TagAdminAppService` | `TagDto`, `TagCreateDto`, `TagUpdateDto`, `TagGetListInput`, `TagDefinitionDto` | `ICrudAppService<...>` + `GetTagDefinitionsAsync` | The definitions endpoint feeds the "which entity type?" dropdown in the admin tag editor. |
+| `EntityTagAdminAppService` | `EntityTagCreateDto`, `EntityTagRemoveDto`, `EntityTagSetDto` | (custom) | Attach / detach / bulk-set tags on an entity. |
+| `MenuItemAdminAppService` | `MenuItemDto`, `MenuItemWithDetailsDto`, `MenuItemCreateInput`, `MenuItemUpdateInput`, `MenuItemMoveInput`, `PageLookupDto`, `PermissionLookupDto` | (custom) | Includes lookup endpoints for the "link to page" and "requires permission" pickers. |
+| `MediaDescriptorAdminAppService` | `MediaDescriptorDto`, `CreateMediaInputWithStream` | (custom) | File upload via `IRemoteStreamContent`. |
+| `GlobalResourceAdminAppService` | `GlobalResourcesDto`, `GlobalResourcesUpdateDto` | (custom) | Get and set the site-wide CSS/JS strings. |
+
+## `IBlogPostAdminAppService`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Blogs/IBlogPostAdminAppService.cs
+public interface IBlogPostAdminAppService : ICrudAppService<
+    BlogPostDto,
+    BlogPostListDto,
+    Guid,
+    BlogPostGetListInput,
+    CreateBlogPostDto,
+    UpdateBlogPostDto>
+{
+    Task PublishAsync(Guid id);
+    Task DraftAsync(Guid id);
+    Task<BlogPostDto> CreateAndPublishAsync(CreateBlogPostDto input);
+    Task SendToReviewAsync(Guid id);
+    Task<BlogPostDto> CreateAndSendToReviewAsync(CreateBlogPostDto input);
+    Task<bool> HasBlogPostWaitingForReviewAsync();
+}
+```
+
+Two DTO types: `BlogPostDto` (full detail, returned by `GetAsync`/`CreateAsync`/`UpdateAsync`) and `BlogPostListDto` (slim, returned by `GetListAsync` — no `Content`, just metadata for the grid).
+
+Lifecycle methods correspond to the blog post status transitions described in [Blogs](/modules/cms-kit/blogs#status-lifecycle). `CreateAndPublishAsync` and `CreateAndSendToReviewAsync` are convenience methods that do create + status change in a single request.
+
+`HasBlogPostWaitingForReviewAsync()` powers the red badge in the admin nav.
+
+## `BlogPostAdminAppService` — implementation excerpt
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/Blogs/BlogPostAdminAppService.cs
+[RequiresFeature(CmsKitFeatures.BlogEnable)]
+[RequiresGlobalFeature(typeof(BlogsFeature))]
+[Authorize(CmsKitAdminPermissions.BlogPosts.Default)]
+public class BlogPostAdminAppService : CmsKitAppServiceBase, IBlogPostAdminAppService
+{
+    protected BlogPostManager BlogPostManager { get; }
+    protected IBlogPostRepository BlogPostRepository { get; }
+    protected IBlogRepository BlogRepository { get; }
+    protected ICommentRepository CommentRepository { get; }
+    protected ICmsUserLookupService UserLookupService { get; }
+    protected IMediaDescriptorAdminAppService MediaDescriptorAdminAppService { get; }
+
+    public BlogPostAdminAppService(
+        BlogPostManager blogPostManager,
+        IBlogPostRepository blogPostRepository,
+        IBlogRepository blogRepository,
+        ICmsUserLookupService userLookupService,
+        IMediaDescriptorAdminAppService mediaDescriptorAdminAppService,
+        ICommentRepository commentRepository)
+    {
+        BlogPostManager = blogPostManager;
+        BlogPostRepository = blogPostRepository;
+        BlogRepository = blogRepository;
+        UserLookupService = userLookupService;
+        MediaDescriptorAdminAppService = mediaDescriptorAdminAppService;
+        CommentRepository = commentRepository;
+    }
+
+    [Authorize(CmsKitAdminPermissions.BlogPosts.Create)]
+    public virtual async Task<BlogPostDto> CreateAsync(CreateBlogPostDto input)
+    {
+        var author = await UserLookupService.GetByIdAsync(CurrentUser.GetId());
+        var blog = await BlogRepository.GetAsync(input.BlogId);
+
+        var blogPost = await BlogPostManager.CreateAsync(
+            author, blog,
+            input.Title, input.Slug,
+            BlogPostStatus.Draft,
+            input.ShortDescription, input.Content,
+            input.CoverImageMediaId);
+
+        input.MapExtraPropertiesTo(blogPost);
+        await BlogPostRepository.InsertAsync(blogPost);
+
+        return ObjectMapper.Map<BlogPost, BlogPostDto>(blogPost);
+    }
+
+    [Authorize(CmsKitAdminPermissions.BlogPosts.Update)]
+    public virtual async Task<BlogPostDto> UpdateAsync(Guid id, UpdateBlogPostDto input)
+    {
+        var blogPost = await BlogPostRepository.GetAsync(id);
+        blogPost.SetTitle(input.Title);
+        blogPost.SetShortDescription(input.ShortDescription);
+        // ... slug change goes through BlogPostManager.SetSlugUrlAsync
+        // ... extra-property mapping
+        // ... save and map
+    }
+}
+```
+
+Three patterns to notice:
+
+**1. Layered attributes.** Every method inherits the class-level `[Authorize(CmsKitAdminPermissions.BlogPosts.Default)]` *plus* its own granular check (`Create`, `Update`, `Delete`). The class-level feature attributes mean the entire service compiles out when the global `BlogsFeature` is disabled.
+
+**2. Manager + repository split.** The manager (`BlogPostManager.CreateAsync`) returns the constructed aggregate; the app service inserts it. Persistence is *not* the manager's job. This makes managers reusable in event handlers, background jobs, etc.
+
+**3. `MapExtraPropertiesTo`.** ABP's `IHasExtraProperties` lets DTOs carry arbitrary extension data. `input.MapExtraPropertiesTo(blogPost)` copies all extension-method-defined fields from DTO to entity, which is how host apps add custom fields to `BlogPost` without modifying CMS Kit.
+
+## `IPageAdminAppService`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Pages/IPageAdminAppService.cs
+public interface IPageAdminAppService :
+    ICrudAppService<PageDto, PageDto, Guid, GetPagesInputDto, CreatePageInputDto, UpdatePageInputDto>
+{
+    Task SetAsHomePageAsync(Guid id);
+}
+```
+
+Note that the list DTO and detail DTO are *both* `PageDto` here — pages are small enough not to need a slimmed list shape.
+
+```csharp
+// PageAdminAppService.cs (excerpt)
+[RequiresFeature(CmsKitFeatures.PageEnable)]
+[RequiresGlobalFeature(typeof(PagesFeature))]
+[Authorize(CmsKitAdminPermissions.Pages.Default)]
+public class PageAdminAppService : CmsKitAdminAppServiceBase, IPageAdminAppService
+{
+    protected IPageRepository PageRepository { get; }
+    protected ICommentRepository CommentRepository { get; }
+    protected PageManager PageManager { get; }
+    protected IDistributedCache<PageCacheItem> PageCache { get; }
+    // ...
+
+    public virtual async Task<PageDto> GetAsync(Guid id)
+    {
+        var page = await PageRepository.GetAsync(id);
+        return ObjectMapper.Map<Page, PageDto>(page);
+    }
+
+    public virtual async Task<PagedResultDto<PageDto>> GetListAsync(GetPagesInputDto input)
+    {
+        var count = await PageRepository.GetCountAsync(input.Filter);
+        var pages = await PageRepository.GetListAsync(
+            input.Filter, input.MaxResultCount, input.SkipCount, input.Sorting);
+        // ... map to PagedResultDto<PageDto>
+    }
+}
+```
+
+Page mutations also invalidate `PageCache` so the next public read hits the database — the cache is rebuilt on first miss.
+
+## `ICommentAdminAppService`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application.Contracts/Volo/CmsKit/Admin/Comments/ICommentAdminAppService.cs
+public interface ICommentAdminAppService : IApplicationService
+{
+    Task<PagedResultDto<CommentWithAuthorDto>> GetListAsync(CommentGetListInput input);
+    Task<CommentWithAuthorDto> GetAsync(Guid id);
+    Task DeleteAsync(Guid id);
+    Task UpdateApprovalStatusAsync(Guid id, CommentApprovalDto input);
+    Task UpdateSettingsAsync(CommentSettingsDto input);
+    Task<int> GetWaitingCountAsync();
+}
+```
+
+`UpdateApprovalStatusAsync` posts to `Comment.Approve()` / `Reject()` / `WaitForApproval()` — see the [comment state machine](/modules/cms-kit/comments#moderation-state-machine).
+
+`UpdateSettingsAsync(CommentSettingsDto)` lets the admin flip `CmsKitSettings.Comments.RequireApprovement` from the UI without touching the settings table directly.
+
+## `ITagAdminAppService` and `IEntityTagAdminAppService`
+
+```csharp
+public interface ITagAdminAppService :
+    ICrudAppService<TagDto, Guid, TagGetListInput, TagCreateDto, TagUpdateDto>
+{
+    Task<List<TagDefinitionDto>> GetTagDefinitionsAsync();
+}
+
+public interface IEntityTagAdminAppService : IApplicationService
+{
+    Task AddTagToEntityAsync(EntityTagCreateDto input);
+    Task RemoveTagFromEntityAsync(EntityTagRemoveDto input);
+    Task SetEntityTagsAsync(EntityTagSetDto input);
+}
+```
+
+`TagAdminAppService` manages the `Tag` aggregate itself (CRUD + the entity-type definitions dropdown). `EntityTagAdminAppService` manages the `EntityTag` join — it is what the blog-post edit screen calls when you click "save" on the tag editor.
+
+## `IMenuItemAdminAppService`
+
+```csharp
+public interface IMenuItemAdminAppService : IApplicationService
+{
+    Task<ListResultDto<MenuItemDto>> GetListAsync();
+    Task<MenuItemWithDetailsDto> GetAsync(Guid id);
+    Task<MenuItemDto> CreateAsync(MenuItemCreateInput input);
+    Task<MenuItemDto> UpdateAsync(Guid id, MenuItemUpdateInput input);
+    Task DeleteAsync(Guid id);
+    Task MoveMenuItemAsync(Guid id, MenuItemMoveInput input);
+    Task<PagedResultDto<PageLookupDto>> GetPageLookupAsync(PageLookupInputDto input);
+    Task<ListResultDto<PermissionLookupDto>> GetPermissionLookupAsync(PermissionLookupInputDto inputDto);
+    Task<int> GetAvailableMenuOrderAsync(Guid? parentId = null);
+}
+```
+
+Three things stand out:
+
+- **`MoveMenuItemAsync`** wraps `MenuItemManager.MoveAsync` — see [Menus & Media](/modules/cms-kit/menus-and-media#menuitemmanager).
+- **`GetPageLookupAsync`** powers the "link to page" combobox. It returns a paged list of `PageLookupDto` (id + title + slug) filtered by a search string.
+- **`GetPermissionLookupAsync`** returns every defined permission so the admin can pick `RequiredPermissionName` from a dropdown rather than typing it.
+
+## `IMediaDescriptorAdminAppService`
+
+```csharp
+public interface IMediaDescriptorAdminAppService : IApplicationService
+{
+    Task<MediaDescriptorDto> CreateAsync(string entityType, CreateMediaInputWithStream inputStream);
+    Task DeleteAsync(Guid id);
+}
+```
+
+`CreateMediaInputWithStream` carries an `IRemoteStreamContent` plus the original file name — this is how multipart uploads cross the ABP dynamic-proxy boundary. The implementation:
+
+1. Calls `MediaDescriptorManager.CreateAsync(entityType, fileName, mimeType, length)`.
+2. Inserts the resulting `MediaDescriptor` row.
+3. Streams the bytes into `IBlobContainer<MediaContainer>` keyed by `descriptor.Id.ToString()`.
+
+There is no `UpdateAsync` — to replace a file you create a new descriptor and delete the old one.
+
+## `IBlogAdminAppService` and `IBlogFeatureAdminAppService`
+
+```csharp
+public interface IBlogAdminAppService :
+    ICrudAppService<BlogDto, Guid, BlogGetListInput, CreateBlogDto, UpdateBlogDto>
+{
+    Task<ListResultDto<BlogDto>> GetAllListAsync();
+    Task MoveAllBlogPostsAsync(Guid blogId, Guid? assignToBlogId = null);
+}
+
+public interface IBlogFeatureAdminAppService : IApplicationService
+{
+    Task SetAsync(Guid blogId, BlogFeatureInputDto dto);
+    Task<List<BlogFeatureDto>> GetListAsync(Guid blogId);
+}
+```
+
+`MoveAllBlogPostsAsync` exists so an admin can decommission a blog without losing posts — bulk-reassign first, then delete the blog. If `assignToBlogId` is null, the posts are deleted with the blog (cascading to their comments via `BlogPostManager.DeleteAsync`).
+
+`BlogFeatureAdminAppService` is the per-blog toggle screen (Reactions, Comments, Tags, Ratings on/off per blog).
+
+## `IGlobalResourceAdminAppService`
+
+```csharp
+public interface IGlobalResourceAdminAppService : IApplicationService
+{
+    Task<GlobalResourcesDto> GetAsync();
+    Task SetGlobalResourcesAsync(GlobalResourcesUpdateDto input);
+}
+```
+
+A tiny two-method service that backs the "Site CSS / Site JS" admin form. The single row it owns is read by the public `GlobalResources/Script` and `GlobalResources/Style` view components — see [Web UI](/modules/cms-kit/web-ui).
+
+## Base class and module wire-up
+
+```csharp
+public abstract class CmsKitAdminAppServiceBase : ApplicationService
+{
+    protected CmsKitAdminAppServiceBase()
+    {
+        LocalizationResource = typeof(CmsKitResource);
+        ObjectMapperContext  = typeof(CmsKitAdminApplicationModule);
+    }
+}
+```
+
+`CmsKitAdminApplicationModule` depends on:
+
+- `CmsKitDomainModule` — managers and repositories.
+- `CmsKitAdminApplicationContractsModule` — interfaces and DTOs.
+- `AbpDddApplicationModule` — `ApplicationService` base, `ObjectMapper`.
+- `AbpAutoMapperModule` — DTO ↔ entity mapping in `CmsKitAdminApplicationMappers`.
+- `AbpFeatureManagementModule` — for `[RequiresFeature]`.
+
+## Permissions
+
+`CmsKitAdminPermissions` (in `Volo.CmsKit.Domain.Shared`) defines the names used in `[Authorize(...)]` and surfaces them in `CmsKitAdminPermissionDefinitionProvider`:
+
+```csharp
+public static class CmsKitAdminPermissions
+{
+    public const string GroupName = "CmsKit";
+
+    public static class Pages
+    {
+        public const string Default = GroupName + ".Pages";
+        public const string Create  = Default + ".Create";
+        public const string Update  = Default + ".Update";
+        public const string Delete  = Default + ".Delete";
+    }
+
+    public static class BlogPosts { /* same pattern */ }
+    public static class Blogs     { /* same pattern */ }
+    public static class Comments  { /* same pattern */ }
+    public static class Tags      { /* same pattern */ }
+    // ...
+}
+```
+
+Hosts grant these to roles via the standard permission-management UI.
+
+## Cross-references
+
+- Routes that expose these services: [HTTP API](/modules/cms-kit/http-api).
+- The Razor Pages that consume them: [Web UI](/modules/cms-kit/web-ui).
+- Underlying domain: [Domain layer](/modules/cms-kit/domain), [Blogs](/modules/cms-kit/blogs), [Pages](/modules/cms-kit/pages), [Comments](/modules/cms-kit/comments), [Tags & Ratings](/modules/cms-kit/tags-and-ratings), [Menus & Media](/modules/cms-kit/menus-and-media).
+- Public-side counterparts: [Public Application](/modules/cms-kit/public-application).
+- Media storage: [Blob Storing Database](/modules/blob-storing-database/overview).
+- Translating DTOs back into multiple languages: [Multi-lingual objects](/localization/multi-lingual-objects).

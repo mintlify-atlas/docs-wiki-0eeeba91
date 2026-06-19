@@ -1,0 +1,163 @@
+---
+title: "ASP.NET Core Integration — Modules, Pipeline And Hosting"
+sidebarTitle: "Overview"
+description: "Landing page for the Volo.Abp.AspNetCore.* module family — host module, MVC, multi-tenancy middleware, SignalR, Serilog, auth handlers and test base."
+---
+
+This group documents every package under `framework/src/Volo.Abp.AspNetCore.*` plus the closely related `Volo.Abp.Swashbuckle` package. These modules glue the framework's cross‑cutting concerns — unit of work, multi‑tenancy, auditing, exception handling, authorization, dynamic claims — into the ASP.NET Core request pipeline. They are the layer where `AbpModule.OnApplicationInitialization(...)` calls `app.UseConfiguredEndpoints()`, `app.UseAbpExceptionHandling()`, `app.UseMultiTenancy()`, `app.UseUnitOfWork()` and `app.UseAuthorization()` from a Web host's startup module.
+
+<Note>
+  All file paths cited in this group are relative to `/home/daytona/repos/abpframework/abp/`. The host module is `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/AbpAspNetCoreModule.cs`; the MVC module is `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcModule.cs`. See [/core/modularity](/core/modularity) for how `[DependsOn]` chains these together and [/flows/http-request-pipeline](/flows/http-request-pipeline) for an end‑to‑end request walkthrough.
+</Note>
+
+## What's in this group
+
+<CardGroup cols={2}>
+  <Card title="Host Module" icon="server" href="/aspnetcore/host-module">
+    `Volo.Abp.AspNetCore` and `Volo.Abp.AspNetCore.Abstractions` — the base host module that wires `AbpAuditingModule`, `AbpAuthorizationModule`, `AbpUnitOfWorkModule`, `AbpExceptionHandlingModule` and `AbpSecurityModule` into ASP.NET Core.
+  </Card>
+  <Card title="MVC Module" icon="cube" href="/aspnetcore/mvc-module">
+    `AbpAspNetCoreMvcModule`, `AbpAspNetCoreMvcOptions`, `AbpMvcOptionsExtensions.AddAbp(...)` and the dozens of subfolders that ship action/page filters, formatters, conventions, anti‑forgery, validation, response wrapping and proxy scripting.
+  </Card>
+  <Card title="Controllers & Conventions" icon="route" href="/aspnetcore/mvc-controllers-and-conventions">
+    `AbpController`, `AbpControllerBase`, the `AbpServiceConvention` that turns application services into REST endpoints, and the `[RemoteService]` attribute that opts a service in.
+  </Card>
+  <Card title="UI Bundling" icon="boxes-stacked" href="/aspnetcore/mvc-ui-bundling">
+    `Volo.Abp.AspNetCore.Bundling` abstractions plus `Volo.Abp.AspNetCore.Mvc.UI.Bundling` MVC implementation — `IBundleManager`, `BundlerContext`, the `<abp-script-bundle>` / `<abp-style-bundle>` tag helpers.
+  </Card>
+  <Card title="UI Widgets" icon="grip" href="/aspnetcore/mvc-ui-widgets">
+    `WidgetDefinition`, `[Widget]` attribute, `IWidgetManager` and `AbpWidgetOptions` — discoverable, authorizable view components with their own scripts and styles.
+  </Card>
+  <Card title="UI Packages" icon="box-archive" href="/aspnetcore/mvc-ui-packages">
+    `Volo.Abp.AspNetCore.Mvc.UI.Packages` — embedded bundle contributors for Bootstrap, jQuery, DataTables, Lodash, Moment, SignalR JS client, and the `install-libs` CLI command.
+  </Card>
+  <Card title="Multi-Tenancy Middleware" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    `Volo.Abp.AspNetCore.MultiTenancy` — `MultiTenancyMiddleware`, `AbpAspNetCoreMultiTenancyOptions`, the six HTTP tenant resolvers (query, route, header, cookie, domain, form).
+  </Card>
+  <Card title="Serilog" icon="scroll" href="/aspnetcore/serilog">
+    `AbpAspNetCoreSerilogModule` and `AbpSerilogMiddleware` — adds `TenantId`, `UserId`, `ClientId` and `CorrelationId` to the Serilog `LogContext` for every request.
+  </Card>
+  <Card title="SignalR" icon="tower-broadcast" href="/aspnetcore/signalr">
+    `AbpHub`, `AbpHubBase`, `AbpSignalROptions`, hub auto‑mapping via `HubRouteAttribute`, hub filters for auth / audit / hub‑context‑accessor.
+  </Card>
+  <Card title="JWT Bearer" icon="key" href="/aspnetcore/auth-jwt-bearer">
+    `Volo.Abp.AspNetCore.Authentication.JwtBearer` — wires `WebRemoteDynamicClaimsPrincipalContributor` so resource APIs can refresh dynamic claims out‑of‑band.
+  </Card>
+  <Card title="OAuth Claims" icon="id-badge" href="/aspnetcore/auth-oauth">
+    `Volo.Abp.AspNetCore.Authentication.OAuth` — `MultipleClaimAction` and `RemoveDuplicateClaimAction` helpers used by OIDC/Google/Microsoft handlers.
+  </Card>
+  <Card title="OpenID Connect" icon="lock" href="/aspnetcore/auth-openidconnect">
+    `Volo.Abp.AspNetCore.Authentication.OpenIdConnect` — cookie + OIDC flow with `OpenIdLocalUserCreationClient` and dynamic‑claims integration.
+  </Card>
+  <Card title="Swashbuckle" icon="book" href="/aspnetcore/swashbuckle">
+    `Volo.Abp.Swashbuckle` — ABP‑aware Swagger UI HTML, OIDC flows model, enum schema and document filters.
+  </Card>
+  <Card title="Test Base" icon="flask" href="/aspnetcore/test-base">
+    `Volo.Abp.AspNetCore.TestBase` — `AbpWebApplicationFactoryIntegratedTest<TProgram>` and the legacy `AbpAspNetCoreIntegratedTestBase<TStartupModule>`.
+  </Card>
+</CardGroup>
+
+## The ABP request pipeline at a glance
+
+Every Web host built on `Volo.Abp.AspNetCore` calls `OnApplicationInitialization(...)` in some `*HttpApiHostModule`. The standard ordering — established by the application templates and reproduced by the modules in this group — is shown below.
+
+```mermaid
+flowchart LR
+    Req([HTTP request]) --> Forwarded[UseForwardedHeaders]
+    Forwarded --> Static[UseStaticFiles]
+    Static --> Cors[UseAbpRequestLocalization]
+    Cors --> Excpt[UseAbpExceptionHandling]
+    Excpt --> Route[UseRouting]
+    Route --> Auth[UseAuthentication]
+    Auth --> Tenant[UseMultiTenancy]
+    Tenant --> Authz[UseAbpClaimsMap / UseAuthorization]
+    Authz --> Serilog[UseAbpSerilogEnrichers]
+    Serilog --> Uow[UseUnitOfWork]
+    Uow --> Endpoints[UseConfiguredEndpoints]
+    Endpoints --> Controller[[MVC controller / Razor page]]
+    Controller --> Filters[Action filters: GlobalFeature, Validation, Audit, ExceptionFilter, Uow]
+    Filters --> Service[[Application service]]
+    Service --> Resp([HTTP response])
+```
+
+The middleware names map directly to source files:
+
+| Middleware | Type | Path |
+| --- | --- | --- |
+| `UseAbpExceptionHandling` | `AbpExceptionHandlingMiddleware` | `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/ExceptionHandling/` |
+| `UseMultiTenancy` | `MultiTenancyMiddleware` | `framework/src/Volo.Abp.AspNetCore.MultiTenancy/.../MultiTenancyMiddleware.cs` |
+| `UseUnitOfWork` | `AbpUnitOfWorkMiddleware` | `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/` |
+| `UseAbpSerilogEnrichers` | `AbpSerilogMiddleware` | `framework/src/Volo.Abp.AspNetCore.Serilog/.../AbpSerilogMiddleware.cs` |
+
+Inside MVC, `AbpMvcOptionsExtensions.AddAbp(MvcOptions, IServiceCollection)` registers the action filters (`GlobalFeatureActionFilter`, `AbpValidationActionFilter`, `AbpAuditActionFilter`, `AbpExceptionFilter`, `AbpUowActionFilter`) via `options.Filters.AddService(typeof(...))` — see `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpMvcOptionsExtensions.cs`.
+
+## How to read this group
+
+<Steps>
+  <Step title="Start with the host module">
+    Read [/aspnetcore/host-module](/aspnetcore/host-module) to understand which framework modules `AbpAspNetCoreModule` pulls in (`AbpAuditingModule`, `AbpSecurityModule`, `AbpUnitOfWorkModule`, `AbpHttpModule`, `AbpAuthorizationModule`, `AbpValidationModule`, `AbpExceptionHandlingModule`, `AbpVirtualFileSystemModule`). Everything else in this group depends on it.
+  </Step>
+  <Step title="Then read the MVC module">
+    [/aspnetcore/mvc-module](/aspnetcore/mvc-module) catalogs the subfolders under `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/`. Each subfolder is a sub‑system (`AntiForgery`, `Validation`, `Uow`, `Response`, `ApiExploring`, `ProxyScripting`, `ApplicationConfigurations`, `Conventions`, `Features`, `GlobalFeatures`, `ModelBinding`, `ViewFeatures`, `Versioning`).
+  </Step>
+  <Step title="Pick the topic-specific page you need">
+    Tenant resolution? See [/aspnetcore/multi-tenancy-middleware](/aspnetcore/multi-tenancy-middleware) and cross‑link to [/tenancy/data-filtering](/tenancy/data-filtering). Authentication? See [/aspnetcore/auth-jwt-bearer](/aspnetcore/auth-jwt-bearer), [/aspnetcore/auth-oauth](/aspnetcore/auth-oauth), [/aspnetcore/auth-openidconnect](/aspnetcore/auth-openidconnect) and cross‑link to [/security/overview](/security/overview). SignalR? See [/aspnetcore/signalr](/aspnetcore/signalr).
+  </Step>
+</Steps>
+
+## What sits where in the source tree
+
+The packages in this group all live under `framework/src/`. The naming follows a strict convention:
+
+| Folder | Module type |
+| --- | --- |
+| `Volo.Abp.AspNetCore/` | The host module. Every other Web module depends on it. |
+| `Volo.Abp.AspNetCore.Abstractions/` | Public contracts. Used by packages that mustn't take the full Web host dependency. |
+| `Volo.Abp.AspNetCore.Mvc/` | The MVC integration — easily the largest package in the group, ~150 source files. |
+| `Volo.Abp.AspNetCore.Mvc.Contracts/` | DTOs and interfaces shared between the MVC module and its HTTP API clients (`ApplicationConfigurationDto` lives here). |
+| `Volo.Abp.AspNetCore.MultiTenancy/` | `MultiTenancyMiddleware` plus the six HTTP tenant resolvers. |
+| `Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy/` | The tenant switcher UI dropdown for MVC themes. |
+| `Volo.Abp.AspNetCore.Serilog/` | One middleware that pushes ABP identity onto `LogContext`. |
+| `Volo.Abp.AspNetCore.SignalR/` | `AbpHub` base, `AbpSignalROptions`, auto‑hub‑mapping. |
+| `Volo.Abp.AspNetCore.Authentication.JwtBearer/` | Dynamic claims for stateless JWT‑secured APIs. |
+| `Volo.Abp.AspNetCore.Authentication.OAuth/` | `MultipleClaimAction` / `RemoveDuplicateClaimAction` helpers. |
+| `Volo.Abp.AspNetCore.Authentication.OpenIdConnect/` | Cookie + OIDC flow with local user creation. |
+| `Volo.Abp.AspNetCore.Bundling/` and `.Mvc.UI.Bundling*` | Bundle abstractions and MVC implementation. |
+| `Volo.Abp.AspNetCore.Mvc.UI.Widgets/` | View‑components‑as‑widgets. |
+| `Volo.Abp.AspNetCore.Mvc.UI.Packages/` | Standard bundle contributors for jQuery, Bootstrap, DataTables, etc. |
+| `Volo.Abp.AspNetCore.TestBase/` | `WebApplicationFactory`‑based integration test base. |
+| `Volo.Abp.Swashbuckle/` | ABP‑aware Swagger UI and OpenAPI document filters. |
+
+## Conventions every package in this group follows
+
+<Steps>
+  <Step title="One AbpModule per assembly">
+    Each `csproj` ships exactly one class named `Abp{Suffix}Module : AbpModule`. It declares `[DependsOn(...)]` against the modules it logically depends on — `AbpAspNetCoreSignalRModule` depends only on `AbpAspNetCoreModule`, for example.
+  </Step>
+  <Step title="ConfigureServices / OnApplicationInitialization">
+    Modules register options and DI services in `ConfigureServices`, and wire up middleware via `AbpEndpointRouterOptions` or the `app.UseXxx()` extension method exposed under the `Microsoft.AspNetCore.Builder` namespace.
+  </Step>
+  <Step title="Middlewares extend AbpMiddlewareBase">
+    `AbpMiddlewareBase` declares `Task InvokeAsync(HttpContext, RequestDelegate)`. The DI conventional registrar registers every derived class as `ITransientDependency`, so `app.UseMiddleware<TMiddleware>()` resolves it from the request scope.
+  </Step>
+  <Step title="Options classes are plain POCOs">
+    Every `Abp*Options` class is a POCO with init‑only collections and public setters for primitives. They are configured via `Configure<TOptions>(action)` from inside `ConfigureServices`, with `PreConfigure<TOptions>(...)` used when the module itself reads them in `PreConfigureServices`.
+  </Step>
+</Steps>
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Modularity" icon="diagram-project" href="/core/modularity">
+    The `[DependsOn]` graph that makes `AbpAspNetCoreModule` a transitive dependency of every Web host module in the framework.
+  </Card>
+  <Card title="HTTP request pipeline flow" icon="route" href="/flows/http-request-pipeline">
+    End‑to‑end trace of a request through the middlewares listed above into an MVC controller and an application service.
+  </Card>
+  <Card title="Multi‑tenancy" icon="building-user" href="/tenancy/multi-tenancy-core">
+    `ICurrentTenant`, `ITenantResolveResultAccessor` and the contributor chain that `MultiTenancyMiddleware` activates per request.
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/security/overview">
+    `ICurrentUser`, dynamic claims and the authorization filters wired by `AbpMvcOptionsExtensions.AddAbp(...)`.
+  </Card>
+</CardGroup>

@@ -1,0 +1,546 @@
+---
+title: "AI: IChatClient, IKernelAccessor, WorkspaceConfiguration"
+sidebarTitle: "AI"
+description: "ABP's AI integration. Wires Microsoft.Extensions.AI (IChatClient) and Microsoft.SemanticKernel into the ABP module system with named 'workspaces', per-workspace ChatClientBuilder/KernelBuilder, and DI-friendly typed accessors."
+---
+
+`Volo.Abp.AI` and `Volo.Abp.AI.Abstractions` are ABP's bindings to **Microsoft.Extensions.AI** (`IChatClient`) and **Microsoft.SemanticKernel** (`Kernel`). The package introduces a small but important concept: **AI workspaces** — named, independently-configured AI back-ends so the same app can talk to, say, an OpenAI endpoint for "Default" and a local Ollama endpoint for "Internal" without re-registering the SDK plumbing.
+
+Source:
+- `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/`
+- `framework/src/Volo.Abp.AI/Volo/Abp/AI/`
+
+<Info>This module is intentionally a thin layer on top of `Microsoft.Extensions.AI` and `Microsoft.SemanticKernel`. The interesting work (prompts, function-calling, RAG) lives in your application code or in higher-level ABP packages that build on this one.</Info>
+
+## The contracts
+
+### `IChatClient<TWorkspace>`
+
+```csharp
+// framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IChatClient.cs
+using Microsoft.Extensions.AI;
+
+namespace Volo.Abp.AI;
+
+public interface IChatClient<TWorkSpace> : IChatClient
+    where TWorkSpace : class
+{
+}
+```
+
+A marker interface that *is* `Microsoft.Extensions.AI.IChatClient` but tied to a workspace type. The type parameter is how DI knows which underlying chat client to resolve when you inject `IChatClient<MarketingWorkspace>` vs `IChatClient<SupportWorkspace>`.
+
+### `IChatClientAccessor` / `IKernelAccessor`
+
+```csharp
+// IChatClientAccessor.cs
+using Microsoft.Extensions.AI;
+using Volo.Abp.DependencyInjection;
+
+namespace Volo.Abp.AI;
+
+public interface IChatClientAccessor
+{
+    IChatClient? ChatClient { get; }
+}
+
+public interface IChatClientAccessor<TWorkSpace> : IChatClientAccessor
+    where TWorkSpace : class
+{
+}
+
+// IKernelAccessor.cs
+using Microsoft.SemanticKernel;
+
+public interface IKernelAccessor
+{
+    Kernel? Kernel { get; }
+}
+
+public interface IKernelAccessor<TWorkSpace> : IKernelAccessor
+    where TWorkSpace : class
+{
+}
+```
+
+The "accessor" pattern is how you ask "is there an AI workspace configured?" without blowing up at injection time when there isn't:
+
+- `IChatClient` itself **always** resolves — to a real chat client if the Default workspace is configured, or to `null`-returning accessor otherwise.
+- `IChatClientAccessor` exposes the same chat client (or `null`) as a property, so callers can check before using.
+
+### `NullChatClientAccessor` / `NullKernelAccessor`
+
+```csharp
+// NullChatClientAccessor.cs
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IChatClientAccessor))]
+public class NullChatClientAccessor : IChatClientAccessor
+{
+    public IChatClient? ChatClient => null;
+}
+
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IChatClientAccessor<>))]
+public class NullChatClientAccessor<TWorkSpace> : IChatClientAccessor<TWorkSpace>
+    where TWorkSpace : class
+{
+    public IChatClient? ChatClient => null;
+}
+```
+
+`TryRegister` so the real accessors (`ChatClientAccessor`, `KernelAccessor<T>`) override these when the AI module is loaded. The non-generic null `[ExposeServices(typeof(IChatClientAccessor))]` and the generic open-type registration are deliberate — you can inject either form and never hit a missing-service exception.
+
+```csharp
+public class GenerateSummaryService : ApplicationService
+{
+    private readonly IChatClientAccessor _chat;
+    public GenerateSummaryService(IChatClientAccessor chat) => _chat = chat;
+
+    public async Task<string?> SummariseAsync(string text)
+    {
+        if (_chat.ChatClient is null) return null; // gracefully degrades
+        var response = await _chat.ChatClient.GetResponseAsync(text);
+        return response.Text;
+    }
+}
+```
+
+## The abstractions module
+
+```csharp
+// AbpAIAbstractionsModule.cs
+public class AbpAIAbstractionsModule : AbpModule
+{
+}
+```
+
+Empty — registration happens via `[Dependency(TryRegister = true)]` and `[ExposeServices]` on the null accessors.
+
+## `AbpAIOptions`
+
+```csharp
+// framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/AbpAIOptions.cs
+public class AbpAIOptions
+{
+    public HashSet<string> ConfiguredWorkspaceNames { get; } = new();
+}
+```
+
+A diagnostic surface: at runtime you can inject `IOptions<AbpAIOptions>` and learn which workspace names were registered. The set is populated by `AbpAIModule.ConfigureServices` from the workspace configuration dictionary.
+
+## Workspaces
+
+A **workspace** is a named bundle of "how to build the `Kernel`" and "how to build the `IChatClient`". The configurations live on a dictionary:
+
+```csharp
+// framework/src/Volo.Abp.AI/Volo/Abp/AI/WorkspaceConfiguration.cs
+public class WorkspaceConfiguration
+{
+    public string Name { get; }
+    public ChatClientConfiguration ChatClient { get; } = new();
+    public KernelConfiguration Kernel { get; } = new();
+
+    public WorkspaceConfiguration(string name)
+    {
+        Name = name;
+    }
+
+    public WorkspaceConfiguration ConfigureChatClient(Action<ChatClientConfiguration> configureAction)
+    {
+        configureAction(ChatClient);
+        return this;
+    }
+
+    public WorkspaceConfiguration ConfigureKernel(Action<KernelConfiguration> configureAction)
+    {
+        configureAction(Kernel);
+        return this;
+    }
+}
+```
+
+…with `ChatClientConfiguration` and `KernelConfiguration` exposing a `Builder` slot plus a list of `Action<>` configurers run *against* that builder:
+
+```csharp
+// ChatClientConfiguration.cs
+public class ChatClientConfiguration
+{
+    public ChatClientBuilder? Builder { get; set; }
+    public BuilderConfigurerList BuilderConfigurers { get; } = new();
+
+    public void ConfigureBuilder(Action<ChatClientBuilder> configureAction)
+        => BuilderConfigurers.Add(configureAction);
+
+    public void ConfigureBuilder(string name, Action<ChatClientBuilder> configureAction)
+        => BuilderConfigurers.Add(name, configureAction);
+}
+
+// KernelConfiguration.cs
+public class KernelConfiguration
+{
+    public IKernelBuilder? Builder { get; set; }
+    public KernelBuilderConfigurerList BuilderConfigurers { get; } = new();
+
+    public void ConfigureBuilder(Action<IKernelBuilder> configureAction)
+        => BuilderConfigurers.Add(configureAction);
+
+    public void ConfigureBuilder(string name, Action<IKernelBuilder> configureAction)
+        => BuilderConfigurers.Add(name, configureAction);
+}
+```
+
+Two pieces of design encode the entire shape:
+
+1. **`Builder` is `set;`** — the consumer picks which builder type and instantiates it. ABP doesn't know which `ChatClientBuilder` or `IKernelBuilder` you want.
+2. **`BuilderConfigurers` is a list** — multiple modules can each add configuration without overwriting each other. The configurers run during module init against the chosen builder.
+
+## `AbpAIWorkspaceOptions`
+
+```csharp
+// AbpAIWorkspaceOptions.cs
+public class AbpAIWorkspaceOptions
+{
+    public const string ChatClientServiceKeyNamePrefix = "Abp.AI.ChatClient_";
+    public const string KernelServiceKeyNamePrefix     = "Abp.AI.Kernel_";
+
+    public WorkspaceConfigurationDictionary Workspaces { get; } = new();
+
+    public static string GetChatClientServiceKeyName(string name) => $"{ChatClientServiceKeyNamePrefix}{name}";
+    public static string GetKernelServiceKeyName(string name)     => $"{KernelServiceKeyNamePrefix}{name}";
+}
+```
+
+The comment in the source says it all:
+
+> Pre-configured options for the AI workspaces. Not used via Options pattern. Use it with 'PreConfigure' method in a Module class.
+>
+> ```csharp
+> PreConfigure<AbpAIWorkspaceOptions>(options => { });
+> ```
+
+This is the **`PreConfigure`** path. Reading the [Options & Configuration](/core/options-and-configuration) page is helpful here — `PreConfigure` runs *before* any other module's `Configure` and is used when one module needs to *publish data to* another module's `ConfigureServices`. That's exactly what's happening: your host module's `PreConfigure<AbpAIWorkspaceOptions>` defines workspaces, and `AbpAIModule.ConfigureServices` consumes them.
+
+The service-key constants are how named workspaces are stored in DI:
+
+| Workspace | DI service key for `IChatClient` | DI service key for `Kernel` |
+|---|---|---|
+| `"Default"` | `Abp.AI.ChatClient_Default` | `Abp.AI.Kernel_Default` |
+| `"Marketing"` | `Abp.AI.ChatClient_Marketing` | `Abp.AI.Kernel_Marketing` |
+
+You almost never touch these strings yourself — the accessors look them up for you.
+
+## `WorkspaceNameAttribute`
+
+```csharp
+// framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/WorkspaceNameAttribute.cs
+[AttributeUsage(AttributeTargets.Class)]
+public class WorkspaceNameAttribute : Attribute
+{
+    public string Name { get; }
+
+    public WorkspaceNameAttribute(string name)
+    {
+        Check.NotNull(name, nameof(name));
+        Name = name;
+    }
+
+    private static readonly ConcurrentDictionary<Type, string> _nameCache = new();
+
+    public static string GetWorkspaceName<TWorkspace>() => GetWorkspaceName(typeof(TWorkspace));
+
+    public static string GetWorkspaceName(Type workspaceType)
+    {
+        return _nameCache.GetOrAdd(workspaceType, type =>
+        {
+            var workspaceNameAttribute = type
+                .GetCustomAttributes(true)
+                .OfType<WorkspaceNameAttribute>()
+                .FirstOrDefault();
+
+            return workspaceNameAttribute?.Name ?? type.FullName!;
+        });
+    }
+}
+```
+
+The attribute lets you give a workspace marker type a different *registered* name than its CLR type name:
+
+```csharp
+[WorkspaceName("Marketing")]
+public class MarketingWorkspace { }
+
+[WorkspaceName("Support")]
+public class SupportWorkspace { }
+```
+
+The `_nameCache` makes the lookup O(1) after the first call. The fallback to `type.FullName` means you can skip the attribute and DI will still work — the workspace is registered under the CLR name.
+
+## The AI module: putting it together
+
+```csharp
+// framework/src/Volo.Abp.AI/Volo/Abp/AI/AbpAIModule.cs
+[DependsOn(typeof(AbpAIAbstractionsModule))]
+public class AbpAIModule : AbpModule
+{
+    public const string DefaultWorkspaceName = "Default";
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var options = context.Services.ExecutePreConfiguredActions<AbpAIWorkspaceOptions>();
+
+        context.Services.Configure<AbpAIOptions>(workspaceOptions =>
+        {
+            workspaceOptions.ConfiguredWorkspaceNames.AddIfNotContains(
+                options.Workspaces.Select(x => x.Key)
+            );
+        });
+
+        foreach (var workspaceConfig in options.Workspaces.Values)
+        {
+            ConfigureChatClient(context, workspaceConfig);
+            ConfigureKernel(context, workspaceConfig);
+        }
+
+        context.Services.TryAddTransient(typeof(IChatClient<>),         typeof(TypedChatClient<>));
+        context.Services.TryAddTransient(typeof(IChatClientAccessor<>), typeof(ChatClientAccessor<>));
+        context.Services.TryAddTransient(typeof(IKernelAccessor<>),     typeof(KernelAccessor<>));
+    }
+```
+
+Walk through it:
+
+1. **`ExecutePreConfiguredActions<AbpAIWorkspaceOptions>()`** — runs every `PreConfigure<AbpAIWorkspaceOptions>` callback from upstream modules and returns the resulting `AbpAIWorkspaceOptions` instance. By design this is the **only** way to populate the workspace dictionary.
+2. **Diagnostic copy** — pushes the workspace names into `AbpAIOptions.ConfiguredWorkspaceNames`.
+3. **Per-workspace registration** — `ConfigureChatClient` and `ConfigureKernel` register keyed `IChatClient` and `Kernel` instances per workspace name.
+4. **Open-generic accessors** — registered last with `TryAddTransient` so they pick up the per-`T` resolution. `TypedChatClient<T>` is the typed `IChatClient<T>` that delegates to the keyed underlying client.
+
+### `ConfigureChatClient`
+
+```csharp
+private static void ConfigureChatClient(ServiceConfigurationContext context, WorkspaceConfiguration workspaceConfig)
+{
+    if (workspaceConfig.ChatClient.Builder is null) return;
+
+    foreach (var builderConfigurer in workspaceConfig.ChatClient.BuilderConfigurers)
+    {
+        builderConfigurer.Action(workspaceConfig.ChatClient.Builder);
+    }
+
+    var serviceName = AbpAIWorkspaceOptions.GetChatClientServiceKeyName(workspaceConfig.Name);
+
+    context.Services.AddKeyedChatClient(
+        serviceName,
+        provider => workspaceConfig.ChatClient.Builder.Build(provider),
+        ServiceLifetime.Transient
+    );
+
+    if (workspaceConfig.Name == DefaultWorkspaceName)
+    {
+        context.Services.AddTransient<IChatClient>(
+            sp => sp.GetRequiredKeyedService<IChatClient>(serviceName)
+        );
+    }
+
+    if (workspaceConfig.Kernel.Builder is null)
+    {
+        context.Services.AddKeyedTransient<Kernel>(
+            AbpAIWorkspaceOptions.GetKernelServiceKeyName(workspaceConfig.Name),
+            (sp, _) =>
+            {
+                var chatClient = sp.GetRequiredKeyedService<IChatClient>(serviceName);
+                var builder = Kernel.CreateBuilder();
+                builder.Services.AddSingleton<IChatClient>(chatClient);
+                return builder.Build();
+            }
+        );
+    }
+}
+```
+
+Three rules:
+
+1. **No builder = nothing to do** — opt out of `ChatClient` configuration per workspace.
+2. **The "Default" workspace also registers as plain `IChatClient`** — so existing `Microsoft.Extensions.AI` code that injects `IChatClient` without a workspace marker still works.
+3. **If you configured a chat client but no kernel, ABP still builds a kernel** that wraps your chat client. Convenient when you want to use Semantic Kernel's planner/function-calling on top of a vanilla `IChatClient`.
+
+### `ConfigureKernel`
+
+```csharp
+private static void ConfigureKernel(ServiceConfigurationContext context, WorkspaceConfiguration workspaceConfig)
+{
+    if (workspaceConfig.Kernel.Builder is null) return;
+
+    foreach (var builderConfigurer in workspaceConfig.Kernel.BuilderConfigurers)
+    {
+        builderConfigurer.Action(workspaceConfig.Kernel.Builder!);
+    }
+
+    context.Services.AddKeyedTransient<Kernel>(
+        AbpAIWorkspaceOptions.GetKernelServiceKeyName(workspaceConfig.Name),
+        (provider, _) => workspaceConfig.Kernel.Builder!.Build());
+
+    if (workspaceConfig.Name == DefaultWorkspaceName)
+    {
+        context.Services.AddTransient<Kernel>(sp =>
+            sp.GetRequiredKeyedService<Kernel>(
+                AbpAIWorkspaceOptions.GetKernelServiceKeyName(workspaceConfig.Name)));
+    }
+
+    if (workspaceConfig.ChatClient?.Builder is null)
+    {
+        context.Services.AddKeyedTransient<IChatClient>(
+            AbpAIWorkspaceOptions.GetChatClientServiceKeyName(workspaceConfig.Name),
+            (sp, _) => sp.GetKeyedService<Kernel>(AbpAIWorkspaceOptions.GetKernelServiceKeyName(workspaceConfig.Name))?
+                .GetRequiredService<IChatClient>()
+                ?? throw new InvalidOperationException(
+                    "Kernel or IChatClient not found with workspace name: " + workspaceConfig.Name)
+        );
+    }
+}
+```
+
+Mirror image of the chat-client setup. The "no chat client builder → derive one from the kernel" branch lets you wire only a kernel (typical with the Semantic Kernel sample apps) and still get `IChatClient` injection working.
+
+## The accessors
+
+```csharp
+// ChatClientAccessor.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IChatClientAccessor))]
+public class ChatClientAccessor : IChatClientAccessor, ITransientDependency
+{
+    public IChatClient? ChatClient { get; }
+
+    public ChatClientAccessor(IServiceProvider serviceProvider)
+    {
+        ChatClient = serviceProvider.GetKeyedService<IChatClient>(
+            AbpAIWorkspaceOptions.GetChatClientServiceKeyName(
+                AbpAIModule.DefaultWorkspaceName));
+    }
+}
+
+public class ChatClientAccessor<TWorkSpace> : IChatClientAccessor<TWorkSpace>
+    where TWorkSpace : class
+{
+    public IChatClient? ChatClient { get; }
+
+    public ChatClientAccessor(IServiceProvider serviceProvider)
+    {
+        ChatClient = serviceProvider.GetKeyedService<IChatClient>(
+            AbpAIWorkspaceOptions.GetChatClientServiceKeyName(
+                WorkspaceNameAttribute.GetWorkspaceName<TWorkSpace>()));
+    }
+}
+```
+
+Two flavours:
+
+- **Non-generic** — resolves the **Default** workspace's chat client.
+- **Generic `<TWorkSpace>`** — uses `WorkspaceNameAttribute.GetWorkspaceName<TWorkSpace>()` to pick the keyed service.
+
+The `KernelAccessor<TWorkSpace>` and `DefaultKernelAccessor` mirror the same shape for `Kernel`. `DefaultKernelAccessor` is registered with `[ExposeServices(typeof(IKernelAccessor))]` and **without** `ReplaceServices`, so a `NullKernelAccessor` wired up before the AI module's services load gets replaced by this one at construction time via standard DI ordering.
+
+## A complete wiring example
+
+```csharp
+[DependsOn(typeof(AbpAIModule))]
+public class MyHostModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<AbpAIWorkspaceOptions>(options =>
+        {
+            // Default workspace — OpenAI through Microsoft.Extensions.AI
+            options.Workspaces.Add(new WorkspaceConfiguration(AbpAIModule.DefaultWorkspaceName)
+                .ConfigureChatClient(c =>
+                {
+                    c.Builder = new ChatClientBuilder(sp => new OpenAIClient(
+                        Environment.GetEnvironmentVariable("OPENAI_API_KEY")!).GetChatClient("gpt-4o-mini").AsIChatClient());
+                    c.ConfigureBuilder(b => b.UseFunctionInvocation());
+                }));
+
+            // Internal workspace — local Ollama, no auth, function calling
+            options.Workspaces.Add(new WorkspaceConfiguration("Internal")
+                .ConfigureKernel(k =>
+                {
+                    k.Builder = Kernel.CreateBuilder();
+                    k.ConfigureBuilder(b => b.AddOpenAIChatCompletion(
+                        modelId: "llama3.1",
+                        endpoint: new Uri("http://ollama:11434/v1"),
+                        apiKey: "ignored"));
+                }));
+        });
+    }
+}
+```
+
+The application code then:
+
+```csharp
+[WorkspaceName("Internal")]
+public class InternalWorkspace { }
+
+public class CodeReviewService : ApplicationService
+{
+    private readonly IChatClient<InternalWorkspace> _internalChat;
+    private readonly IChatClient _defaultChat; // resolves the Default workspace
+
+    public CodeReviewService(
+        IChatClient<InternalWorkspace> internalChat,
+        IChatClient defaultChat)
+    {
+        _internalChat = internalChat;
+        _defaultChat  = defaultChat;
+    }
+    // …
+}
+```
+
+Or with a graceful fallback via accessor:
+
+```csharp
+public class OptionalSummarizer
+{
+    private readonly IChatClientAccessor _chat;
+    public OptionalSummarizer(IChatClientAccessor chat) => _chat = chat;
+
+    public async Task<string?> SummariseAsync(string text, CancellationToken ct)
+    {
+        if (_chat.ChatClient is null) return null;
+        var resp = await _chat.ChatClient.GetResponseAsync(text, cancellationToken: ct);
+        return resp.Text;
+    }
+}
+```
+
+## Notes on the "nascent" character of the module
+
+The AI module deliberately stays close to the underlying SDKs. There is **no**:
+
+- `IAiTextGenerationService` — `Microsoft.Extensions.AI.IChatClient` already provides this surface.
+- ABP-specific prompt templating — use Semantic Kernel's `PromptTemplateConfig` or `Volo.Abp.TextTemplating` for that.
+- Per-tenant chat-client switching baked in — but `IChatClientAccessor`'s constructor injects `IServiceProvider`, so you can subclass it to consult `ICurrentTenant` and pick a different keyed client.
+
+That's by design — the layer wraps registration and gives you typed DI access; everything richer is application or higher-module concern.
+
+## Pitfalls
+
+<Warning>**`PreConfigure`, not `Configure`.** Workspace configuration must run *before* `AbpAIModule.ConfigureServices`. Use `PreConfigureServices` in your module, and `PreConfigure<AbpAIWorkspaceOptions>(...)`. A regular `Configure` runs too late and the workspace dictionary will be empty when the module reads it.</Warning>
+
+<Warning>**`IChatClient` (no workspace) only resolves if "Default" is configured.** If your app only declares `[WorkspaceName("Special")]` workspaces, the plain `IChatClient` injection fails with a missing-service exception. Either name one workspace `"Default"` or always inject `IChatClientAccessor`/`IChatClient<TWorkspace>`.</Warning>
+
+<Warning>**`Kernel` is registered transient, but with a `TODO` comment.** The source notes "Check if we can use transient instead of singleton for Kernel". For deterministic plugin registration semantics, prefer building the kernel once and treating its services as singletons.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Options & configuration" icon="gear" href="/core/options-and-configuration">
+    `PreConfigure` vs `Configure`, why workspace setup needs the pre-stage.
+  </Card>
+  <Card title="JSON" icon="brackets-curly" href="/misc/json">
+    Useful when serialising AI tool-call payloads.
+  </Card>
+  <Card title="Identity module" icon="user-shield" href="/modules/identity/overview">
+    A natural surface for "summarise this user's activity" features once AI is wired up.
+  </Card>
+</CardGroup>

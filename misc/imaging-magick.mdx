@@ -1,0 +1,310 @@
+---
+title: "Imaging — Magick.NET: native ImageMagick for GIF, lossless and optimal compression"
+sidebarTitle: "Imaging — Magick.NET"
+description: "The native ImageMagick backend for ABP imaging. Uses ImageMagick.ImageOptimizer for compression (lossless or optimal), MagickImage for resize, and supports JPEG/PNG/GIF for compression — the only in-tree backend that compresses GIF."
+---
+
+`Volo.Abp.Imaging.MagickNet` wraps **Magick.NET** (the .NET binding for **ImageMagick**) into ABP's [imaging pipeline](/misc/imaging-abstractions). It's the **only in-tree backend that compresses GIF** and the one to use when you need ImageMagick's optimization heuristics. The trade-off is a native dependency — Magick.NET ships its own bundled `.dll`/`.so`/`.dylib`, so deployments need the right platform binary.
+
+Source: `framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/`
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/AbpImagingMagickNetModule.cs
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingMagickNetModule : AbpModule
+{
+}
+```
+
+Empty — both contributors register through `ITransientDependency`. Add this module's `[DependsOn]` and the contributor joins the chain.
+
+## The compressor contributor
+
+The compressor uses ImageMagick's high-level `ImageOptimizer`, which understands per-format optimization strategies (PNG palette reduction, JPEG quantization tables, GIF delta-frame optimization):
+
+```csharp
+// framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickImageCompressorContributor.cs
+public class MagickImageCompressorContributor : IImageCompressorContributor, ITransientDependency
+{
+    protected MagickNetCompressOptions Options { get; }
+    protected readonly ImageOptimizer Optimizer;
+
+    public MagickImageCompressorContributor(IOptions<MagickNetCompressOptions> options)
+    {
+        Options = options.Value;
+        Optimizer = new ImageOptimizer
+        {
+            OptimalCompression       = Options.OptimalCompression,
+            IgnoreUnsupportedFormats = Options.IgnoreUnsupportedFormats
+        };
+    }
+
+    public virtual async Task<ImageCompressResult<Stream>> TryCompressAsync(
+        Stream stream, string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && !CanCompress(mimeType))
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var memoryStream = await stream.CreateMemoryStreamAsync(cancellationToken: cancellationToken);
+
+        try
+        {
+            if (!Optimizer.IsSupported(memoryStream))
+                return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+            if (Compress(memoryStream))
+                return new ImageCompressResult<Stream>(memoryStream, ImageProcessState.Done);
+
+            memoryStream.Dispose();
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Canceled);
+        }
+        catch
+        {
+            memoryStream.Dispose();
+            throw;
+        }
+    }
+
+    protected virtual bool Compress(Stream stream)
+    {
+        return Options.Lossless ? Optimizer.LosslessCompress(stream) : Optimizer.Compress(stream);
+    }
+```
+
+Three things differ from the ImageSharp compressor:
+
+1. **`Optimizer.IsSupported(memoryStream)`** — the actual file content (not just the mime hint) is checked. If you set `IgnoreUnsupportedFormats = true`, the optimizer silently no-ops on unsupported content; otherwise it throws.
+2. **`Optimizer.LosslessCompress` vs `Optimizer.Compress`** — two completely different optimization strategies, picked via the `Lossless` option.
+3. **The state machine is more compact** — the optimizer's bool return tells you "did I actually shrink this?" so `Canceled` falls out naturally.
+
+### `Compress()` vs `LosslessCompress()`
+
+ImageMagick's distinction:
+
+| Method | What it does | Use when |
+|---|---|---|
+| `LosslessCompress` | Reorders/dedupes data without altering visual content. Strips metadata, picks better Huffman tables, optimises PNG palette. | You can't accept any quality loss (medical, prepress). |
+| `Compress` | Allows visual changes (e.g. recompress JPEG with lower quality, drop GIF frames). Strips metadata. | User-facing images where small artifacts are fine. |
+
+`OptimalCompression = true` lets `Compress` try multiple strategies and pick the smallest output. It's slower (multiplicatively, for some formats) but often wins on heterogeneous uploads.
+
+### Supported mime types
+
+```csharp
+protected virtual bool CanCompress(string? mimeType)
+{
+    return mimeType switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Gif  => true,
+        _ => false
+    };
+}
+```
+
+GIF is the differentiator from ImageSharp. WebP is *not* supported by `ImageOptimizer` — ImageMagick can read/write WebP but the optimizer wrapper doesn't recognise it. If you need both GIF compression and WebP compression, register both Magick.NET and ImageSharp; the contributor chain will route per-mime-type.
+
+## `MagickNetCompressOptions`
+
+```csharp
+// framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickNetCompressOptions.cs
+public class MagickNetCompressOptions
+{
+    public bool OptimalCompression       { get; set; }
+    public bool IgnoreUnsupportedFormats { get; set; }
+    public bool Lossless                 { get; set; }
+}
+```
+
+| Property | Default | Notes |
+|---|---|---|
+| `OptimalCompression` | `false` | Let `Compress` try multiple strategies. Slower; smaller output. |
+| `IgnoreUnsupportedFormats` | `false` | If `true`, the optimizer no-ops on unsupported content instead of throwing. |
+| `Lossless` | `false` | `true` → `LosslessCompress`, `false` → `Compress`. |
+
+Configuration:
+
+```csharp
+[DependsOn(typeof(AbpImagingMagickNetModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<MagickNetCompressOptions>(o =>
+        {
+            o.OptimalCompression       = true;  // squeeze harder
+            o.IgnoreUnsupportedFormats = true;  // don't blow up on weird uploads
+            o.Lossless                 = false; // user uploads — small artifacts OK
+        });
+    }
+}
+```
+
+## The resizer contributor
+
+```csharp
+// framework/src/Volo.Abp.Imaging.MagickNet/Volo/Abp/Imaging/MagickImageResizerContributor.cs
+public class MagickImageResizerContributor : IImageResizerContributor, ITransientDependency
+{
+    private const int Min = 1;
+
+    public virtual async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!mimeType.IsNullOrWhiteSpace() && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var memoryStream = await stream.CreateMemoryStreamAsync(cancellationToken: cancellationToken);
+
+        try
+        {
+            using var image = new MagickImage(memoryStream);
+
+            if (mimeType.IsNullOrWhiteSpace() && !CanResize(image.Format))
+                return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+            Resize(image, resizeArgs);
+
+            memoryStream.Position = 0;
+            await image.WriteAsync(memoryStream, cancellationToken);
+            memoryStream.SetLength(memoryStream.Position);
+            memoryStream.Position = 0;
+
+            return new ImageResizeResult<Stream>(memoryStream, ImageProcessState.Done);
+        }
+        catch
+        {
+            memoryStream.Dispose();
+            throw;
+        }
+    }
+```
+
+Notable details:
+
+1. **Double mime-type check.** First against the caller's `mimeType` hint (string), then against the *decoded* `MagickFormat` enum if the caller didn't pass a hint. Two overloads of `CanResize`:
+
+    ```csharp
+    protected virtual bool CanResize(string mimeType)
+    {
+        return mimeType.ToLowerInvariant() switch
+        {
+            MimeTypes.Image.Jpeg => true,
+            MimeTypes.Image.Png  => true,
+            MimeTypes.Image.Gif  => true,
+            MimeTypes.Image.Bmp  => true,
+            MimeTypes.Image.Tiff => true,
+            MimeTypes.Image.Webp => true,
+            _ => false
+        };
+    }
+
+    protected virtual bool CanResize(MagickFormat format)
+    {
+        return format switch
+        {
+            MagickFormat.Jpeg => true,
+            MagickFormat.Png  => true,
+            MagickFormat.Gif  => true,
+            MagickFormat.Bmp  => true,
+            MagickFormat.Tiff => true,
+            MagickFormat.WebP => true,
+            _ => false
+        };
+    }
+    ```
+2. **In-place write.** `image.WriteAsync(memoryStream)` overwrites the *same* buffer, then `SetLength(memoryStream.Position)` trims it. No double-allocation.
+3. **`Resize → ApplyResizeMode` indirection.** Every `ImageResizeMode` value has its own dedicated method (`ResizeStretch`, `ResizePad`, `ResizeBoxPad`, `ResizeCrop`, `ResizeMin`, `ResizeMax`, `ResizeModeNone`). The mode → method dispatch makes each strategy independently extensible — subclass and override just the one you want to change.
+
+```csharp
+protected virtual void ApplyResizeMode(MagickImage image, ImageResizeArgs resizeArgs)
+{
+    switch (resizeArgs.Mode)
+    {
+        case ImageResizeMode.None:    ResizeModeNone(image, resizeArgs); break;
+        case ImageResizeMode.Stretch: ResizeStretch(image, resizeArgs); break;
+        case ImageResizeMode.Pad:     ResizePad(image, resizeArgs); break;
+        case ImageResizeMode.BoxPad:  /* … */ break;
+        // …
+    }
+}
+```
+
+`Min = 1` is the constant that protects against `Width = 0` (which ImageMagick would treat as "no constraint" — usually surprising).
+
+## When to pick Magick.NET
+
+| Need | Magick.NET | ImageSharp |
+|---|---|---|
+| Pure managed code (cloud-native, no native libs) | ❌ native | ✅ |
+| GIF compression | ✅ | ❌ |
+| Optimal/lossless explicit modes | ✅ | partial |
+| WebP compression | ❌ (optimizer wrapper) | ✅ |
+| BMP/TIFF resize | ✅ | ✅ |
+| Per-format dispatch override hooks | ✅ (one method per mode) | partial |
+
+The common pattern: **register both Magick.NET and ImageSharp**. The contributor chain picks the one that handles each request's mime type. ImageSharp covers WebP, Magick.NET covers GIF; they complement.
+
+## Deployment notes
+
+Magick.NET ships per-platform native binaries inside the NuGet package (`Magick.Native-Q8-x64.dll`, `libMagick.Native-Q8-x64.so`, etc.). For containers:
+
+- **Linux**: `mcr.microsoft.com/dotnet/aspnet:8.0` already has `libgomp1` and the other transitive deps. If you use `runtime-deps` you may need to `apt-get install -y libgomp1 libfontconfig1` depending on the formats you handle.
+- **Alpine**: choose `Magick.NET.Core` + a musl-targeted native package; the default `Magick.NET-Q8-AnyCPU` does *not* work on Alpine.
+- **Windows**: nothing extra; the bundled DLL is loaded automatically.
+
+The `Q8` vs `Q16` in package names is the per-channel bit depth — Q8 is ~half the memory, sufficient for everything below colour-critical prepress.
+
+## Layering with ImageSharp
+
+```csharp
+[DependsOn(
+    typeof(AbpImagingImageSharpModule),
+    typeof(AbpImagingMagickNetModule)
+)]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // ImageSharp owns JPEG/PNG/WebP quality dials
+        Configure<ImageSharpCompressOptions>(o => o.DefaultQuality = 82);
+
+        // Magick.NET handles GIFs aggressively
+        Configure<MagickNetCompressOptions>(o =>
+        {
+            o.OptimalCompression       = true;
+            o.IgnoreUnsupportedFormats = true;
+        });
+    }
+}
+```
+
+Because both modules register their contributors with `ITransientDependency`, the `IEnumerable<IImageCompressorContributor>` resolved by `ImageCompressor` contains both. The dispatcher tries them in reverse-registration order; whichever returns `Done`/`Canceled` wins. `Unsupported` falls through.
+
+## Pitfalls
+
+<Warning>**Memory growth in long-running services.** `MagickImage` holds unmanaged memory; relying on the GC is too slow when you process hundreds of images per second. The contributor already wraps `using var image = new MagickImage(...)`, but if you subclass and add steps, keep the `using`.</Warning>
+
+<Warning>**Alpine containers.** The default Magick.NET package is glibc-only. Use `Magick.NET-Q8-AnyCPU` carefully and consider Alpine-specific builds if running on Alpine base images.</Warning>
+
+<Warning>**`OptimalCompression` cost.** It tries multiple compression strategies per image. For batch jobs that's fine; for synchronous user upload paths, expect a 2–5× CPU cost vs `OptimalCompression = false`.</Warning>
+
+<Warning>**`Lossless = true` doesn't help JPEG much.** Lossless JPEG (`Optimizer.LosslessCompress` on a `.jpg`) is mostly metadata stripping. If your JPEGs already lack EXIF, the win is small.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Imaging abstractions" icon="image" href="/misc/imaging-abstractions">
+    The orchestrator and `IImageResizerContributor` / `IImageCompressorContributor` contracts.
+  </Card>
+  <Card title="ImageSharp" icon="palette" href="/misc/imaging-imagesharp">
+    Pure-managed sibling. Run them together for full format coverage.
+  </Card>
+  <Card title="BLOB storing" icon="database" href="/modules/blob-storing-database">
+    The natural destination for the compressed bytes.
+  </Card>
+</CardGroup>

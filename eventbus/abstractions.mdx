@@ -1,0 +1,437 @@
+---
+title: "Event Bus Abstractions: Buses, Handlers, Event Names"
+sidebarTitle: "Abstractions"
+description: "Walk the contracts in Volo.Abp.EventBus.Abstractions: IEventBus, ILocalEventBus, IDistributedEventBus, handler interfaces and EventNameAttribute."
+---
+
+`framework/src/Volo.Abp.EventBus.Abstractions/` is the contract-only package that every other event bus module depends on. It defines what an event bus, an event handler, an inbox and an outbox look like — without forcing any implementation choice. Application code should depend on these interfaces; broker adapters depend on the same surface and replace the registered implementations.
+
+This page walks every type in that project: the three bus interfaces, the handler interfaces, the event-name attribute and the contracts that the inbox/outbox workers use.
+
+## Project layout
+
+```text
+framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/
+├── Abstractions/
+│   └── AbpEventBusAbstractionsModule.cs
+├── Distributed/
+│   ├── DistributedEventReceived.cs
+│   ├── DistributedEventSent.cs
+│   ├── DistributedEventSource.cs
+│   ├── IDistributedEventBus.cs
+│   ├── IDistributedEventHandler.cs
+│   ├── IEventInbox.cs
+│   ├── IEventOutbox.cs
+│   ├── IInboxProcessor.cs
+│   ├── IOutboxSender.cs
+│   ├── IIncomingEventInfo.cs
+│   ├── IOutgoingEventInfo.cs
+│   ├── InboxConfig.cs
+│   ├── OutboxConfig.cs
+│   ├── IncomingEventInfo.cs
+│   ├── IncomingEventStatus.cs
+│   ├── OutgoingEventInfo.cs
+│   └── ISupportsEventBoxes.cs
+├── Local/
+│   ├── ILocalEventBus.cs
+│   ├── ILocalEventHandler.cs
+│   └── LocalEventHandlerOrderAttribute.cs
+├── EventBusConsts.cs
+├── EventNameAttribute.cs
+├── GenericEventNameAttribute.cs
+├── IEventBus.cs
+├── IEventHandler.cs
+├── IEventHandlerFactory.cs
+├── IEventHandlerInvoker.cs
+├── IEventNameProvider.cs
+└── EventTypeWithEventHandlerFactories.cs
+```
+
+## The marker `IEventHandler`
+
+Every handler ultimately implements `IEventHandler`. It is intentionally empty — its only job is to give the runtime a single type to scan for. You never implement it directly; pick one of the two specializations below.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/IEventHandler.cs
+public interface IEventHandler
+{
+}
+```
+
+### `ILocalEventHandler<TEvent>`
+
+In-process handler. Resolved per event from the IoC container.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Local/ILocalEventHandler.cs
+public interface ILocalEventHandler<in TEvent> : IEventHandler
+{
+    Task HandleEventAsync(TEvent eventData);
+}
+```
+
+### `IDistributedEventHandler<TEvent>`
+
+Same shape, different intent: this handler is invoked from a message coming off a broker or from a local distributed bus.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IDistributedEventHandler.cs
+public interface IDistributedEventHandler<in TEvent> : IEventHandler
+{
+    Task HandleEventAsync(TEvent eventData);
+}
+```
+
+A single class can implement both — it will be invoked once on each side. The runtime resolves which method to call from `EventHandlerInvoker`, which builds a cached delegate based on the interface signature; see [Local Event Bus](/eventbus/local-event-bus#event-handler-invoker) for the cache.
+
+## `IEventBus`
+
+The base contract every bus implements. It has three roles: publish, subscribe, unsubscribe.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/IEventBus.cs
+public interface IEventBus
+{
+    Task PublishAsync<TEvent>(TEvent eventData, bool onUnitOfWorkComplete = true)
+        where TEvent : class;
+
+    Task PublishAsync(Type eventType, object eventData, bool onUnitOfWorkComplete = true);
+
+    IDisposable Subscribe<TEvent>(Func<TEvent, Task> action) where TEvent : class;
+    IDisposable Subscribe<TEvent, THandler>()
+        where TEvent : class
+        where THandler : IEventHandler, new();
+    IDisposable Subscribe(Type eventType, IEventHandler handler);
+    IDisposable Subscribe<TEvent>(IEventHandlerFactory factory) where TEvent : class;
+    IDisposable Subscribe(Type eventType, IEventHandlerFactory factory);
+
+    void Unsubscribe<TEvent>(Func<TEvent, Task> action) where TEvent : class;
+    void Unsubscribe<TEvent>(ILocalEventHandler<TEvent> handler) where TEvent : class;
+    void Unsubscribe(Type eventType, IEventHandler handler);
+    void Unsubscribe<TEvent>(IEventHandlerFactory factory) where TEvent : class;
+    void Unsubscribe(Type eventType, IEventHandlerFactory factory);
+
+    void UnsubscribeAll<TEvent>() where TEvent : class;
+    void UnsubscribeAll(Type eventType);
+}
+```
+
+<Note>
+  `onUnitOfWorkComplete: true` (the default) tells the bus to buffer the event on the ambient `IUnitOfWork` and publish it after the transaction commits. Pass `false` to dispatch immediately. See [Unit of Work](/data/unit-of-work) for the buffer mechanics.
+</Note>
+
+### `ILocalEventBus`
+
+Adds a typed `Subscribe` overload that takes an `ILocalEventHandler<TEvent>` directly and a `GetEventHandlerFactories` introspection method.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Local/ILocalEventBus.cs
+public interface ILocalEventBus : IEventBus
+{
+    IDisposable Subscribe<TEvent>(ILocalEventHandler<TEvent> handler) where TEvent : class;
+
+    List<EventTypeWithEventHandlerFactories> GetEventHandlerFactories(Type eventType);
+}
+```
+
+### `IDistributedEventBus`
+
+Adds the `useOutbox` flag and a typed handler subscription. This is the only bus that talks to a broker.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IDistributedEventBus.cs
+public interface IDistributedEventBus : IEventBus
+{
+    IDisposable Subscribe<TEvent>(IDistributedEventHandler<TEvent> handler) where TEvent : class;
+
+    Task PublishAsync<TEvent>(
+        TEvent eventData,
+        bool onUnitOfWorkComplete = true,
+        bool useOutbox = true)
+        where TEvent : class;
+
+    Task PublishAsync(
+        Type eventType,
+        object eventData,
+        bool onUnitOfWorkComplete = true,
+        bool useOutbox = true);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Local Event Bus" icon="bolt" href="/eventbus/local-event-bus">
+    See how `LocalEventBus` implements these contracts.
+  </Card>
+  <Card title="Distributed Event Bus" icon="network-wired" href="/eventbus/distributed-event-bus">
+    See how `DistributedEventBusBase` wires the outbox path.
+  </Card>
+</CardGroup>
+
+## Naming events: `EventNameAttribute`
+
+Brokers transmit a string, not a CLR type. ABP derives that string from `EventNameAttribute` if present, otherwise from `Type.FullName`.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/EventNameAttribute.cs
+[AttributeUsage(AttributeTargets.Class)]
+public class EventNameAttribute : Attribute, IEventNameProvider
+{
+    public virtual string Name { get; }
+
+    public EventNameAttribute([NotNull] string name)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+    }
+
+    public static string GetNameOrDefault<TEvent>()
+        => GetNameOrDefault(typeof(TEvent));
+
+    public static string GetNameOrDefault([NotNull] Type eventType)
+    {
+        Check.NotNull(eventType, nameof(eventType));
+
+        return (eventType
+                    .GetCustomAttributes(true)
+                    .OfType<IEventNameProvider>()
+                    .FirstOrDefault()
+                    ?.GetName(eventType)
+                ?? eventType.FullName)!;
+    }
+
+    public string GetName(Type eventType) => Name;
+}
+```
+
+### Usage
+
+```csharp
+[EventName("orders.order_placed.v1")]
+public class OrderPlacedEto
+{
+    public Guid OrderId { get; set; }
+    public Guid CustomerId { get; set; }
+    public decimal Total { get; set; }
+}
+```
+
+The bus calls `EventNameAttribute.GetNameOrDefault(typeof(OrderPlacedEto))` and gets `"orders.order_placed.v1"` instead of `MyApp.Orders.OrderPlacedEto`. That string becomes the RabbitMQ routing key, the Kafka message key, the Service Bus `Subject` and the Dapr topic name.
+
+### `GenericEventNameAttribute`
+
+For envelope types like `EntityCreatedEto<T>`, ABP also ships `GenericEventNameAttribute` which composes a deterministic name from the open generic and its type argument so that `EntityCreatedEto<User>` and `EntityCreatedEto<Order>` get distinct event names.
+
+<Warning>
+  Choose an event name on day one and treat it as a wire-level contract. Renaming the CLR type is safe; renaming the value of `EventName` breaks every consumer.
+</Warning>
+
+## `IEventHandlerInvoker`
+
+The bus does not call your handler directly. It hands the resolved handler instance to an `IEventHandlerInvoker`, which dispatches to the right interface method based on cached metadata.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/IEventHandlerInvoker.cs
+public interface IEventHandlerInvoker
+{
+    Task InvokeAsync(IEventHandler eventHandler, object eventData, Type eventType);
+}
+```
+
+The default `EventHandlerInvoker` from `Volo.Abp.EventBus` builds a cached `EventHandlerInvokerCacheItem` per `(handler type, event type)` pair, checks whether the handler implements `ILocalEventHandler<>`, `IDistributedEventHandler<>`, or both, and invokes the matching `HandleEventAsync`. See [Local Event Bus → Handler invoker](/eventbus/local-event-bus#event-handler-invoker) for the cache.
+
+## Distributed contracts
+
+### `InboxConfig` and `OutboxConfig`
+
+The inbox/outbox subsystem is multi-database aware. Each configured box has a name, a backing database, an implementation type and optional event/handler selectors.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/InboxConfig.cs
+public class InboxConfig
+{
+    public string Name { get; }
+    public string DatabaseName { get; set; }
+    public Type ImplementationType { get; set; } = default!;
+    public Func<Type, bool>? EventSelector { get; set; }
+    public Func<Type, bool>? HandlerSelector { get; set; }
+    public bool IsProcessingEnabled { get; set; } = true;
+
+    public InboxConfig(string name) => Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/OutboxConfig.cs
+public class OutboxConfig
+{
+    public string Name { get; }
+    public string DatabaseName { get; set; }
+    public Type ImplementationType { get; set; } = default!;
+    public Func<Type, bool>? Selector { get; set; }
+    public bool IsSendingEnabled { get; set; } = true;
+
+    public OutboxConfig(string name) => Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+}
+```
+
+`Selector` is the per-outbox event filter — if it returns `false`, the event skips this outbox. The dispatcher in `DistributedEventBusBase.AddToOutboxAsync` orders outboxes so configurations without a selector come last, making them the catch-all.
+
+### `IEventInbox` and `IEventOutbox`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IEventInbox.cs
+public interface IEventInbox
+{
+    Task EnqueueAsync(IncomingEventInfo incomingEvent);
+    Task<List<IncomingEventInfo>> GetWaitingEventsAsync(
+        int maxCount,
+        Expression<Func<IIncomingEventInfo, bool>>? filter = null,
+        CancellationToken cancellationToken = default);
+    Task MarkAsProcessedAsync(Guid id);
+    Task RetryLaterAsync(Guid id, int retryCount, DateTime? nextRetryTime);
+    Task MarkAsDiscardAsync(Guid id);
+    Task<bool> ExistsByMessageIdAsync(string messageId);
+    Task DeleteOldEventsAsync();
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IEventOutbox.cs
+public interface IEventOutbox
+{
+    Task EnqueueAsync(OutgoingEventInfo outgoingEvent);
+    Task<List<OutgoingEventInfo>> GetWaitingEventsAsync(
+        int maxCount,
+        Expression<Func<IOutgoingEventInfo, bool>>? filter = null,
+        CancellationToken cancellationToken = default);
+    Task DeleteAsync(Guid id);
+    Task DeleteManyAsync(IEnumerable<Guid> ids);
+}
+```
+
+The EF Core inbox/outbox implementations live in `Volo.Abp.EntityFrameworkCore`; the MongoDB ones live in `Volo.Abp.MongoDB`. They satisfy `IEventInbox` / `IEventOutbox` against their backing store.
+
+### `IIncomingEventInfo` / `IOutgoingEventInfo`
+
+The row shape the boxes store.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/IIncomingEventInfo.cs
+public interface IIncomingEventInfo : IHasExtraProperties
+{
+    Guid Id { get; }
+    string MessageId { get; }
+    string EventName { get; }
+    byte[] EventData { get; }
+    DateTime CreationTime { get; }
+}
+```
+
+`MessageId` is the deduplication key — the inbox short-circuits any second arrival of the same `MessageId` through `ExistsByMessageIdAsync`. `EventData` is the serialized payload; correlation IDs and tenant IDs travel in `ExtraProperties`.
+
+### `ISupportsEventBoxes`
+
+Implemented by every distributed bus; the inbox/outbox workers call into it to do per-broker publication and processing.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/ISupportsEventBoxes.cs
+public interface ISupportsEventBoxes
+{
+    Task PublishFromOutboxAsync(OutgoingEventInfo outgoingEvent, OutboxConfig outboxConfig);
+    Task PublishManyFromOutboxAsync(IEnumerable<OutgoingEventInfo> outgoingEvents, OutboxConfig outboxConfig);
+    Task ProcessFromInboxAsync(IncomingEventInfo incomingEvent, InboxConfig inboxConfig);
+}
+```
+
+### Sent / Received notifications
+
+`LocalEventBus` also publishes two meta-events whenever a distributed event crosses the wire — useful for tracing or auditing.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/DistributedEventSent.cs
+public class DistributedEventSent
+{
+    public DistributedEventSource Source { get; set; }
+    public string EventName { get; set; } = default!;
+    public object EventData { get; set; } = default!;
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/DistributedEventSource.cs
+public enum DistributedEventSource { Direct, Inbox, Outbox }
+```
+
+You can subscribe an `ILocalEventHandler<DistributedEventSent>` to capture every send, regardless of which broker is configured.
+
+## Local handler ordering
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Local/LocalEventHandlerOrderAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = false, Inherited = true)]
+public class LocalEventHandlerOrderAttribute : Attribute
+{
+    public int Order { get; set; }
+    public LocalEventHandlerOrderAttribute(int order) { Order = order; }
+}
+```
+
+Stamp this on a local handler to control its position relative to other handlers for the same event. The local bus sorts factories by ascending `Order` before dispatching.
+
+## Event data migration
+
+When you change the payload shape of an already-deployed event, ABP gives you `IEventDataMigrator<TEvent>` to upgrade an old serialized event into the new shape before it reaches the handler. The inbox calls every registered migrator for the event type in turn, threading the result through. Implementations live alongside your event types and are picked up automatically through DI conventions.
+
+```csharp
+public interface IEventDataMigrator<TEvent>
+{
+    Task<TEvent?> MigrateAsync(TEvent eventData);
+}
+```
+
+Use this when you add a field, drop a field, or split an event in two and need to upgrade in-flight messages without coordinating a global redeploy.
+
+## `IEventBusConsts`
+
+Single source of truth for header names used across brokers.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/EventBusConsts.cs
+public static class EventBusConsts
+{
+    public const string CorrelationIdHeaderName = "X-Correlation-Id";
+}
+```
+
+## What every implementation must do
+
+<Steps>
+  <Step title="Implement IEventBus">
+    `PublishAsync`, `Subscribe*`, `Unsubscribe*`. The base `EventBusBase` class in `Volo.Abp.EventBus` supplies most of the surface; you override `PublishToEventBusAsync` and the subscribe/unsubscribe internals.
+  </Step>
+  <Step title="Route through the UoW">
+    Check `UnitOfWorkManager.Current`. If non-null and `onUnitOfWorkComplete` is true, call `AddToUnitOfWork`. Otherwise call `PublishToEventBusAsync`.
+  </Step>
+  <Step title="For distributed buses: implement ISupportsEventBoxes">
+    `PublishFromOutboxAsync`, `PublishManyFromOutboxAsync`, `ProcessFromInboxAsync`. The `OutboxSender` and `InboxProcessor` background workers call these.
+  </Step>
+  <Step title="Serialize with EventNameAttribute">
+    Always use `EventNameAttribute.GetNameOrDefault(eventType)` to derive the wire-level name. Never serialize the CLR type name directly.
+  </Step>
+</Steps>
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    `AddOrReplaceLocalEvent`, `AddOrReplaceDistributedEvent` and how events are drained after commit.
+  </Card>
+  <Card title="Background workers" icon="gears" href="/background/overview">
+    Where `OutboxSenderManager` and `InboxProcessManager` are hosted.
+  </Card>
+  <Card title="Publication flow" icon="diagram-project" href="/flows/distributed-event-publish-consume">
+    End-to-end sequence: code → bus → UoW → outbox → broker → inbox → handler.
+  </Card>
+  <Card title="Overview" icon="compass" href="/eventbus/overview">
+    Pick the right bus and broker for your scenario.
+  </Card>
+</CardGroup>

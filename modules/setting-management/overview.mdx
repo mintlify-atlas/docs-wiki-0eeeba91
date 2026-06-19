@@ -1,0 +1,323 @@
+---
+title: "Setting Management Module"
+description: "ABP's persisted, multi-tenant setting store: how `SettingValue` flows through the provider chain, how the management providers persist overrides, and how the UI lets administrators edit them."
+---
+
+The **Setting Management module** (`Volo.Abp.SettingManagement.*`) is the persistence, application, and UI layer that sits on top of the [framework setting infrastructure](/security/settings). The framework's `Volo.Abp.Settings` package only knows how to *define* settings and *read* them through `ISettingProvider`; it is intentionally stateless. This module supplies the missing half: a `Setting` aggregate, an `ISettingRepository`, an `ISettingManagementStore` cache, five `ISettingManagementProvider` implementations that map onto the framework's `SettingValueProvider` chain, and an `ISettingManager` API that *writes* new values for the global, tenant, and user scopes.
+
+It is the engine behind the **Administration → Settings** page in every ABP startup template — that page is built from the `EmailSettingsAppService`, `TimeZoneSettingsAppService`, and the contributor APIs exposed by the [Web](/modules/setting-management/web-and-blazor) and Blazor packages of this module.
+
+<Info>
+**Source root.** Every type referenced on these pages lives under [`modules/setting-management/src/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src) in the ABP repository. The 13 projects in that folder map 1‑to‑1 to the layered structure below.
+</Info>
+
+## What the module gives you
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="database" href="/modules/setting-management/domain">
+    `Setting` aggregate, `ISettingRepository`, `ISettingManagementStore` + `SettingManagementStore`, the five `SettingManagementProvider`s, `ISettingManager` + `SettingManager`, `IStaticSettingSaver`, `IDynamicSettingDefinitionStore`, `ISettingEncryptionService`, distributed-cache `SettingCacheItem`.
+  </Card>
+  <Card title="Application layer" icon="layer-group" href="/modules/setting-management/application">
+    `EmailSettingsAppService` (`SMTP host/port/user/password`, send-test-email), `TimeZoneSettingsAppService`, `IEmailSettingsAppService`, DTOs (`EmailSettingsDto`, `UpdateEmailSettingsDto`, `SendTestEmailInput`), permissions, feature checker, `UserDeletedEventHandler`.
+  </Card>
+  <Card title="HTTP API + client" icon="cloud" href="/modules/setting-management/http-api">
+    `EmailSettingsController` and `TimeZoneSettingsController` (REST controllers under `/api/setting-management/...`), generated `EmailSettingsClientProxy` / `TimeZoneSettingsClientProxy` static HTTP client proxies.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-restore" href="/modules/setting-management/web-and-blazor">
+    Razor Pages `Index.cshtml` host, Blazor `SettingManagement.razor`, the `SettingPageContributorBase` / `ISettingComponentContributor` extension points, `SettingManagementPageOptions` and `SettingManagementComponentOptions`.
+  </Card>
+  <Card title="EF Core & MongoDB" icon="server" href="/modules/setting-management/efcore-mongodb">
+    `SettingManagementDbContext` + `EfCoreSettingRepository`, `SettingManagementMongoDbContext` + `MongoSettingRepository`, model-builder extensions, `ConnectionStringName = "AbpSettingManagement"`.
+  </Card>
+  <Card title="Cross-cutting integrations" icon="puzzle-piece" href="/security/settings">
+    Plugs into the framework's `ISettingProvider`/`ISettingValueProvider` chain, the [Tenant Management module](/modules/tenant-management/overview) for per‑tenant overrides, and the [Emailing abstraction](/misc/emailing) for the SMTP settings page.
+  </Card>
+</CardGroup>
+
+## The two halves of "settings" in ABP
+
+Settings in ABP are split between two NuGet packages by design, and confusing them is the most common source of "why isn't my setting picked up?" questions.
+
+| Concern | Lives in | Description |
+| --- | --- | --- |
+| **Defining** a setting (name, default, scope, encryption flag) | `Volo.Abp.Settings` (framework) — `SettingDefinition`, `SettingDefinitionProvider` | Static, code-first. Loaded once at startup. Covered in [Settings (framework)](/security/settings). |
+| **Reading** a setting at runtime, walking U → T → G → C → D fallback | `Volo.Abp.Settings` (framework) — `ISettingProvider`, `ISettingValueProvider` | The read pipeline. Returns a `SettingValue` (name + value). |
+| **Persisting** an override for a user / tenant / global | `Volo.Abp.SettingManagement.Domain` (this module) — `ISettingManager`, `SettingManagementStore`, `Setting` entity | Writes a row to the `AbpSettings` table or Mongo collection. |
+| **Editing** through a UI | `Volo.Abp.SettingManagement.Web` / `.Blazor` (this module) | Administration → Settings page, with contributor extensibility. |
+
+The framework's `ISettingProvider` *reads* values through a chain of `ISettingValueProvider`s. Each of those value providers asks an `ISettingManagementProvider` from **this module** for the persisted override:
+
+```mermaid
+flowchart LR
+    subgraph Framework["Volo.Abp.Settings (framework)"]
+        SP[ISettingProvider<br/>SettingProvider]
+        U[UserSettingValueProvider]
+        T[TenantSettingValueProvider]
+        G[GlobalSettingValueProvider]
+        C[ConfigurationSettingValueProvider]
+        D[DefaultValueSettingValueProvider]
+        SP --> U --> T --> G --> C --> D
+    end
+
+    subgraph Module["Volo.Abp.SettingManagement (this module)"]
+        Mgr[ISettingManager<br/>SettingManager]
+        UP[UserSettingManagementProvider]
+        TP[TenantSettingManagementProvider]
+        GP[GlobalSettingManagementProvider]
+        CP[ConfigurationSettingManagementProvider]
+        DP[DefaultValueSettingManagementProvider]
+        Store[ISettingManagementStore<br/>SettingManagementStore]
+        Repo[ISettingRepository<br/>AbpSettings table]
+        Cache[(IDistributedCache&lt;SettingCacheItem&gt;)]
+        Mgr --> UP & TP & GP & CP & DP
+        UP --> Store
+        TP --> Store
+        GP --> Store
+        Store --> Cache
+        Store --> Repo
+    end
+
+    U -. delegates write/clear .-> UP
+    T -. delegates write/clear .-> TP
+    G -. delegates write/clear .-> GP
+    C -. reads appsettings.json .-> CP
+    D -. reads SettingDefinition.DefaultValue .-> DP
+
+    Caller[Your code: ISettingProvider.GetOrNullAsync] --> SP
+    Admin[Admin UI / EmailSettingsAppService] --> Mgr
+```
+
+A read walks **top → bottom** of the value‑provider chain and returns the first non-null value, so a user override beats a tenant override beats a global override beats appsettings beats the static default. A write goes through `ISettingManager.SetAsync(name, value, providerName, providerKey)` which calls the matching `ISettingManagementProvider`, which calls `SettingManagementStore`, which writes a row to `AbpSettings` keyed by `(Name, ProviderName, ProviderKey)`.
+
+## SettingValue, the data unit
+
+`SettingValue` is the small DTO that flows out of every provider:
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/SettingValue.cs
+public class SettingValue : NameValue
+{
+    public SettingValue() { }
+    public SettingValue(string name, string value) : base(name, value) { }
+}
+```
+
+A `List<SettingValue>` is what `ISettingProvider.GetAllAsync(providerName, providerKey)` returns and what `ISettingManagementStore.GetListAsync(...)` materialises from the database. The `SettingValue.Value` is always a **string** — booleans, ints, enums, JSON blobs are all serialised by the caller. `SettingDefinition.IsEncrypted` triggers transparent `ISettingEncryptionService` round-tripping; see [Domain layer → encryption](/modules/setting-management/domain#isettingencryptionservice).
+
+## Provider name constants
+
+Every provider has a short string `Name` that becomes the `ProviderName` column on the `Setting` entity. They live in the framework, but you'll see them everywhere in this module's code:
+
+| `Name` constant | Provider | `ProviderKey` |
+| --- | --- | --- |
+| `"D"` | `DefaultValueSettingValueProvider` | n/a |
+| `"C"` | `ConfigurationSettingValueProvider` | n/a |
+| `"G"` | `GlobalSettingValueProvider` | always `null` |
+| `"T"` | `TenantSettingValueProvider` | tenant `Guid` as string |
+| `"U"` | `UserSettingValueProvider` | user `Guid` as string |
+
+The constants are defined as `GlobalSettingValueProvider.ProviderName`, `TenantSettingValueProvider.ProviderName`, etc., and re-used by each `SettingManagementProvider` so the same name maps both sides of the read/write split.
+
+## Where each layer ships
+
+| Project | NuGet package | Contents |
+| --- | --- | --- |
+| `Volo.Abp.SettingManagement.Domain.Shared` | `Volo.Abp.SettingManagement.Domain.Shared` | `SettingConsts` (max lengths), `SettingManagementFeatures`, `SettingDefinitionRecordConsts`, localization resource. |
+| `Volo.Abp.SettingManagement.Domain` | `Volo.Abp.SettingManagement.Domain` | `Setting` aggregate, `ISettingRepository`, `SettingManagementStore`, the five `SettingManagementProvider`s, `SettingManager`, `IStaticSettingSaver`, dynamic-store, cache invalidator. |
+| `Volo.Abp.SettingManagement.Application.Contracts` | `Volo.Abp.SettingManagement.Application.Contracts` | `IEmailSettingsAppService`, `ITimeZoneSettingsAppService`, DTOs, permission + feature definitions, remote-service consts. |
+| `Volo.Abp.SettingManagement.Application` | `Volo.Abp.SettingManagement.Application` | `EmailSettingsAppService`, `TimeZoneSettingsAppService`, `UserDeletedEventHandler`. |
+| `Volo.Abp.SettingManagement.HttpApi` | `Volo.Abp.SettingManagement.HttpApi` | `EmailSettingsController`, `TimeZoneSettingsController` under `/api/setting-management/...`. |
+| `Volo.Abp.SettingManagement.HttpApi.Client` | `Volo.Abp.SettingManagement.HttpApi.Client` | Generated `EmailSettingsClientProxy.Generated.cs`, `TimeZoneSettingsClientProxy.Generated.cs`. |
+| `Volo.Abp.SettingManagement.Web` | `Volo.Abp.SettingManagement.Web` | Razor Pages **Index.cshtml** + view components, `SettingManagementPageOptions`, `ISettingPageContributor`. |
+| `Volo.Abp.SettingManagement.Blazor` | `Volo.Abp.SettingManagement.Blazor` | `SettingManagement.razor`, `SettingManagementComponentOptions`, `ISettingComponentContributor`. |
+| `Volo.Abp.SettingManagement.Blazor.Server` / `.WebAssembly` | bootstrap modules | Wire up the Blazor module for hosted vs. WASM. |
+| `Volo.Abp.SettingManagement.EntityFrameworkCore` | `Volo.Abp.SettingManagement.EntityFrameworkCore` | `SettingManagementDbContext`, `EfCoreSettingRepository`, model-builder extensions. |
+| `Volo.Abp.SettingManagement.MongoDB` | `Volo.Abp.SettingManagement.MongoDB` | `SettingManagementMongoDbContext`, `MongoSettingRepository`. |
+| `Volo.Abp.SettingManagement.Installer` | n/a | Adds the module via ABP CLI/Suite. |
+
+## Module dependency graph
+
+The domain module declares only three direct framework dependencies:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/AbpSettingManagementDomainModule.cs
+[DependsOn(
+    typeof(AbpSettingsModule),
+    typeof(AbpDddDomainModule),
+    typeof(AbpSettingManagementDomainSharedModule),
+    typeof(AbpCachingModule)
+    )]
+public class AbpSettingManagementDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<SettingManagementOptions>(options =>
+        {
+            options.Providers.Add<DefaultValueSettingManagementProvider>();
+            options.Providers.Add<ConfigurationSettingManagementProvider>();
+            options.Providers.Add<GlobalSettingManagementProvider>();
+            options.Providers.Add<TenantSettingManagementProvider>();
+            options.Providers.Add<UserSettingManagementProvider>();
+        });
+        // ...
+    }
+}
+```
+
+The order of `options.Providers.Add<...>()` mirrors the framework's value-provider chain. `SettingManager` walks the list in reverse (`Enumerable.Reverse(Providers)`) when reading, so the **most specific** provider is consulted first.
+
+## What you get out of the box
+
+Once a startup template depends on `AbpSettingManagementHttpApiModule`, `AbpSettingManagementApplicationModule`, `AbpSettingManagementEntityFrameworkCoreModule` (or the Mongo equivalent), and `AbpSettingManagementWebModule`/`AbpSettingManagementBlazorModule`, you get:
+
+- **An `AbpSettings` table** with a unique index on `(Name, ProviderName, ProviderKey)`.
+- **Auto-bootstrapping of static settings to DB** via `IStaticSettingSaver` — enabled by `SettingManagementOptions.SaveStaticSettingsToDatabase = true` (the default). This happens once per application start in `AbpSettingManagementDomainModule.OnApplicationInitializationAsync` and is wrapped in a Polly retry policy.
+- **Distributed caching** of every read via `IDistributedCache<SettingCacheItem>`. The cache key is `pn:{providerName},pk:{providerKey},n:{name}`.
+- **Cache invalidation on write** through `SettingCacheItemInvalidator` listening to `EntityChangedEventData<Setting>`.
+- **A pre-wired Administration → Settings page** with the **Email** and **Time Zone** tabs.
+- **`SettingManagement` permission group** containing `SettingManagement.Emailing`, `SettingManagement.Emailing.Test`, `SettingManagement.TimeZone`.
+- **`SettingManagement` feature group** containing `SettingManagement.Enable` and `SettingManagement.AllowChangingEmailSettings` (for multi-tenant scenarios — see [Tenant Management](/modules/tenant-management/overview)).
+
+## A 30-second tour of the read path
+
+1. Your code calls `_settingProvider.GetOrNullAsync("MyApp.MaxItemsPerPage")` (framework `ISettingProvider`).
+2. `SettingProvider` iterates the configured `ISettingValueProvider`s in order: User → Tenant → Global → Configuration → Default.
+3. `UserSettingValueProvider.GetOrNullAsync` asks for `"MyApp.MaxItemsPerPage"` with `providerKey = CurrentUser.Id`.
+4. It delegates to `UserSettingManagementProvider.GetOrNullAsync(setting, userId)` (this module).
+5. That calls `SettingManagementStore.GetOrNullAsync("MyApp.MaxItemsPerPage", "U", userId)`.
+6. `SettingManagementStore` checks `IDistributedCache<SettingCacheItem>` first; on miss, `ISettingRepository.FindAsync(...)` queries `AbpSettings`.
+7. If the user has no override, `UserSettingValueProvider` returns null and the chain continues to Tenant, Global, Configuration, then Default.
+8. If `SettingDefinition.IsEncrypted == true`, the value is decrypted by `ISettingEncryptionService` before being returned.
+
+## A 30-second tour of the write path
+
+1. Admin saves a new SMTP host in the UI → `EmailSettingsAppService.UpdateAsync(input)`.
+2. The app service calls `SettingManager.SetForTenantOrGlobalAsync(tenantId, "Abp.Mailing.Smtp.Host", "smtp.acme.com")`.
+3. `SettingManager.SetAsync(name, value, "T" or "G", tenantId)`:
+   - Resolves the `SettingDefinition` from `ISettingDefinitionManager`.
+   - Encrypts the value if `IsEncrypted`.
+   - If `IsInherited == true` and the new value equals the fallback (the next provider down the chain), it **clears** the override rather than storing a redundant row.
+   - Otherwise calls the matching `ISettingManagementProvider.SetAsync`.
+4. `TenantSettingManagementProvider.SetAsync` calls `SettingManagementStore.SetAsync(name, value, "T", tenantId)`.
+5. `SettingManagementStore` finds or creates a `Setting` aggregate and saves it through `ISettingRepository`.
+6. `SettingCacheItemInvalidator` (an `ILocalEventHandler<EntityChangedEventData<Setting>>`) invalidates the cache key, so the next read picks up the new value.
+
+## Built-in permission and feature definitions
+
+The module ships one **permission group** and one **feature group**, both with the same `GroupName = "SettingManagement"`.
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/
+//   Volo/Abp/SettingManagement/SettingManagementPermissions.cs
+public class SettingManagementPermissions
+{
+    public const string GroupName = "SettingManagement";
+    public const string Emailing = GroupName + ".Emailing";
+    public const string EmailingTest = Emailing + ".Test";
+    public const string TimeZone = GroupName + ".TimeZone";
+
+    public static string[] GetAll()
+    {
+        return ReflectionHelper.GetPublicConstantsRecursively(typeof(SettingManagementPermissions));
+    }
+}
+```
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain.Shared/
+//   Volo/Abp/SettingManagement/SettingManagementFeatures.cs
+public class SettingManagementFeatures
+{
+    public const string GroupName = "SettingManagement";
+    public const string Enable = GroupName + ".Enable";
+    public const string AllowChangingEmailSettings = GroupName + ".AllowChangingEmailSettings";
+}
+```
+
+`SettingManagement.Enable` defaults to `true`; `SettingManagement.AllowChangingEmailSettings` defaults to `false`. Both are `isAvailableToHost: false` — they only apply to tenants. See the feature definition provider in [Application → Feature definitions](/modules/setting-management/application#feature-definitions).
+
+## Default `SettingDefinition` flags that this module honours
+
+`SettingDefinition` (in the framework) has three flags that govern how this module behaves at runtime:
+
+| Flag | Default | Effect inside this module |
+| --- | --- | --- |
+| `IsVisibleToClients` | `false` | If `true`, the value is published into `AbpApplicationConfigurationDto` and reaches the client. The UI's Settings page does not depend on this flag — it always works server-side. |
+| `IsInherited` | `true` | Drives the fallback rule in `SettingManager.GetOrNullInternalAsync`. With `IsInherited = false`, a read at the user scope **does not** continue to tenant / global / configuration / default — it stops at user. The matching behaviour for writes: when storing a value identical to its fallback, the row is cleared rather than inserted (see [Domain → inheritance-aware writes](/modules/setting-management/domain#inheritance-aware-writes)). |
+| `IsEncrypted` | `false` | Routes the value through `ISettingEncryptionService.Encrypt` on write and `Decrypt` on read. The `Setting.Value` column stores the ciphertext. |
+
+Combining the three is what differentiates settings:
+
+- A *user-only* setting (e.g. a per-user theme): `IsInherited = false`.
+- A *secret* setting (SMTP password): `IsEncrypted = true`.
+- A *client-visible* preference: `IsVisibleToClients = true`.
+
+The encrypted-and-client-visible combination is supported — the framework's per-request `AbpApplicationConfigurationService` decrypts on its way to the client, so the value is sent in plaintext over the HTTPS channel.
+
+## Where the data lives
+
+Every persisted setting ends up as one row in `AbpSettings`:
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `Id` | `Guid` | Aggregate id. |
+| `Name` | `nvarchar(128)` | The setting's name (matches `SettingDefinition.Name`). |
+| `Value` | `nvarchar(2048)` | The string value (ciphertext when `IsEncrypted`). On Oracle, capped at 2000 chars. |
+| `ProviderName` | `nvarchar(64)` | `"G"`, `"T"`, or `"U"`. |
+| `ProviderKey` | `nvarchar(64)` | Tenant id, user id, or `null` for global. |
+| `CreationTime` / `CreatorId` / `LastModificationTime` / `LastModifierId` / `IsDeleted` / ... | varies | Standard `FullAuditedAggregateRoot` columns via `ConfigureByConvention()`. |
+
+A unique index on `(Name, ProviderName, ProviderKey)` is what allows `ISettingRepository.FindAsync(name, providerName, providerKey)` to be O(log n). The full schema details are on [EF Core & MongoDB](/modules/setting-management/efcore-mongodb#schema).
+
+## Quick API cheatsheet
+
+The most common things you'll write against this module from your own code:
+
+```csharp
+// Read (through the framework chain, U → T → G → C → D).
+private readonly ISettingProvider _settingProvider; // from ApplicationService base
+var maxItems = Convert.ToInt32(await _settingProvider.GetOrNullAsync("MyApp.MaxItemsPerPage"));
+
+// Write a global value (host scope).
+private readonly ISettingManager _settingManager;
+await _settingManager.SetGlobalAsync("MyApp.MaxItemsPerPage", "50");
+
+// Write a value for the current tenant.
+await _settingManager.SetForCurrentTenantAsync("MyApp.MaxItemsPerPage", "25");
+
+// Write a value for a specific user.
+await _settingManager.SetForUserAsync(userId, "MyApp.Theme", "dark");
+
+// Read the raw stored value at a specific scope (no fallback).
+var tenantOverride = await _settingManager.GetOrNullForCurrentTenantAsync(
+    "MyApp.MaxItemsPerPage", fallback: false);
+
+// Delete every setting for a user (used by UserDeletedEventHandler).
+await _settingManager.DeleteAsync(UserSettingValueProvider.ProviderName, userId.ToString());
+```
+
+The `Set...Async` and `Get...Async` extensions live in `GlobalSettingManagerExtensions`, `TenantSettingManagerExtensions`, and `UserSettingManagerExtensions` — covered on the [Domain layer](/modules/setting-management/domain#isettingmanager-and-settingmanager) page.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="database" href="/modules/setting-management/domain">
+    The `Setting` aggregate, repository contract, store, the five management providers, the manager, dynamic store, and encryption service.
+  </Card>
+  <Card title="Application layer" icon="layer-group" href="/modules/setting-management/application">
+    `EmailSettingsAppService`, `TimeZoneSettingsAppService`, feature checks, permissions.
+  </Card>
+  <Card title="HTTP API & client proxies" icon="cloud" href="/modules/setting-management/http-api">
+    `/api/setting-management/emailing`, `/api/setting-management/timezone`, and the generated client proxies.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-restore" href="/modules/setting-management/web-and-blazor">
+    The Administration → Settings page, the contributor model, and how to add your own tab.
+  </Card>
+  <Card title="EF Core & MongoDB" icon="server" href="/modules/setting-management/efcore-mongodb">
+    Schema, repositories, indexes, connection-string naming.
+  </Card>
+  <Card title="Framework setting infrastructure" icon="book" href="/security/settings">
+    `SettingDefinition`, `ISettingProvider`, the value-provider chain that this module fills in.
+  </Card>
+</CardGroup>

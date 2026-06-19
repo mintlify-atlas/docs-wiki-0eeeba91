@@ -1,0 +1,346 @@
+---
+title: "Azure Service Bus Event Bus: Topic & Subscriptions"
+sidebarTitle: "Azure Service Bus"
+description: "Configure AzureDistributedEventBus: topic, subscription, message Subject as event name, batched outbox publication and at-least-once delivery."
+---
+
+`Volo.Abp.EventBus.Azure` plugs ABP's distributed event bus into Azure Service Bus. The implementation uses a single topic for all events with the event name carried as the message `Subject`, one subscription per service for filtered delivery, and Service Bus batches for efficient outbox publication.
+
+All sources for this page live under `framework/src/Volo.Abp.EventBus.Azure/`. Connection management, publisher and consumer factories come from `Volo.Abp.AzureServiceBus`.
+
+## Package layout
+
+```text
+framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/
+├── AbpAzureEventBusOptions.cs
+├── AbpEventBusAzureModule.cs
+└── AzureDistributedEventBus.cs
+```
+
+## `AzureDistributedEventBus`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AzureDistributedEventBus.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IDistributedEventBus), typeof(AzureDistributedEventBus))]
+public class AzureDistributedEventBus : DistributedEventBusBase, ISingletonDependency
+{
+    protected AbpAzureEventBusOptions Options { get; }
+    protected IAzureServiceBusMessageConsumerFactory MessageConsumerFactory { get; }
+    protected IPublisherPool PublisherPool { get; }
+    protected IAzureServiceBusSerializer Serializer { get; }
+    protected ConcurrentDictionary<Type, List<IEventHandlerFactory>> HandlerFactories { get; }
+    protected ConcurrentDictionary<string, Type> EventTypes { get; }
+    protected IAzureServiceBusMessageConsumer Consumer { get; private set; } = default!;
+}
+```
+
+The bus delegates connection management to `Volo.Abp.AzureServiceBus` — `IPublisherPool` returns cached `ServiceBusSender` instances, and `IAzureServiceBusMessageConsumerFactory` creates a long-polling consumer over a subscription.
+
+## `AbpAzureEventBusOptions`
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AbpAzureEventBusOptions.cs
+public class AbpAzureEventBusOptions
+{
+    public string? ConnectionName { get; set; }
+
+    public string SubscriberName { get; set; } = default!;
+
+    public string TopicName { get; set; } = default!;
+
+    public bool IsServiceBusDisabled { get; set; }
+}
+```
+
+| Property | Purpose |
+| --- | --- |
+| `ConnectionName` | Selects an entry in `AbpAzureServiceBusOptions.Connections`. `null` uses the default. |
+| `TopicName` | Single Service Bus topic that receives every event. |
+| `SubscriberName` | Subscription name for this service. One per service so each gets its own copy. |
+| `IsServiceBusDisabled` | When true, `OnApplicationInitialization` skips `Initialize()` — handy for local development without an Azure connection. |
+
+`appsettings.json`:
+
+```json
+{
+  "Azure": {
+    "ServiceBus": {
+      "Connections": {
+        "Default": {
+          "ConnectionString": "Endpoint=sb://..."
+        }
+      }
+    },
+    "EventBus": {
+      "TopicName":     "MyApp.Events",
+      "SubscriberName": "MyApp.OrdersService"
+    }
+  }
+}
+```
+
+## Module
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AbpEventBusAzureModule.cs
+[DependsOn(typeof(AbpEventBusModule), typeof(AbpAzureServiceBusModule))]
+public class AbpEventBusAzureModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpAzureEventBusOptions>(configuration.GetSection("Azure:EventBus"));
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider
+            .GetRequiredService<IOptions<AbpAzureEventBusOptions>>().Value;
+
+        if (!options.IsServiceBusDisabled)
+        {
+            context.ServiceProvider
+                .GetRequiredService<AzureDistributedEventBus>()
+                .Initialize();
+        }
+    }
+}
+```
+
+## Initialization
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AzureDistributedEventBus.cs
+public void Initialize()
+{
+    Consumer = MessageConsumerFactory.CreateMessageConsumer(
+        Options.TopicName,
+        Options.SubscriberName,
+        Options.ConnectionName);
+
+    Consumer.OnMessageReceived(ProcessEventAsync);
+    SubscribeHandlers(AbpDistributedEventBusOptions.Handlers);
+}
+```
+
+The factory ensures the topic and subscription exist (using the Service Bus management SDK) before opening a `ServiceBusReceiver`. `SubscribeHandlers` registers every `IDistributedEventHandler<T>` from the type list so messages route by name.
+
+## Publishing
+
+`PublishToEventBusAsync` translates a typed event into a Service Bus message and sends it.
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AzureDistributedEventBus.cs
+protected async override Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    await PublishAsync(EventNameAttribute.GetNameOrDefault(eventType), eventData);
+}
+
+protected virtual Task PublishAsync(string eventName, object eventData)
+{
+    var body = Serializer.Serialize(eventData);
+    return PublishAsync(eventName, body, CorrelationIdProvider.Get(), null);
+}
+
+protected virtual async Task PublishAsync(
+    string eventName,
+    byte[] body,
+    string? correlationId,
+    Guid? eventId)
+{
+    var message = new ServiceBusMessage(body) { Subject = eventName };
+
+    if (message.MessageId.IsNullOrWhiteSpace())
+    {
+        message.MessageId = (eventId ?? GuidGenerator.Create()).ToString("N");
+    }
+    message.CorrelationId = correlationId;
+
+    var publisher = await PublisherPool.GetAsync(Options.TopicName, Options.ConnectionName);
+    await publisher.SendMessageAsync(message);
+}
+```
+
+- `Subject` carries the event name. Consumers route on it.
+- `MessageId` becomes the inbox dedup key.
+- `CorrelationId` propagates the ABP correlation id end-to-end.
+
+### Batched publication from outbox
+
+`PublishManyFromOutboxAsync` uses a `ServiceBusMessageBatch` for throughput:
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AzureDistributedEventBus.cs
+public async override Task PublishManyFromOutboxAsync(
+    IEnumerable<OutgoingEventInfo> outgoingEvents, OutboxConfig outboxConfig)
+{
+    var outgoingEventArray = outgoingEvents.ToArray();
+
+    var publisher = await PublisherPool.GetAsync(Options.TopicName, Options.ConnectionName);
+    using var messageBatch = await publisher.CreateMessageBatchAsync();
+
+    foreach (var outgoingEvent in outgoingEventArray)
+    {
+        var message = new ServiceBusMessage(outgoingEvent.EventData)
+        {
+            Subject = outgoingEvent.EventName
+        };
+
+        if (message.MessageId.IsNullOrWhiteSpace())
+        {
+            message.MessageId = outgoingEvent.Id.ToString();
+        }
+
+        message.CorrelationId = outgoingEvent.GetCorrelationId();
+
+        if (!messageBatch.TryAddMessage(message))
+        {
+            throw new AbpException(
+                "The message is too large to fit in the batch. Set AbpEventBusBoxesOptions.OutboxWaitingEventMaxCount to reduce the number");
+        }
+    }
+
+    await publisher.SendMessagesAsync(messageBatch);
+}
+```
+
+If a batch overflows the 256 KB / 1 MB Service Bus message-batch limit, the bus throws an `AbpException` directing you to lower `AbpEventBusBoxesOptions.OutboxWaitingEventMaxCount`.
+
+### Direct publication from outbox
+
+```csharp
+public async override Task PublishFromOutboxAsync(
+    OutgoingEventInfo outgoingEvent, OutboxConfig outboxConfig)
+{
+    await PublishAsync(outgoingEvent.EventName, outgoingEvent.EventData,
+        outgoingEvent.GetCorrelationId(), outgoingEvent.Id);
+
+    using (CorrelationIdProvider.Change(outgoingEvent.GetCorrelationId()))
+    {
+        await TriggerDistributedEventSentAsync(new DistributedEventSent()
+        {
+            Source = DistributedEventSource.Outbox,
+            EventName = outgoingEvent.EventName,
+            EventData = outgoingEvent.EventData
+        });
+    }
+}
+```
+
+Used when `AbpEventBusBoxesOptions.BatchPublishOutboxEvents` is false.
+
+## Consuming
+
+```csharp
+// framework/src/Volo.Abp.EventBus.Azure/Volo/Abp/EventBus/Azure/AzureDistributedEventBus.cs
+private async Task ProcessEventAsync(ServiceBusReceivedMessage message)
+{
+    var eventName = message.Subject;
+    if (eventName == null) return;
+
+    var eventType = EventTypes.GetOrDefault(eventName);
+    if (eventType == null) return;
+
+    var eventData = Serializer.Deserialize(message.Body.ToArray(), eventType);
+
+    if (await AddToInboxAsync(message.MessageId, eventName, eventType, eventData, message.CorrelationId))
+    {
+        return;
+    }
+
+    using (CorrelationIdProvider.Change(message.CorrelationId))
+    {
+        await TriggerHandlersDirectAsync(eventType, eventData);
+    }
+}
+```
+
+Flow:
+
+1. Resolve event type from `Subject`.
+2. Deserialize body bytes.
+3. Try the inbox. If accepted, the message completes on Service Bus and the inbox processor takes over.
+4. Otherwise, fire handlers immediately.
+
+The `IAzureServiceBusMessageConsumer` from `Volo.Abp.AzureServiceBus` uses the SDK's `ServiceBusProcessor` underneath, so message completion / abandonment is handled automatically based on whether `ProcessEventAsync` throws.
+
+## Topic / subscription layout
+
+<AccordionGroup>
+  <Accordion title="One topic per environment">
+    All services publish into and read from the same topic (`MyApp.Events`). This is the simplest layout and keeps the routing model uniform with RabbitMQ and Kafka adapters.
+  </Accordion>
+  <Accordion title="One subscription per service">
+    `SubscriberName` is the Service Bus subscription. Service Bus copies each topic message into every subscription, so each `SubscriberName` gets a private queue.
+  </Accordion>
+  <Accordion title="Server-side filters for noise reduction">
+    Create SQL or correlation filters on the subscription (outside ABP) to drop events you do not handle. The bus still tolerates unknown events — `EventTypes.GetOrDefault(eventName)` returns null and the message is acked — but filtering at the broker saves bandwidth.
+  </Accordion>
+  <Accordion title="Sessions for ordering">
+    The default consumer is not session-aware. If you need per-aggregate ordering, use a session-enabled subscription and override `PublishAsync` to set `SessionId`.
+  </Accordion>
+</AccordionGroup>
+
+## Worked example
+
+```csharp
+[DependsOn(typeof(AbpEventBusAzureModule))]
+public class OrdersModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAzureServiceBusOptions>(o =>
+        {
+            o.Connections.Default.ConnectionString =
+                context.Services.GetConfiguration()["Azure:ServiceBus:Default"];
+        });
+
+        Configure<AbpAzureEventBusOptions>(o =>
+        {
+            o.TopicName      = "MyApp.Events";
+            o.SubscriberName = "MyApp.OrdersService";
+        });
+
+        Configure<AbpDistributedEventBusOptions>(o =>
+        {
+            o.Outboxes.Configure(c => c.UseDbContext<OrdersDbContext>());
+            o.Inboxes.Configure(c => c.UseDbContext<OrdersDbContext>());
+        });
+    }
+}
+
+[EventName("orders.order_placed.v1")]
+public class OrderPlacedEto
+{
+    public Guid OrderId { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class NotifyShippingHandler
+    : IDistributedEventHandler<OrderPlacedEto>, ITransientDependency
+{
+    private readonly IShippingService _shipping;
+    public NotifyShippingHandler(IShippingService shipping) => _shipping = shipping;
+
+    public Task HandleEventAsync(OrderPlacedEto eventData)
+        => _shipping.ScheduleAsync(eventData.OrderId);
+}
+```
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Distributed Event Bus" icon="network-wired" href="/eventbus/distributed-event-bus">
+    Outbox/inbox machinery this bus reuses.
+  </Card>
+  <Card title="Background workers" icon="gears" href="/background/overview">
+    `OutboxSenderManager` calls `PublishManyFromOutboxAsync` periodically.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    Outbox rows commit with the business write.
+  </Card>
+  <Card title="Publication flow" icon="diagram-project" href="/flows/distributed-event-publish-consume">
+    End-to-end view of an Azure Service Bus publish.
+  </Card>
+</CardGroup>

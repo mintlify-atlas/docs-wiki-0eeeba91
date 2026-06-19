@@ -1,0 +1,404 @@
+---
+title: "IdentityModel — Token Acquisition With Distributed Cache"
+sidebarTitle: "IdentityModel"
+description: "Volo.Abp.IdentityModel: Duende-based client_credentials, password and device-code flows with IDistributedCache token caching and per-tenant client lookup."
+---
+
+`Volo.Abp.IdentityModel` is ABP's wrapper around the [Duende `IdentityModel`](https://duendesoftware.com/products/identitymodel) library — the canonical .NET client for OpenID Connect / OAuth 2.0. It takes a strongly-typed `IdentityClientConfiguration` (authority, client id/secret, scope, grant type) and produces a bearer access token that the rest of ABP attaches to outbound HTTP calls. The package caches both the discovery document and the access token in `IDistributedCache`, picks the right configuration for the current tenant, and supports the three flows backend services actually use: `client_credentials`, `password`, and `device_code`.
+
+Module path: `framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/`.
+
+## `AbpIdentityModelModule`
+
+The module configures the named `HttpClient` Duende uses to talk to the authority and registers the distributed cache entries for both the token and the discovery document. The detailed wiring lives in the module class — the important consequence is that `IIdentityModelAuthenticationService` becomes a `ITransientDependency` available to any caller.
+
+## `IIdentityModelAuthenticationService`
+
+```csharp
+public interface IIdentityModelAuthenticationService
+{
+    Task<bool> TryAuthenticateAsync(
+        [NotNull] HttpClient client,
+        string? identityClientName = null);
+
+    Task<string> GetAccessTokenAsync(
+        IdentityClientConfiguration configuration);
+}
+```
+
+Two flavors:
+
+- `TryAuthenticateAsync(client, name)` — looks up the named configuration, fetches/refreshes the token, and **mutates** the supplied `HttpClient` by setting `DefaultRequestHeaders.Authorization`. Returns `false` if no matching configuration exists.
+- `GetAccessTokenAsync(config)` — pure: returns just the token string for a given configuration, so callers that don't want a `HttpClient` mutated (e.g. SignalR with a custom access-token factory) can use it directly.
+
+## `IdentityModelAuthenticationService`
+
+The shipped implementation. Key fields:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class IdentityModelAuthenticationService : IIdentityModelAuthenticationService, ITransientDependency
+{
+    public const string HttpClientName = "IdentityModelAuthenticationServiceHttpClientName";
+
+    protected AbpIdentityClientOptions ClientOptions { get; }
+    protected ICancellationTokenProvider CancellationTokenProvider { get; }
+    protected IHttpClientFactory HttpClientFactory { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+    protected IdentityModelHttpRequestMessageOptions IdentityModelHttpRequestMessageOptions { get; }
+    protected IDistributedCache<IdentityModelTokenCacheItem> TokenCache { get; }
+    protected IDistributedCache<IdentityModelDiscoveryDocumentCacheItem> DiscoveryDocumentCache { get; }
+    protected IAbpHostEnvironment AbpHostEnvironment { get; }
+}
+```
+
+### `TryAuthenticateAsync` and `GetAccessTokenAsync`
+
+```csharp
+public async Task<bool> TryAuthenticateAsync(
+    [NotNull] HttpClient client,
+    string? identityClientName = null)
+{
+    var accessToken = await GetAccessTokenOrNullAsync(identityClientName);
+    if (accessToken == null) return false;
+
+    SetAccessToken(client, accessToken);
+    return true;
+}
+
+protected virtual async Task<string?> GetAccessTokenOrNullAsync(string? identityClientName)
+{
+    var configuration = ClientOptions.GetClientConfiguration(CurrentTenant, identityClientName);
+    if (configuration == null)
+    {
+        Logger.LogWarning(
+            $"Could not find {nameof(IdentityClientConfiguration)} for {identityClientName}. " +
+            $"Either define a configuration for {identityClientName} or set a default configuration.");
+        return null;
+    }
+    return await GetAccessTokenAsync(configuration);
+}
+
+public virtual async Task<string> GetAccessTokenAsync(IdentityClientConfiguration configuration)
+{
+    var cacheKey = CalculateTokenCacheKey(configuration);
+    var tokenCacheItem = await TokenCache.GetAsync(cacheKey);
+    if (tokenCacheItem == null)
+    {
+        var tokenResponse = await GetTokenResponse(configuration);
+        if (tokenResponse.IsError) { /* throw AbpException */ }
+
+        tokenCacheItem = new IdentityModelTokenCacheItem(tokenResponse.AccessToken!);
+        await TokenCache.SetAsync(cacheKey, tokenCacheItem, new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = AbpHostEnvironment.IsDevelopment()
+                ? TimeSpan.FromSeconds(5)
+                : TimeSpan.FromSeconds(configuration.CacheAbsoluteExpiration)
+        });
+    }
+    return tokenCacheItem.AccessToken;
+}
+
+protected virtual void SetAccessToken(HttpClient client, string accessToken)
+{
+    //TODO: "Bearer" should be configurable
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+}
+```
+
+<Info>
+In `Development`, tokens are cached for only 5 seconds so you can change clients/scopes in `appsettings.json` and see the new token used almost immediately. Production uses `IdentityClientConfiguration.CacheAbsoluteExpiration` (default 1800 seconds).
+</Info>
+
+### Discovery document cache
+
+```csharp
+protected virtual async Task<IdentityModelDiscoveryDocumentCacheItem> GetDiscoveryResponse(
+    IdentityClientConfiguration configuration)
+{
+    var tokenEndpointUrlCacheKey = CalculateDiscoveryDocumentCacheKey(configuration);
+    var discoveryDocumentCacheItem = await DiscoveryDocumentCache.GetAsync(tokenEndpointUrlCacheKey);
+    if (discoveryDocumentCacheItem == null)
+    {
+        DiscoveryDocumentResponse discoveryResponse;
+        using (var httpClient = HttpClientFactory.CreateClient(HttpClientName))
+        {
+            var request = new DiscoveryDocumentRequest
+            {
+                Address = configuration.Authority,
+                Policy =
+                {
+                    RequireHttps = configuration.RequireHttps,
+                    ValidateIssuerName = configuration.ValidateIssuerName,
+                    ValidateEndpoints = configuration.ValidateEndpoints
+                }
+            };
+            IdentityModelHttpRequestMessageOptions.ConfigureHttpRequestMessage?.Invoke(request);
+            discoveryResponse = await httpClient.GetDiscoveryDocumentAsync(request);
+        }
+
+        if (discoveryResponse.IsError) { /* throw */ }
+
+        discoveryDocumentCacheItem = new IdentityModelDiscoveryDocumentCacheItem(
+            discoveryResponse.TokenEndpoint!,
+            discoveryResponse.DeviceAuthorizationEndpoint!);
+        await DiscoveryDocumentCache.SetAsync(tokenEndpointUrlCacheKey, discoveryDocumentCacheItem,
+            new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = AbpHostEnvironment.IsDevelopment()
+                    ? TimeSpan.FromSeconds(5)
+                    : TimeSpan.FromSeconds(configuration.CacheAbsoluteExpiration)
+            });
+    }
+    return discoveryDocumentCacheItem;
+}
+```
+
+The discovery document is cached separately because (a) it has its own TTL story, (b) reusing it across token requests halves the network round-trips when the access-token cache expires.
+
+### Grant types
+
+```csharp
+protected virtual async Task<TokenResponse> GetTokenResponse(IdentityClientConfiguration configuration)
+{
+    using (var httpClient = HttpClientFactory.CreateClient(HttpClientName))
+    {
+        AddHeaders(httpClient);
+        switch (configuration.GrantType)
+        {
+            case OidcConstants.GrantTypes.ClientCredentials:
+                return await httpClient.RequestClientCredentialsTokenAsync(
+                    await CreateClientCredentialsTokenRequestAsync(configuration),
+                    CancellationTokenProvider.Token);
+
+            case OidcConstants.GrantTypes.Password:
+                return await httpClient.RequestPasswordTokenAsync(
+                    await CreatePasswordTokenRequestAsync(configuration),
+                    CancellationTokenProvider.Token);
+
+            case OidcConstants.GrantTypes.DeviceCode:
+                return await RequestDeviceAuthorizationAsync(httpClient, configuration);
+
+            default:
+                throw new AbpException("Grant type was not implemented: " + configuration.GrantType);
+        }
+    }
+}
+```
+
+#### `client_credentials`
+
+```csharp
+protected virtual async Task<ClientCredentialsTokenRequest> CreateClientCredentialsTokenRequestAsync(
+    IdentityClientConfiguration configuration)
+{
+    var discoveryResponse = await GetDiscoveryResponse(configuration);
+    var request = new ClientCredentialsTokenRequest
+    {
+        Address      = discoveryResponse.TokenEndpoint,
+        Scope        = configuration.Scope,
+        ClientId     = configuration.ClientId,
+        ClientSecret = configuration.ClientSecret
+    };
+    IdentityModelHttpRequestMessageOptions.ConfigureHttpRequestMessage?.Invoke(request);
+    await AddParametersToRequestAsync(configuration, request);
+    return request;
+}
+```
+
+Used for **machine-to-machine** outbound calls — the most common case in a microservice mesh.
+
+#### `password`
+
+```csharp
+protected virtual async Task<PasswordTokenRequest> CreatePasswordTokenRequestAsync(
+    IdentityClientConfiguration configuration)
+{
+    var discoveryResponse = await GetDiscoveryResponse(configuration);
+    var request = new PasswordTokenRequest
+    {
+        Address      = discoveryResponse.TokenEndpoint,
+        Scope        = configuration.Scope,
+        ClientId     = configuration.ClientId,
+        ClientSecret = configuration.ClientSecret,
+        UserName     = configuration.UserName!,
+        Password     = configuration.UserPassword
+    };
+    IdentityModelHttpRequestMessageOptions.ConfigureHttpRequestMessage?.Invoke(request);
+    await AddParametersToRequestAsync(configuration, request);
+    return request;
+}
+```
+
+Used by trusted CLIs and the ABP test suite — the resource-owner password flow is *not* recommended for browser-facing apps.
+
+#### `device_code`
+
+```csharp
+protected virtual async Task<TokenResponse> RequestDeviceAuthorizationAsync(
+    HttpClient httpClient, IdentityClientConfiguration configuration)
+{
+    var discoveryResponse = await GetDiscoveryResponse(configuration);
+    var request = new DeviceAuthorizationRequest()
+    {
+        Address      = discoveryResponse.DeviceAuthorizationEndpoint,
+        Scope        = configuration.Scope,
+        ClientId     = configuration.ClientId,
+        ClientSecret = configuration.ClientSecret,
+    };
+    IdentityModelHttpRequestMessageOptions.ConfigureHttpRequestMessage?.Invoke(request);
+    await AddParametersToRequestAsync(configuration, request);
+
+    var response = await httpClient.RequestDeviceAuthorizationAsync(request);
+    if (response.IsError) throw new AbpException(response.ErrorDescription);
+
+    Logger.LogInformation($"Open your browser, go to: \"{response.VerificationUri}\"");
+    Logger.LogInformation($"and enter the following one-time code:");
+    Logger.LogInformation(response.UserCode);
+
+    for (var i = 0; i < ((response.ExpiresIn ?? 300) / response.Interval + 1); i++)
+    {
+        await Task.Delay(response.Interval * 1000);
+        // poll /token with DeviceTokenRequest until success or expiry
+    }
+    // ...
+}
+```
+
+This is the flow used by the ABP CLI to log in: print a verification URI + code, then poll until the user completes the browser sign-in.
+
+<Note>
+Refresh-token-based renewal isn't a separate code path here — when the cached `IdentityModelTokenCacheItem` expires, the service simply re-requests a new token using the same configured grant. For service-to-service calls (`client_credentials`), that's correct. For interactive user flows you should rely on the host (Web cookie / WASM `IAccessTokenProvider` / MAUI secure storage) — see [Http.Client.IdentityModel](/http/http-client-identitymodel).
+</Note>
+
+## `AbpIdentityClientOptions`
+
+The configuration container — typically bound from `appsettings.json`:
+
+```csharp
+public class AbpIdentityClientOptions
+{
+    public IdentityClientConfigurationDictionary IdentityClients { get; set; }
+
+    public AbpIdentityClientOptions()
+    {
+        IdentityClients = new IdentityClientConfigurationDictionary();
+    }
+
+    public IdentityClientConfiguration? GetClientConfiguration(
+        ICurrentTenant currentTenant, string? identityClientName = null)
+    {
+        if (identityClientName.IsNullOrWhiteSpace())
+        {
+            identityClientName = IdentityClientConfigurationDictionary.DefaultName;
+        }
+
+        if (currentTenant.Id.HasValue)
+        {
+            var tenantConfiguration = IdentityClients.FirstOrDefault(
+                x => x.Key == $"{identityClientName}.{currentTenant.Id}");
+            if (tenantConfiguration.Key == null && !currentTenant.Name.IsNullOrWhiteSpace())
+            {
+                tenantConfiguration = IdentityClients.FirstOrDefault(
+                    x => x.Key == $"{identityClientName}.{currentTenant.Name}");
+            }
+            if (tenantConfiguration.Key != null) return tenantConfiguration.Value;
+        }
+
+        return IdentityClients.GetOrDefault(identityClientName!) ?? IdentityClients.Default;
+    }
+}
+```
+
+The lookup order is:
+
+1. `"{name}.{tenantId}"` — host-defined tenant override by Guid.
+2. `"{name}.{tenantName}"` — host-defined tenant override by name.
+3. `"{name}"` — the named identity client.
+4. `IdentityClients.Default` — the catch-all.
+
+This is how the same outbound call gets *different* credentials when the current tenant changes (some tenants bring their own IdP).
+
+## `IdentityClientConfiguration`
+
+```csharp
+public class IdentityClientConfiguration : Dictionary<string, string?>
+{
+    public string  GrantType   { get; set; }   // OidcConstants.GrantTypes.*
+    public string  ClientId    { get; set; }
+    public string  ClientSecret{ get; set; }
+    public string? UserName    { get; set; }   // password grant
+    public string? UserPassword{ get; set; }   // password grant
+    public string  Authority   { get; set; }
+    public string  Scope       { get; set; }
+    public bool    RequireHttps           { get; set; } = true;
+    public int     CacheAbsoluteExpiration{ get; set; } = 60 * 30;
+    public bool    ValidateIssuerName     { get; set; } = true;
+    public bool    ValidateEndpoints      { get; set; } = true;
+}
+```
+
+A dictionary-backed type so that extra keys round-trip through `IConfiguration` unchanged. `CacheAbsoluteExpiration` defaults to 30 minutes — usually less than the token's actual lifetime, which makes "auto-refresh" the normal path under steady-state load.
+
+## `IdentityModelTokenCacheItem`
+
+```csharp
+[Serializable]
+public class IdentityModelTokenCacheItem
+{
+    public string AccessToken { get; set; } = default!;
+
+    public IdentityModelTokenCacheItem() { }
+    public IdentityModelTokenCacheItem(string accessToken) { AccessToken = accessToken; }
+
+    public static string CalculateCacheKey(IdentityClientConfiguration configuration)
+    {
+        return string.Join(",", configuration.Select(x => x.Key + ":" + x.Value)).ToSha256();
+    }
+}
+```
+
+The cache key is a SHA-256 of the *whole* configuration dictionary — so if you change the scope or the client secret, you get a *new* cache entry instead of poisoning the existing one.
+
+## `IdentityModelHttpRequestMessageOptions`
+
+```csharp
+public class IdentityModelHttpRequestMessageOptions
+{
+    public Action<HttpRequestMessage>? ConfigureHttpRequestMessage { get; set; }
+}
+```
+
+Hook every outbound OIDC request (discovery, token, device-token) so you can stamp headers like correlation ids or routing hints.
+
+## Example: `appsettings.json`
+
+```json
+{
+  "IdentityClients": {
+    "Default": {
+      "GrantType":    "client_credentials",
+      "ClientId":     "web-service",
+      "ClientSecret": "1q2w3e*",
+      "Authority":    "https://identity.acme.com",
+      "Scope":        "BookService"
+    },
+    "Default.acme-eu": {
+      "GrantType":    "client_credentials",
+      "ClientId":     "web-service-eu",
+      "ClientSecret": "1q2w3e*",
+      "Authority":    "https://identity-eu.acme.com",
+      "Scope":        "BookService"
+    }
+  }
+}
+```
+
+With the configuration above, requests in the host tenant use `web-service` against `identity.acme.com`; requests in the `acme-eu` tenant transparently switch to `web-service-eu` against `identity-eu.acme.com`.
+
+## Related
+
+- [Http.Client.IdentityModel](/http/http-client-identitymodel) — uses this package to attach bearer tokens to outbound `HttpClient` calls.
+- [Auth — OpenID Connect](/aspnetcore/auth-openidconnect) — server-side interactive flow used by browser apps.
+- [Auth — JWT Bearer](/aspnetcore/auth-jwt-bearer) — resource-server side that validates the tokens issued here.
+- [Dynamic HTTP API and Proxy Generation](/aspnetcore/mvc-controllers-and-conventions) — end-to-end flow.

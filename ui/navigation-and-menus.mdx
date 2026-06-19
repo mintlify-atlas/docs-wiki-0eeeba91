@@ -1,0 +1,360 @@
+---
+title: "Navigation and menus"
+sidebarTitle: "Navigation & menus"
+description: "Volo.Abp.UI.Navigation — IMenuManager, IMenuContributor, ApplicationMenu, ApplicationMenuItem, ApplicationMenuGroup, StandardMenus.Main, plus the related IToolbarManager / IToolbarContributor in Theme.Shared."
+---
+
+`Volo.Abp.UI.Navigation` is the UI-agnostic package that owns the **menu** model used by every ABP theme — MVC, Blazor, Angular, MAUI Blazor. A menu is `ApplicationMenu` (a tree of `ApplicationMenuItem`s, optionally grouped by `ApplicationMenuGroup`), produced by a pipeline of `IMenuContributor`s and resolved through `IMenuManager`. Permissions are evaluated lazily against the current user, so the same contributor code produces a different result for an admin and an anonymous visitor.
+
+The closely related **toolbar** pipeline (`IToolbarManager` / `IToolbarContributor`) lives in `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared` and is covered at the bottom of this page because in practice the two are configured side-by-side.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/
+├── AbpUiNavigationModule.cs
+├── AbpNavigationOptions.cs               # List<IMenuContributor>, MainMenuNames
+├── ApplicationMenu.cs                    # The root
+├── ApplicationMenuItem.cs                # Tree nodes (Name, DisplayName, Url, Icon, Order, ...)
+├── ApplicationMenuItemList.cs
+├── ApplicationMenuGroup.cs
+├── ApplicationMenuGroupList.cs
+├── ApplicationMenuExtensions.cs
+├── DefaultMenuContributor.cs             # Seeds the Administration item
+├── DefaultMenuNames.cs                   # "Abp.Application.Main.Administration"
+├── HasMenuItemsExtensions.cs
+├── IHasMenuItems.cs
+├── IHasMenuGroups.cs
+├── IMenuConfigurationContext.cs
+├── IMenuContributor.cs
+├── IMenuManager.cs
+├── MenuConfigurationContext.cs
+├── MenuManager.cs                        # Default IMenuManager
+├── StandardMenus.cs                      # "Main", "User", "Shortcut"
+├── Localization/Resource/                # AbpUiNavigationResource
+└── Urls/
+```
+
+## The model
+
+```csharp
+// ApplicationMenu.cs
+public class ApplicationMenu : IHasMenuItems, IHasMenuGroups
+{
+    [NotNull] public string Name { get; }
+    [NotNull] public string DisplayName { get; set; }
+    [NotNull] public ApplicationMenuItemList Items { get; }
+    [NotNull] public ApplicationMenuGroupList Groups { get; }
+    [NotNull] public Dictionary<string, object> CustomData { get; } = new();
+
+    public ApplicationMenu(string name, string? displayName = null) { ... }
+
+    public ApplicationMenu AddItem(ApplicationMenuItem menuItem) { Items.Add(menuItem); return this; }
+    public ApplicationMenu AddGroup(ApplicationMenuGroup group)  { Groups.Add(group); return this; }
+    public ApplicationMenu WithCustomData(string key, object value) { ... }
+}
+```
+
+A menu item is a tree node — it can have its own `Items`, so a top-level "Administration" item can contain "Identity Management", which contains "Users" and "Roles":
+
+```csharp
+// ApplicationMenuItem.cs (essentials)
+public class ApplicationMenuItem : IHasMenuItems, IHasSimpleStateCheckers<ApplicationMenuItem>
+{
+    public const int DefaultOrder = 1000;
+
+    [NotNull] public string Name { get; }
+    [NotNull] public string DisplayName { get; set; }
+    public int     Order       { get; set; }
+    public string? Url         { get; set; }
+    public string? Icon        { get; set; }
+    public bool    IsLeaf      => Items.IsNullOrEmpty();
+    public string? Target      { get; set; }   // "_blank", "_self", ...
+    public bool    IsDisabled  { get; set; }
+    public string? ElementId   { get; set; }   // for DOM selection
+    public string? CssClass    { get; set; }
+    public string? GroupName   { get; set; }
+    public ApplicationMenuItemList Items { get; }
+    public List<ISimpleStateChecker<ApplicationMenuItem>> StateCheckers { get; }
+    public Dictionary<string, object> CustomData { get; } = new();
+}
+```
+
+Groups are flat, optional containers:
+
+```csharp
+// ApplicationMenuGroup.cs
+public class ApplicationMenuGroup
+{
+    public const int DefaultOrder = 1000;
+    [NotNull] public string Name { get; }
+    [NotNull] public string DisplayName { get; set; }
+    public string? ElementId { get; set; }
+    public int     Order     { get; set; }
+    public string? Icon      { get; set; }
+    public Dictionary<string, object> CustomData { get; } = new();
+}
+```
+
+Standard names you can target:
+
+```csharp
+public static class StandardMenus
+{
+    public const string Main     = "Main";
+    public const string User     = "User";
+    public const string Shortcut = "Shortcut";
+}
+
+public static class DefaultMenuNames
+{
+    public static class Application
+    {
+        public static class Main
+        {
+            public const string Administration = "Abp.Application.Main.Administration";
+        }
+    }
+}
+```
+
+## The pipeline
+
+`AbpNavigationOptions` is the registration point:
+
+```csharp
+public class AbpNavigationOptions
+{
+    [NotNull] public List<IMenuContributor> MenuContributors { get; }
+    public List<string> MainMenuNames { get; }   // defaults to ["Main"]
+
+    public AbpNavigationOptions()
+    {
+        MenuContributors = new List<IMenuContributor>();
+        MainMenuNames    = new List<string> { StandardMenus.Main };
+    }
+}
+```
+
+`IMenuContributor` is the single contributor contract:
+
+```csharp
+public interface IMenuContributor
+{
+    Task ConfigureMenuAsync(MenuConfigurationContext context);
+}
+```
+
+The default contributor seeds the `Administration` top-level item that every admin module hangs its sub-items off of:
+
+```csharp
+public class DefaultMenuContributor : IMenuContributor
+{
+    public Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        var l = context.GetLocalizer<AbpUiNavigationResource>();
+
+        if (context.Menu.Name == StandardMenus.Main)
+        {
+            context.Menu.AddItem(new ApplicationMenuItem(
+                DefaultMenuNames.Application.Main.Administration,
+                l["Menu:Administration"],
+                icon: "fa fa-wrench"));
+        }
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Registered by the module:
+
+```csharp
+[DependsOn(typeof(AbpUiModule), typeof(AbpAuthorizationModule), typeof(AbpMultiTenancyModule))]
+public class AbpUiNavigationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpUiNavigationModule>();
+        });
+
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new DefaultMenuContributor());
+        });
+    }
+}
+```
+
+## Writing your own contributor
+
+A contributor is plain code. The context exposes the current `ApplicationMenu`, a `ServiceProvider`, and helpers for localization and authorization:
+
+```csharp
+public class BookStoreMenuContributor : IMenuContributor
+{
+    public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main) return;
+
+        var l = context.GetLocalizer<BookStoreResource>();
+
+        context.Menu.AddItem(
+            new ApplicationMenuItem(
+                name: "BookStore",
+                displayName: l["Menu:BookStore"],
+                icon: "fa fa-book",
+                order: 2)
+                .AddItem(new ApplicationMenuItem(
+                    name: "BookStore.Books",
+                    displayName: l["Menu:Books"],
+                    url: "/Books")
+                    .RequirePermissions(BookStorePermissions.Books.Default))
+                .AddItem(new ApplicationMenuItem(
+                    name: "BookStore.Authors",
+                    displayName: l["Menu:Authors"],
+                    url: "/Authors")
+                    .RequirePermissions(BookStorePermissions.Authors.Default))
+        );
+    }
+}
+```
+
+Register it from your module:
+
+```csharp
+Configure<AbpNavigationOptions>(options =>
+{
+    options.MenuContributors.Add(new BookStoreMenuContributor());
+});
+```
+
+`RequirePermissions(...)` is a `HasSimpleStateCheckers<T>` extension. At render time `MenuManager` evaluates all state checkers and drops items the current user cannot access — see the next section.
+
+## The default `IMenuManager`
+
+```csharp
+public class MenuManager : IMenuManager, ITransientDependency
+{
+    public Task<ApplicationMenu> GetAsync(string name) => GetInternalAsync(name);
+
+    public Task<ApplicationMenu> GetMainMenuAsync()
+        => GetAsync(Options.MainMenuNames.ToArray());
+
+    protected virtual async Task<ApplicationMenu> GetAsync(params string[] menuNames)
+    {
+        if (menuNames.IsNullOrEmpty())
+            return new ApplicationMenu(StandardMenus.Main);
+
+        var menus = new List<ApplicationMenu>();
+        foreach (var menuName in Options.MainMenuNames)
+            menus.Add(await GetInternalAsync(menuName));
+
+        return MergeMenus(menus);
+    }
+
+    protected virtual async Task<ApplicationMenu> GetInternalAsync(string name)
+    {
+        var menu = new ApplicationMenu(name);
+
+        using (var scope = ServiceScopeFactory.CreateScope())
+        using (RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>.Use(
+                   new RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>()))
+        {
+            var context = new MenuConfigurationContext(menu, scope.ServiceProvider);
+
+            foreach (var contributor in Options.MenuContributors)
+                await contributor.ConfigureMenuAsync(context);
+
+            await CheckPermissionsAsync(scope.ServiceProvider, menu);
+        }
+
+        NormalizeMenu(menu);
+        NormalizeMenuGroup(menu);
+        return menu;
+    }
+}
+```
+
+Three things to notice:
+
+1. `GetMainMenuAsync()` reads `Options.MainMenuNames` — you can register **additional** main menus (for a multi-area app) by appending to that list.
+2. `CheckPermissionsAsync` walks the tree once, batches every item with `StateCheckers.Any()`, asks `ISimpleStateCheckerManager<ApplicationMenuItem>` whether each item is enabled, and removes the disabled ones (including their children).
+3. `NormalizeMenu` sorts each `Items` collection by `Order`, and `NormalizeMenuGroup` reconciles items whose `GroupName` no longer maps to a defined `ApplicationMenuGroup`.
+
+## Consuming the menu
+
+In MVC the `MenuViewComponent` (in the theme — see [/ui/basic-theme](/ui/basic-theme) `Themes/Basic/Components/Menu/`) calls:
+
+```csharp
+var menu = await _menuManager.GetMainMenuAsync();
+return View(menu);
+```
+
+In Blazor and Angular the same `IMenuManager` is bridged through the respective UI infrastructure.
+
+## Toolbars: `IToolbarManager` and `IToolbarContributor`
+
+The toolbar pipeline lives next door, in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/Toolbars/`, because it is MVC/Razor-specific (toolbar items are view component types). The shape is intentionally similar to the menu pipeline:
+
+```csharp
+public interface IToolbarContributor
+{
+    Task ConfigureToolbarAsync(IToolbarConfigurationContext context);
+}
+
+public interface IToolbarManager
+{
+    Task<Toolbar> GetAsync(string name);
+}
+
+public class AbpToolbarOptions
+{
+    [NotNull] public List<IToolbarContributor> Contributors { get; }
+}
+
+public static class StandardToolbars
+{
+    public const string Main = "Main";
+}
+```
+
+Register a contributor — typically per theme — like this:
+
+```csharp
+public class MyToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name != StandardToolbars.Main) return Task.CompletedTask;
+        if (!(context.Theme is BasicTheme))               return Task.CompletedTask;
+
+        context.Toolbar.Items.Add(new ToolbarItem(typeof(NotificationsViewComponent)));
+        return Task.CompletedTask;
+    }
+}
+
+Configure<AbpToolbarOptions>(options =>
+{
+    options.Contributors.Add(new MyToolbarContributor());
+});
+```
+
+Two patterns to copy from the Basic theme:
+
+- Check `context.Toolbar.Name` so secondary toolbars get a different set of items.
+- Check `context.Theme is XTheme` so a contributor lives safely in a process that hosts multiple themes.
+
+`ToolbarManager.GetAsync(...)` resolves contributors, then applies the same `RequirePermissionsSimpleBatchStateChecker<ToolbarItem>` permission filter the menu manager uses.
+
+For a deeper walk-through of the toolbar internals and the per-page `IPageToolbarManager` see [/ui/theme-shared](/ui/theme-shared).
+
+## Cross-references
+
+- The shared theme that surfaces the toolbar pipeline: [/ui/theme-shared](/ui/theme-shared).
+- The Basic theme's own toolbar contributor (`BasicThemeMainTopToolbarContributor`): [/ui/basic-theme](/ui/basic-theme).
+- The Bootstrap tag helpers used by the menu/toolbar partials: [/ui/bootstrap-theme](/ui/bootstrap-theme).
+- The Blazor side: [/blazor/theming](/blazor/theming).
+- The companion Basic theme module overview: [/modules/basic-theme/overview](/modules/basic-theme/overview).

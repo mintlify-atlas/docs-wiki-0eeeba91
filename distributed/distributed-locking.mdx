@@ -1,0 +1,595 @@
+---
+title: "Distributed Locking: IAbpDistributedLock & Handle Lifecycle"
+sidebarTitle: "Distributed Locking"
+description: "Acquire named distributed locks with IAbpDistributedLock, the Medallion default, the in-process LocalAbpDistributedLock and pluggable key normalization."
+---
+
+`Volo.Abp.DistributedLocking` is the **ABP Framework**'s minimal contract for cluster-wide mutual exclusion. It exists so application code can write `await using var handle = await _lock.TryAcquireAsync("orders:reservation");` without caring whether the underlying store is Redis, SQL Server, ZooKeeper, a Dapr lock component or just an in-process `SemaphoreSlim`. Two packages cooperate: the abstractions package defines the contract and a local fallback, and the main package replaces that fallback with a Medallion-backed implementation.
+
+## Source layout
+
+```text
+framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/
+├── AbpDistributedLockingAbstractionsModule.cs
+├── AbpDistributedLockOptions.cs
+├── DistributedLockKeyNormalizer.cs
+├── IAbpDistributedLock.cs
+├── IAbpDistributedLockHandle.cs
+├── IDistributedLockKeyNormalizer.cs
+├── LocalAbpDistributedLock.cs
+└── LocalAbpDistributedLockHandle.cs
+
+framework/src/Volo.Abp.DistributedLocking/Volo/Abp/DistributedLocking/
+├── AbpDistributedLockHandleExtensions.cs
+├── AbpDistributedLockingModule.cs
+├── MedallionAbpDistributedLock.cs
+└── MedallionAbpDistributedLockHandle.cs
+```
+
+The abstractions module is what most other ABP packages depend on (the distributed event bus, background workers, the BLOB storing module, …). The main module is only needed when you want the Medallion-backed default.
+
+## The contract
+
+`IAbpDistributedLock` is a single-method interface that returns a disposable handle:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/IAbpDistributedLock.cs
+public interface IAbpDistributedLock
+{
+    /// <summary>
+    /// Tries to acquire a named lock.
+    /// Returns a disposable object to release the lock.
+    /// It is suggested to use this method within a using block.
+    /// Returns null if the lock could not be handled.
+    /// </summary>
+    Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        [NotNull] string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default
+    );
+}
+```
+
+Two things matter here:
+
+1. The result is **nullable**. `null` means "the lock could not be acquired within the timeout"; callers must always check for it.
+2. The handle is `IAsyncDisposable`, not `IDisposable` — release is asynchronous because most providers round-trip to a store.
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/IAbpDistributedLockHandle.cs
+public interface IAbpDistributedLockHandle : IAsyncDisposable
+{
+}
+```
+
+<Note>
+`timeout = default` is `TimeSpan.Zero` — fail fast, no waiting. Pass a positive value to opt into blocking acquisition. Negative values are provider-specific; Medallion treats them as "wait forever".
+</Note>
+
+## Canonical usage
+
+The recommended pattern is `await using` so the handle is released even if your work throws:
+
+```csharp
+public class OrderReservationService : ITransientDependency
+{
+    private readonly IAbpDistributedLock _distributedLock;
+
+    public OrderReservationService(IAbpDistributedLock distributedLock)
+    {
+        _distributedLock = distributedLock;
+    }
+
+    public async Task ReserveAsync(Guid orderId, CancellationToken ct)
+    {
+        await using var handle = await _distributedLock.TryAcquireAsync(
+            name: $"order-reservation:{orderId}",
+            timeout: TimeSpan.FromSeconds(30),
+            cancellationToken: ct
+        );
+
+        if (handle is null)
+        {
+            throw new AbpException(
+                $"Could not acquire reservation lock for order {orderId} within 30s."
+            );
+        }
+
+        // critical section — cluster-wide mutual exclusion is held until disposal
+        await DoReservationAsync(orderId, ct);
+    }
+}
+```
+
+<Warning>
+Never store an `IAbpDistributedLockHandle` in a field across requests. The handle is bound to the underlying provider session — Medallion-Redis, for example, keeps a TCP connection. Acquire, use, dispose, all within one scope.
+</Warning>
+
+## Options and key normalization
+
+Lock names are routed through `IDistributedLockKeyNormalizer` before they hit the provider. Default behaviour is to prepend `AbpDistributedLockOptions.KeyPrefix`:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/AbpDistributedLockOptions.cs
+public class AbpDistributedLockOptions
+{
+    /// <summary>
+    /// DistributedLock key prefix.
+    /// </summary>
+    public string KeyPrefix { get; set; }
+
+    public AbpDistributedLockOptions()
+    {
+        KeyPrefix = "";
+    }
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/DistributedLockKeyNormalizer.cs
+public class DistributedLockKeyNormalizer : IDistributedLockKeyNormalizer, ITransientDependency
+{
+    protected AbpDistributedLockOptions Options { get; }
+
+    public DistributedLockKeyNormalizer(IOptions<AbpDistributedLockOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public virtual string NormalizeKey(string name)
+    {
+        return $"{Options.KeyPrefix}{name}";
+    }
+}
+```
+
+That tiny class has two big jobs: it gives multi-tenant or multi-app deployments **a namespace** in shared lock stores, and it's the extension point if you need to hash, lowercase, or sanitize names.
+
+<Tabs>
+  <Tab title="Per-service prefix">
+    ```csharp
+    Configure<AbpDistributedLockOptions>(options =>
+    {
+        options.KeyPrefix = "orders-svc:";
+    });
+    ```
+    All names become `orders-svc:<name>` — safe to share a single Redis database with other services.
+  </Tab>
+  <Tab title="Per-tenant prefix">
+    Replace the normalizer with one that pulls `ICurrentTenant`:
+
+    ```csharp
+    public class TenantAwareLockKeyNormalizer
+        : IDistributedLockKeyNormalizer, ITransientDependency
+    {
+        protected AbpDistributedLockOptions Options { get; }
+        protected ICurrentTenant CurrentTenant { get; }
+
+        public TenantAwareLockKeyNormalizer(
+            IOptions<AbpDistributedLockOptions> options,
+            ICurrentTenant currentTenant)
+        {
+            Options = options.Value;
+            CurrentTenant = currentTenant;
+        }
+
+        public virtual string NormalizeKey(string name)
+        {
+            var tenant = CurrentTenant.Id?.ToString() ?? "host";
+            return $"{Options.KeyPrefix}{tenant}:{name}";
+        }
+    }
+    ```
+
+    Register it with `context.Services.Replace(ServiceDescriptor.Transient<IDistributedLockKeyNormalizer, TenantAwareLockKeyNormalizer>())`.
+  </Tab>
+  <Tab title="Hash long names">
+    Some providers cap key length. Wrap the default normalizer and SHA-256 anything longer than 200 bytes:
+
+    ```csharp
+    public class HashingLockKeyNormalizer : IDistributedLockKeyNormalizer, ITransientDependency
+    {
+        protected AbpDistributedLockOptions Options { get; }
+
+        public HashingLockKeyNormalizer(IOptions<AbpDistributedLockOptions> options)
+            => Options = options.Value;
+
+        public virtual string NormalizeKey(string name)
+        {
+            var prefixed = $"{Options.KeyPrefix}{name}";
+            if (Encoding.UTF8.GetByteCount(prefixed) <= 200) return prefixed;
+
+            using var sha = SHA256.Create();
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(prefixed));
+            return $"{Options.KeyPrefix}h:{Convert.ToHexString(bytes)}";
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## The in-process fallback
+
+`LocalAbpDistributedLock` is a singleton registered in `AbpDistributedLockingAbstractionsModule`. It's the *only* implementation present when no other package replaces it, which makes it perfect for unit tests and single-process samples.
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/LocalAbpDistributedLock.cs
+public class LocalAbpDistributedLock : IAbpDistributedLock, ISingletonDependency
+{
+    private readonly AsyncKeyedLocker<string> _localSyncObjects = new(o =>
+    {
+        o.PoolSize = 20;
+        o.PoolInitialFill = 1;
+    });
+    protected IDistributedLockKeyNormalizer DistributedLockKeyNormalizer { get; }
+
+    public LocalAbpDistributedLock(IDistributedLockKeyNormalizer distributedLockKeyNormalizer)
+    {
+        DistributedLockKeyNormalizer = distributedLockKeyNormalizer;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        var key = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        var timeoutReleaser = await _localSyncObjects.LockOrNullAsync(key, timeout, cancellationToken);
+        if (timeoutReleaser is not null)
+        {
+            return new LocalAbpDistributedLockHandle(timeoutReleaser);
+        }
+        return null;
+    }
+}
+```
+
+Under the hood it uses the `AsyncKeyedLock` library, which pools `SemaphoreSlim`s keyed by the normalized name. `PoolSize = 20` and `PoolInitialFill = 1` mean the locker pre-creates one slim semaphore on construction and reuses up to twenty.
+
+The handle simply forwards `DisposeAsync` to the releaser:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/LocalAbpDistributedLockHandle.cs
+public class LocalAbpDistributedLockHandle : IAbpDistributedLockHandle
+{
+    private readonly IDisposable _disposable;
+
+    public LocalAbpDistributedLockHandle(IDisposable disposable)
+    {
+        _disposable = disposable;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _disposable.Dispose();
+        return default;
+    }
+}
+```
+
+<Note>
+Because the local lock is a singleton, *every* instance of `IAbpDistributedLock` in the process shares the same `AsyncKeyedLocker<string>`. That means it really does provide mutual exclusion across all callers in the same process — just not across processes.
+</Note>
+
+## The Medallion default
+
+`Volo.Abp.DistributedLocking` references [DistributedLock.Core](https://github.com/madelson/DistributedLock) and replaces the abstractions fallback:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking/Volo/Abp/DistributedLocking/MedallionAbpDistributedLock.cs
+[Dependency(ReplaceServices = true)]
+public class MedallionAbpDistributedLock : IAbpDistributedLock, ITransientDependency
+{
+    protected IDistributedLockProvider DistributedLockProvider { get; }
+    protected ICancellationTokenProvider CancellationTokenProvider { get; }
+    protected IDistributedLockKeyNormalizer DistributedLockKeyNormalizer { get; }
+
+    public MedallionAbpDistributedLock(
+        IDistributedLockProvider distributedLockProvider,
+        ICancellationTokenProvider cancellationTokenProvider,
+        IDistributedLockKeyNormalizer distributedLockKeyNormalizer)
+    {
+        DistributedLockProvider = distributedLockProvider;
+        CancellationTokenProvider = cancellationTokenProvider;
+        DistributedLockKeyNormalizer = distributedLockKeyNormalizer;
+    }
+
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        Check.NotNullOrWhiteSpace(name, nameof(name));
+        var key = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        CancellationTokenProvider.FallbackToProvider(cancellationToken);
+
+        var handle = await DistributedLockProvider.TryAcquireLockAsync(
+            key,
+            timeout,
+            CancellationTokenProvider.FallbackToProvider(cancellationToken)
+        );
+
+        if (handle == null)
+        {
+            return null;
+        }
+
+        return new MedallionAbpDistributedLockHandle(handle);
+    }
+}
+```
+
+Notice the `[Dependency(ReplaceServices = true)]` — ABP's DI registrar will *replace* the singleton `LocalAbpDistributedLock` with this transient implementation when both modules are loaded. The handle wraps Medallion's `IDistributedSynchronizationHandle`:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking/Volo/Abp/DistributedLocking/MedallionAbpDistributedLockHandle.cs
+public class MedallionAbpDistributedLockHandle : IAbpDistributedLockHandle
+{
+    public IDistributedSynchronizationHandle Handle { get; }
+
+    public MedallionAbpDistributedLockHandle(IDistributedSynchronizationHandle handle)
+    {
+        Handle = handle;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        return Handle.DisposeAsync();
+    }
+}
+```
+
+The module declaration is unremarkable — it just depends on `AbpThreadingModule` for `ICancellationTokenProvider`:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking/Volo/Abp/DistributedLocking/AbpDistributedLockingModule.cs
+[DependsOn(
+    typeof(AbpDistributedLockingAbstractionsModule),
+    typeof(AbpThreadingModule)
+)]
+public class AbpDistributedLockingModule : AbpModule
+{
+}
+```
+
+### Wiring a Medallion provider
+
+You still need to register an `IDistributedLockProvider`. Choose one of the Medallion packages and register it as a singleton:
+
+<Tabs>
+  <Tab title="Redis">
+    ```csharp
+    [DependsOn(typeof(AbpDistributedLockingModule))]
+    public class MyModule : AbpModule
+    {
+        public override void ConfigureServices(ServiceConfigurationContext context)
+        {
+            var mux = ConnectionMultiplexer.Connect("redis:6379");
+
+            context.Services.AddSingleton<IDistributedLockProvider>(
+                _ => new RedisDistributedSynchronizationProvider(mux.GetDatabase())
+            );
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="SQL Server">
+    ```csharp
+    context.Services.AddSingleton<IDistributedLockProvider>(
+        _ => new SqlDistributedSynchronizationProvider(
+            connectionString,
+            options => options.UseTransaction()
+        )
+    );
+    ```
+  </Tab>
+  <Tab title="Postgres">
+    ```csharp
+    context.Services.AddSingleton<IDistributedLockProvider>(
+        _ => new PostgresDistributedSynchronizationProvider(connectionString)
+    );
+    ```
+  </Tab>
+</Tabs>
+
+### Reaching the underlying Medallion handle
+
+Sometimes you need provider-specific operations — for example, `RedisDistributedLockHandle.HandleLostToken`. ABP exposes the inner handle through an extension method:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking/Volo/Abp/DistributedLocking/AbpDistributedLockHandleExtensions.cs
+public static class AbpDistributedLockHandleExtensions
+{
+    public static IDistributedSynchronizationHandle ToDistributedSynchronizationHandle(
+        this IAbpDistributedLockHandle handle)
+    {
+        return handle.As<MedallionAbpDistributedLockHandle>().Handle;
+    }
+}
+```
+
+```csharp
+await using var handle = await _lock.TryAcquireAsync("scheduler:nightly", TimeSpan.FromMinutes(1));
+if (handle is null) return;
+
+var medallion = handle.ToDistributedSynchronizationHandle();
+medallion.HandleLostToken.Register(() => _logger.LogWarning("Lock lost!"));
+```
+
+<Warning>
+`ToDistributedSynchronizationHandle` casts to `MedallionAbpDistributedLockHandle`. If you are running with `LocalAbpDistributedLock` (no Medallion package referenced) or the Dapr lock provider, the cast throws. Guard it with a type check in libraries that have to support multiple providers.
+</Warning>
+
+## The Dapr alternative (brief)
+
+`Volo.Abp.DistributedLocking.Dapr` provides yet another implementation that delegates to the Dapr sidecar's distributed-lock alpha API. It also uses `[Dependency(ReplaceServices = true)]`, so referencing it removes both the local fallback and the Medallion default:
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Dapr/Volo/Abp/DistributedLocking/Dapr/DaprAbpDistributedLock.cs
+[Dependency(ReplaceServices = true)]
+public class DaprAbpDistributedLock : IAbpDistributedLock, ITransientDependency
+{
+    public async Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name,
+        TimeSpan timeout = default,
+        CancellationToken cancellationToken = default)
+    {
+        name = DistributedLockKeyNormalizer.NormalizeKey(name);
+
+        var daprClient = await DaprClientFactory.CreateAsync();
+        var lockResponse = await daprClient.Lock(
+            DistributedLockDaprOptions.StoreName,
+            name,
+            DistributedLockDaprOptions.Owner ?? Guid.NewGuid().ToString(),
+            (int)DistributedLockDaprOptions.DefaultExpirationTimeout.TotalSeconds,
+            cancellationToken);
+
+        if (lockResponse == null || !lockResponse.Success) return null;
+        return new DaprAbpDistributedLockHandle(lockResponse);
+    }
+}
+```
+
+Configure it through `AbpDistributedLockDaprOptions`:
+
+```csharp
+public class AbpDistributedLockDaprOptions
+{
+    public string StoreName { get; set; } = default!;
+    public string? Owner { get; set; }
+    public TimeSpan DefaultExpirationTimeout { get; set; }
+
+    public AbpDistributedLockDaprOptions()
+    {
+        DefaultExpirationTimeout = TimeSpan.FromMinutes(2);
+    }
+}
+```
+
+Pick this option when your service already uses a Dapr sidecar for invocation or pub/sub and you want one fewer external dependency. The full Dapr wiring is documented at [/distributed/dapr-integration](/distributed/dapr-integration).
+
+<Note>
+The Dapr distributed-lock API is currently alpha. The implementation file even includes `#pragma warning disable DAPR_DISTRIBUTEDLOCK` to silence the warning. Plan accordingly.
+</Note>
+
+## Patterns
+
+### Idempotent worker
+
+Background workers in a cluster usually need exclusive execution per partition. The pattern is "try, skip if busy":
+
+```csharp
+public class NightlyReportWorker : AsyncPeriodicBackgroundWorkerBase
+{
+    private readonly IAbpDistributedLock _distributedLock;
+
+    public NightlyReportWorker(
+        AbpAsyncTimer timer,
+        IServiceScopeFactory scopeFactory,
+        IAbpDistributedLock distributedLock)
+        : base(timer, scopeFactory)
+    {
+        _distributedLock = distributedLock;
+        Timer.Period = (int) TimeSpan.FromMinutes(1).TotalMilliseconds;
+    }
+
+    protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
+    {
+        await using var handle = await _distributedLock.TryAcquireAsync("nightly-report");
+        if (handle is null) return; // another instance already running
+
+        await GenerateReportAsync(workerContext.CancellationToken);
+    }
+}
+```
+
+### Wait-with-timeout
+
+When you need *eventual* exclusive access, pass a non-zero timeout:
+
+```csharp
+await using var handle = await _distributedLock.TryAcquireAsync(
+    name: $"inventory:{sku}",
+    timeout: TimeSpan.FromSeconds(15)
+);
+
+if (handle is null)
+{
+    throw new BusinessException("Inventory:Busy")
+        .WithData("Sku", sku);
+}
+```
+
+### Composed locks
+
+Acquire multiple locks in a deterministic order to avoid deadlocks:
+
+```csharp
+var keys = new[] { fromAccount, toAccount }
+    .OrderBy(x => x, StringComparer.Ordinal)
+    .ToArray();
+
+await using var first  = await _lock.TryAcquireAsync($"acct:{keys[0]}", TimeSpan.FromSeconds(5));
+if (first is null) return;
+
+await using var second = await _lock.TryAcquireAsync($"acct:{keys[1]}", TimeSpan.FromSeconds(5));
+if (second is null) return;
+
+await TransferAsync(fromAccount, toAccount, amount);
+```
+
+### Unit testing
+
+The default registration is `LocalAbpDistributedLock`, so tests just work. If you want to assert "this code path acquires lock X", swap in a tracker:
+
+```csharp
+public sealed class TrackingDistributedLock : IAbpDistributedLock
+{
+    public ConcurrentBag<string> AcquiredNames { get; } = new();
+
+    public Task<IAbpDistributedLockHandle?> TryAcquireAsync(
+        string name, TimeSpan timeout = default, CancellationToken ct = default)
+    {
+        AcquiredNames.Add(name);
+        return Task.FromResult<IAbpDistributedLockHandle?>(new NoopHandle());
+    }
+
+    private sealed class NoopHandle : IAbpDistributedLockHandle
+    {
+        public ValueTask DisposeAsync() => default;
+    }
+}
+```
+
+<Accordion title="Why is the abstractions module separate?">
+Several ABP packages depend on `IAbpDistributedLock` without wanting to pull in Medallion. The distributed event-bus inbox/outbox, for example, references only `Volo.Abp.DistributedLocking.Abstractions`. Whatever provider the application registers — local, Medallion or Dapr — those packages just use it. This is the same pattern ABP uses for caching, queues and most other infrastructure.
+</Accordion>
+
+<Accordion title="What happens when no provider is registered?">
+The abstractions module registers `LocalAbpDistributedLock` as a singleton. If you only depend on the abstractions package, you get in-process locking and nothing else. As soon as you depend on `Volo.Abp.DistributedLocking` (Medallion) or `Volo.Abp.DistributedLocking.Dapr`, their `[Dependency(ReplaceServices = true)]` attribute kicks in and the local lock is replaced.
+</Accordion>
+
+<Accordion title="Can I lock across tenants?">
+By default `IDistributedLockKeyNormalizer` is tenant-agnostic — it just prepends `KeyPrefix`. If you want per-tenant isolation, replace the normalizer (see the "Per-tenant prefix" tab above). If you want a tenant lock that *also* serializes against host operations, leave the normalizer alone and bake the tenant id into the lock name yourself.
+</Accordion>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Dapr Integration" icon="cube" href="/distributed/dapr-integration">
+    Wire `AbpDaprModule`, configure endpoints and tokens, and inject `IAbpDaprClientFactory`.
+  </Card>
+  <Card title="Dapr Event Bus" icon="signal-stream" href="/eventbus/dapr-event-bus">
+    The distributed event bus that internally relies on `IAbpDistributedLock` for inbox/outbox coordination.
+  </Card>
+  <Card title="HTTP Client over Dapr" icon="arrow-right-arrow-left" href="/distributed/http-client-dapr">
+    Route ABP's HTTP proxies through the sidecar by app-id.
+  </Card>
+  <Card title="HTTP Request Pipeline" icon="route" href="/flows/http-request-pipeline">
+    How `DelegatingHandler` chains compose with `AbpInvocationHandler` in a typed proxy.
+  </Card>
+</CardGroup>

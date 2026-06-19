@@ -1,0 +1,296 @@
+---
+title: "appsettings.json: per-project conventions in the ABP template"
+sidebarTitle: "appsettings.json"
+description: "What every key in the template appsettings.json means — ConnectionStrings, App.SelfUrl, App.RedirectAllowedUrls, AuthServer, StringEncryption, Redis, OpenIddict.Applications — and which executable owns which subset."
+---
+
+A fresh ABP solution ships **one `appsettings.json` per executable project**. The keys overlap (every project needs `ConnectionStrings:Default`), but each project carries only the subset it actually reads. This page documents the real template files, key by key, with the path to each file so you can verify.
+
+Template root: `templates/app/aspnet-core/src/`.
+
+## File-to-project map
+
+| Executable | File | Role |
+| --- | --- | --- |
+| MVC web host | `MyCompanyName.MyProjectName.Web/appsettings.json` | Razor Pages UI, single-app monolith |
+| API host | `MyCompanyName.MyProjectName.HttpApi.Host/appsettings.json` | Separate HTTP API tier |
+| Auth server | `MyCompanyName.MyProjectName.AuthServer/appsettings.json` | OpenIddict / identity tier |
+| Blazor Server | `MyCompanyName.MyProjectName.Blazor.Server/appsettings.json` | Blazor Server UI |
+| DB migrator | `MyCompanyName.MyProjectName.DbMigrator/appsettings.json` | One-shot console runner |
+
+Each file is intentionally small — the framework's *defaults* live in code, and modules only read the keys they own.
+
+## MVC Web host
+
+This is the simplest file in the template. The MVC monolith only needs to know its own self-URL, the database, and the string-encryption pass phrase.
+
+```json
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Web/appsettings.json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44303"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+What each key does:
+
+- **`App:SelfUrl`** — the canonical base URL the application reports to OpenIddict's redirect-allow logic and to the URL-builder helpers (see `IUrlEncryptionService` in [`/security/string-encryption`](/security/string-encryption)). Production deployments override this via env vars.
+- **`ConnectionStrings:Default`** — the dictionary key `"Default"` that `ConnectionStrings.Default` returns. The full multi-database story lives on [`/data/connection-strings`](/data/connection-strings).
+- **`StringEncryption:DefaultPassPhrase`** — the 16-character secret used by the symmetric string-encryption service. **Rotate this in production** — the template ships a fixed value for first-run convenience only.
+
+## HTTP API host
+
+The API tier is "headless" — no Razor Pages UI — but it needs CORS, an auth-server pointer, and a distributed cache.
+
+```json
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.HttpApi.Host/appsettings.json
+{
+  "App": {
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307,https://localhost:44309"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": {
+    "Configuration": "127.0.0.1"
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44301",
+    "RequireHttpsMetadata": true,
+    "SwaggerClientId": "MyProjectName_Swagger"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+New keys:
+
+- **`App:CorsOrigins`** — comma-separated origin list (one wildcard per entry: `https://*.MyProjectName.com` matches all subdomains). Read by the API-host startup code and passed to `AddCors(...)`. Note that ABP's helper supports wildcard subdomains by splitting and registering each origin via the policy builder.
+- **`Redis:Configuration`** — passed to `StackExchange.Redis`'s `ConfigurationOptions.Parse(...)`. Hosts the `IDistributedCache` and the data-protection key ring in tiered deployments.
+- **`AuthServer:Authority`** — the OpenIddict authority. The JWT bearer middleware uses this to fetch the OpenID metadata document and the signing keys.
+- **`AuthServer:RequireHttpsMetadata`** — set to `false` only in Development; production deployments must keep `true`.
+- **`AuthServer:SwaggerClientId`** — the OpenIddict application id used by the embedded Swagger UI when an operator clicks "Authorize" inside `/swagger`.
+
+## Auth server
+
+The OpenIddict tier carries the most URL surface — it advertises itself, knows where the SPA / Blazor / MVC clients live, and lists which post-login redirect URLs it will honour.
+
+```json
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.AuthServer/appsettings.json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44301",
+    "ClientUrl": "http://localhost:4200",
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307,https://localhost:44300",
+    "RedirectAllowedUrls": "http://localhost:4200,https://localhost:44302,https://localhost:44307,https://localhost:44309"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": {
+    "Configuration": "127.0.0.1"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+New keys:
+
+- **`App:ClientUrl`** — the canonical home URL of the *primary* client app (the Angular SPA, in the default template). Used in account-flow links (password reset, email confirmation).
+- **`App:RedirectAllowedUrls`** — a comma-separated allowlist of post-login redirect targets. ABP's account UI checks every `ReturnUrl` it receives against this list to defend against open-redirect attacks.
+
+The four URLs (`44301`, `44302`, `44307`, `44309`) correspond to AuthServer, MVC web client, Blazor client, and Blazor-server-tiered client in the default port plan.
+
+## Blazor Server
+
+The Blazor Server host is its own auth target (the template configures it to authenticate against the embedded AuthServer at `:44308`).
+
+```json
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Blazor.Server/appsettings.json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44308",
+    "RedirectAllowedUrls": "https://localhost:44308"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44308",
+    "RequireHttpsMetadata": false
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+Notable here: `AuthServer:Authority` points at the **same** host as `App:SelfUrl`. The Blazor Server template embeds the OpenIddict authority into the same process, so the authority lives on the same port. The tiered variant splits them.
+
+## DB migrator
+
+The migrator is a one-shot console runner. It needs the database, optionally Redis (for tiered template caches), and a list of OpenIddict client application registrations to seed.
+
+```json
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/appsettings.json
+{
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  //<TEMPLATE-REMOVE IF-NOT='TIERED'>
+  "Redis": {
+    "Configuration": "127.0.0.1"
+  },
+  //</TEMPLATE-REMOVE>
+  "OpenIddict": {
+    "Applications": {
+      //<TEMPLATE-REMOVE IF-NOT='ui:mvc'>
+      "MyProjectName_Web": {
+        "ClientId": "MyProjectName_Web",
+        "ClientSecret": "1q2w3e*",
+        "RootUrl": "https://localhost:44302"
+      },
+      //</TEMPLATE-REMOVE>
+      //<TEMPLATE-REMOVE IF-NOT='ui:blazor'>
+      "MyProjectName_Blazor": {
+        "ClientId": "MyProjectName_Blazor",
+        "RootUrl": "https://localhost:44307"
+      },
+      //</TEMPLATE-REMOVE>
+      //<TEMPLATE-REMOVE IF-NOT='ui:angular'>
+      "MyProjectName_App": {
+        "ClientId": "MyProjectName_App",
+        "RootUrl": "http://localhost:4200"
+      },
+      //</TEMPLATE-REMOVE>
+      //<TEMPLATE-REMOVE IF-NOT='ui:blazor-server&&TIERED'>
+      "MyProjectName_BlazorServerTiered": {
+        "ClientId": "MyProjectName_BlazorServerTiered",
+        "ClientSecret": "1q2w3e*",
+        "RootUrl": "https://localhost:44309"
+      },
+      //</TEMPLATE-REMOVE>
+      //<TEMPLATE-REMOVE IF-NOT='ui:blazor-webapp&&TIERED'>
+      "MyProjectName_BlazorWebAppTiered": {
+        "ClientId": "MyProjectName_BlazorWebAppTiered",
+        "ClientSecret": "1q2w3e*",
+        "RootUrl": "https://localhost:44309"
+      },
+      //</TEMPLATE-REMOVE>
+      "MyProjectName_Swagger": {
+        "ClientId": "MyProjectName_Swagger",
+        "RootUrl": "https://localhost:44305"
+      }
+    }
+  }
+}
+```
+
+<Info>
+The `//<TEMPLATE-REMOVE IF-NOT='...'>` markers are the ABP template engine's conditional comments. When the ABP CLI generates a project for, say, the `ui:angular` flavour, blocks tagged for other flavours are stripped during code generation. Real generated solutions only carry the slice that matches the chosen UI.
+</Info>
+
+`OpenIddict:Applications` is bound by the `OpenIddictDataSeedContributor` in the `Domain` project, which reads each entry and creates a corresponding `OpenIddictApplication` row in the database (`ClientId`, `ClientSecret`, `RootUrl`, redirect/post-logout URIs derived from `RootUrl`).
+
+## The common configuration shape
+
+Across all five files a small vocabulary repeats:
+
+<CardGroup cols={2}>
+  <Card title="App: section" icon="globe">
+    Per-host URL knobs — `SelfUrl`, `ClientUrl`, `CorsOrigins`, `RedirectAllowedUrls`. Bound into the `AppOptions` class that the template ships under `Web/AppOptions.cs` (or similar per project).
+  </Card>
+  <Card title="ConnectionStrings: section" icon="database">
+    Standard .NET shape: one connection string per named slot. ABP reads it through `IConfiguration.GetConnectionString(...)` and surfaces it via `AbpDbConnectionOptions`. See [`/data/connection-strings`](/data/connection-strings).
+  </Card>
+  <Card title="AuthServer: section" icon="key">
+    `Authority`, `RequireHttpsMetadata`, optional `SwaggerClientId`. Read by the JWT bearer middleware and by the Swagger configurator.
+  </Card>
+  <Card title="Redis: section" icon="server">
+    `Configuration` (a StackExchange.Redis connection string). Optional — tiered templates include it; the single-process MVC template usually does not.
+  </Card>
+  <Card title="StringEncryption: section" icon="lock">
+    `DefaultPassPhrase` — the symmetric secret used by `IStringEncryptionService`. **Override per environment** through env vars or a secret manager.
+  </Card>
+  <Card title="OpenIddict.Applications: section" icon="user-shield">
+    DbMigrator-only. One entry per OpenIddict client app: `ClientId`, optional `ClientSecret`, `RootUrl`. Used during data seeding.
+  </Card>
+</CardGroup>
+
+## The `Settings:` section
+
+The five template files above don't include a `Settings:` section out of the box, but ABP **reserves the `Settings:` prefix** for runtime settings. Adding a section like this:
+
+```json
+{
+  "Settings": {
+    "Abp.Mailing.DefaultFromAddress": "noreply@mycompany.com",
+    "Abp.Mailing.DefaultFromDisplayName": "MyCompany",
+    "Abp.Localization.DefaultLanguage": "en"
+  }
+}
+```
+
+…is read transparently by `ConfigurationSettingValueProvider`. See [`/config/settings-system`](/config/settings-system) for the bridge from `IConfiguration` into `ISettingProvider`, and [`/security/settings`](/security/settings) for the full chain.
+
+## Environment overlays
+
+Every ABP template ships an `appsettings.Development.json` next to the base file. The host's `ConfigurationBuilder` automatically layers it on top of `appsettings.json` when `ASPNETCORE_ENVIRONMENT=Development`:
+
+```
+templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Web/
+├── appsettings.json
+└── appsettings.Development.json
+```
+
+The Development overlay is the right place for "loose" values you only want in dev mode (e.g. `AuthServer:RequireHttpsMetadata = false`). Production deployments rely on **environment variables** instead — see [`/config/environment-variables`](/config/environment-variables).
+
+## Things that look like keys but aren't
+
+A few `appsettings.json` keys are *seeds* for runtime data rather than runtime knobs. Reading them at request time is incorrect because the source-of-truth is the database.
+
+<AccordionGroup>
+  <Accordion title="OpenIddict:Applications">
+    Seed data for the OpenIddict application table. Once the DbMigrator has run, the database is the source of truth. Updating this section after seed does **not** update the rows — re-run the seeder or edit through the admin UI.
+  </Accordion>
+  <Accordion title="App:RedirectAllowedUrls">
+    Used by the account flow at *runtime*, but also seeded into the OpenIddict application's redirect-URI list at seed time. Adding a URL here after first-run requires an update to the OpenIddict row in the DB.
+  </Accordion>
+  <Accordion title="Settings:*">
+    `ConfigurationSettingValueProvider` reads these at runtime — but the Setting Management module's persisted store wins if it has an override. Adding a new value to `appsettings.json` is the right way to set a *default* for fresh tenants; it is the wrong way to override an existing operator-set value.
+  </Accordion>
+</AccordionGroup>
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Configuration overview" icon="map" href="/config/overview">
+    The three-layer mental model (`IConfiguration` / Options / Settings).
+  </Card>
+  <Card title="AbpOptions catalogue" icon="sliders" href="/config/options-classes">
+    The framework-level Options classes you bind from these sections.
+  </Card>
+  <Card title="Settings bridge" icon="bridge" href="/config/settings-system">
+    How `Settings:*` entries reach `ISettingProvider`.
+  </Card>
+  <Card title="Environment variables" icon="terminal" href="/config/environment-variables">
+    How to override these JSON values in production (`ConnectionStrings__Default`, etc.).
+  </Card>
+  <Card title="Connection strings" icon="database" href="/data/connection-strings">
+    Full coverage of `ConnectionStrings:Default` resolution and tenant-specific overrides.
+  </Card>
+  <Card title="Module lifecycle" icon="layer-group" href="/core/modularity">
+    When in the lifecycle each section is read.
+  </Card>
+</CardGroup>

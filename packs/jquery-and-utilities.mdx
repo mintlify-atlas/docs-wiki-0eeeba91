@@ -1,0 +1,363 @@
+---
+title: "jQuery and small-utility packs"
+sidebarTitle: "jQuery & utilities"
+description: "npm/packs jquery, jquery-form, jquery-validation, jquery-validation-unobtrusive, clipboard, anchor-js, highlight.js, codemirror, cropperjs — the small library tier the MVC UI relies on."
+---
+
+This is the catalogue of "small utility" `@abp/<lib>` packs that the MVC UI (and any consuming module) depends on for jQuery, form posting, client-side validation, syntax highlighting, anchor links, code editing, image cropping, and clipboard copy. Each one wraps a single upstream package, ships an `abp.resourcemapping.js`, and is consumed transitively through `@abp/aspnetcore.mvc.ui.theme.shared` ([packs/theme-shared](/packs/theme-shared)) or directly by a module-level pack like `@abp/cms-kit.admin`.
+
+Packs covered here:
+
+- `@abp/jquery` — jQuery 3.x
+- `@abp/jquery-form` — `jquery-form` AJAX form helper
+- `@abp/jquery-validation` — jQuery validation engine
+- `@abp/jquery-validation-unobtrusive` — ASP.NET-style unobtrusive validation
+- `@abp/clipboard` — clipboard.js copy-to-clipboard
+- `@abp/anchor-js` — anchor.js (in-page anchor links)
+- `@abp/highlight.js` — highlight.js (code syntax highlighting)
+- `@abp/codemirror` — CodeMirror 5 source editor
+- `@abp/cropperjs` — Cropper.js image cropping
+
+(`@abp/core` and `@abp/utils` carrying `abp.js` / `abp.utils.js` are documented in [packs/aspnetcore-mvc-ui](/packs/aspnetcore-mvc-ui) and [packs/overview](/packs/overview).)
+
+## File-layout summary
+
+Every pack on this page has the same shape:
+
+```
+npm/packs/<name>/
+├── package.json
+└── abp.resourcemapping.js
+```
+
+A handful (`@abp/jquery`, `@abp/jquery-form`, `@abp/jquery-validation`) also ship `src/` shim files; the rest copy upstream files verbatim.
+
+## `@abp/jquery`
+
+The jQuery anchor. Every other jQuery-dependent pack here pins it via `~10.0.1`.
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/jquery",
+  "dependencies": {
+    "@abp/core": "~10.0.1",
+    "jquery":    "~3.7.1"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/jquery/dist/jquery.js":          "@libs/jquery/",
+        "@node_modules/@abp/jquery/src/*.*":            "@libs/abp/jquery/"
+    }
+}
+```
+
+Outputs:
+
+- `wwwroot/libs/jquery/jquery.js` — the upstream library.
+- `wwwroot/libs/abp/jquery/*.*` — ABP-authored jQuery bridge files (event glue and AJAX defaults).
+
+Note the **tilde-pinned upstream** (`~3.7.1`) — jQuery's API surface is stable enough that ABP is comfortable promising a single minor.
+
+## `@abp/jquery-form`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/jquery-form",
+  "dependencies": {
+    "@abp/jquery": "~10.0.1",
+    "jquery-form": "^4.3.0"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/@abp/jquery-form/src/jquery.form.min.js": "@libs/jquery-form/"
+    }
+}
+```
+
+Note this mapping reads from `@node_modules/@abp/jquery-form/src/...`, **not** from the upstream `node_modules/jquery-form/`. ABP re-ships `jquery.form.min.js` inside its own pack so it controls the exact file delivered (avoiding the upstream's hyphen/underscore distribution wobble).
+
+`jquery-form` provides `.ajaxForm()` / `.ajaxSubmit()` — used wherever the MVC UI wants to do an AJAX form post without writing the FormData boilerplate.
+
+## `@abp/jquery-validation`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/jquery-validation",
+  "dependencies": {
+    "@abp/jquery":     "~10.0.1",
+    "jquery-validation": "^1.21.0"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/jquery-validation/dist/jquery.validate.js": "@libs/jquery-validation/",
+        "@node_modules/jquery-validation/dist/localization/*.*":   "@libs/jquery-validation/localization/",
+        "@node_modules/@abp/jquery-validation/src/*.*":            "@libs/jquery-validation/"
+    }
+}
+```
+
+Three sources:
+
+1. Upstream `jquery.validate.js` — the engine.
+2. Upstream `localization/*.*` — every `messages_xx.js` file (Turkish, Spanish, etc.).
+3. ABP-authored `src/*.*` — small shims that wire ABP's localization into jQuery-Validation's `messages` dictionary.
+
+## `@abp/jquery-validation-unobtrusive`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/jquery-validation-unobtrusive",
+  "dependencies": {
+    "@abp/jquery-validation": "~10.0.1",
+    "jquery-validation-unobtrusive": "^4.0.0"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/jquery-validation-unobtrusive/dist/jquery.validate.unobtrusive.js":
+            "@libs/jquery-validation-unobtrusive/"
+    }
+}
+```
+
+The bridge between ASP.NET MVC's `data-val-*` attributes and `jquery-validation`. This is what makes `[Required]`, `[Range]`, `[RegularExpression]` on a Razor view's model "just work" without writing JavaScript.
+
+It is **listed directly in `@abp/aspnetcore.mvc.ui.theme.shared`** ([packs/theme-shared](/packs/theme-shared)) so every ABP MVC project gets it without explicit opt-in.
+
+## `@abp/clipboard`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/clipboard",
+  "dependencies": {
+    "@abp/core": "~10.0.1",
+    "clipboard": "^2.0.11"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/clipboard/dist/*.*": "@libs/clipboard/"
+    }
+}
+```
+
+Used by:
+
+- CMS Kit / Blogging's code-block "copy" buttons.
+- The ABP Studio-generated docs widgets.
+- Pulled in transitively by `@abp/prismjs` (see [packs/cms-kit-packs](/packs/cms-kit-packs)) for prism-toolbar's copy button.
+
+## `@abp/anchor-js`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/anchor-js",
+  "dependencies": {
+    "@abp/core": "~10.0.1",
+    "anchor-js": "^5.0.0"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/anchor-js/anchor.js": "@libs/anchor-js/"
+    }
+}
+```
+
+Used by the Docs module ([modules/docs](/modules/docs/overview) — if you have it) to add the `#` heading-anchor links you see on rendered Markdown pages.
+
+## `@abp/highlight.js`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/highlight.js",
+  "dependencies": {
+    "@abp/core":               "~10.0.1",
+    "@highlightjs/cdn-assets": "~11.11.1"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/@highlightjs/cdn-assets/highlight.min.js":      "@libs/highlight.js/",
+        "@node_modules/@highlightjs/cdn-assets/styles/*.*":            "@libs/highlight.js/styles/",
+        "@node_modules/@highlightjs/cdn-assets/styles/base16/*.*":     "@libs/highlight.js/styles/base16/"
+    }
+}
+```
+
+Note: ABP pulls from the **`@highlightjs/cdn-assets`** distribution (pre-built browser bundles + every theme CSS) rather than the source `highlight.js` package. That's why the staged folder ships dozens of `*.css` theme files under `wwwroot/libs/highlight.js/styles/` and the entire `base16/` subfolder.
+
+Consumed by `@abp/cms-kit.public` (post code blocks) — see [packs/cms-kit-packs](/packs/cms-kit-packs).
+
+## `@abp/codemirror`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/codemirror",
+  "dependencies": {
+    "@abp/core":  "~10.0.1",
+    "codemirror": "^5.65.1"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/codemirror/lib/*.*":      "@libs/codemirror/",
+        "@node_modules/codemirror/mode/**/*.*":  "@libs/codemirror/mode/",
+        "@node_modules/codemirror/theme/**/*.*": "@libs/codemirror/theme/",
+        "@node_modules/codemirror/addon/**/*.*": "@libs/codemirror/addon/"
+    }
+}
+```
+
+CodeMirror 5 (not 6 — that's a different upstream package with a non-backward-compatible API). The four mappings cover the four directories that constitute a self-hosted CodeMirror deployment: core, language modes (`javascript`, `xml`, `css`, …), themes, addons (`closetags`, `matchbrackets`, `search`, `dialog`, …).
+
+Consumed by `@abp/cms-kit.admin` for raw Markdown / HTML editing (`<textarea>` enhancement) — see [packs/cms-kit-packs](/packs/cms-kit-packs).
+
+## `@abp/cropperjs`
+
+```json
+{
+  "version": "10.0.1",
+  "name": "@abp/cropperjs",
+  "dependencies": {
+    "@abp/core": "~10.0.1",
+    "cropperjs": "^1.6.2"
+  }
+}
+```
+
+```js
+// abp.resourcemapping.js
+module.exports = {
+  mappings: {
+    "@node_modules/cropperjs/dist/cropper.min.js":  "@libs/cropperjs/js/",
+    "@node_modules/cropperjs/dist/cropper.min.css": "@libs/cropperjs/css/",
+  },
+};
+```
+
+Cropper.js 1.x. Used by the Account/Identity Profile picture pages for client-side image cropping before upload — see the C# `CropperJsScriptContributor` / `CropperJsStyleContributor` in `Volo.Abp.AspNetCore.Mvc.UI.Packages.CropperJs` ([aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages)).
+
+## Combined staging tree
+
+After `abp install-libs` in a project transitively pulling every pack on this page, `wwwroot/libs/` contains:
+
+```
+wwwroot/libs/
+├── abp/
+│   ├── core/        abp.js, abp.css                          # from @abp/core
+│   ├── jquery/      ...shim files                            # from @abp/jquery's src/
+│   └── utils/       abp.utils.js                             # from @abp/utils
+├── jquery/                           jquery.js
+├── jquery-form/                      jquery.form.min.js
+├── jquery-validation/
+│   ├── jquery.validate.js
+│   ├── localization/                 messages_*.js
+│   └── ...shim files
+├── jquery-validation-unobtrusive/    jquery.validate.unobtrusive.js
+├── clipboard/                        clipboard.js, clipboard.min.js
+├── anchor-js/                        anchor.js
+├── highlight.js/
+│   ├── highlight.min.js
+│   └── styles/                       *.css, base16/*.css
+├── codemirror/
+│   ├── codemirror.js, codemirror.css
+│   ├── mode/                         <lang>/<lang>.js
+│   ├── theme/                        *.css
+│   └── addon/                        <category>/<name>.js
+└── cropperjs/
+    ├── js/  cropper.min.js
+    └── css/ cropper.min.css
+```
+
+## C# pairing
+
+Each pack on this page has a one-to-one C# contributor pair in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages/Volo/Abp/AspNetCore/Mvc/UI/Packages/`:
+
+| Pack | Contributor folder | Files referenced |
+| --- | --- | --- |
+| `@abp/jquery` | `JQuery/` | `/libs/jquery/jquery.js` |
+| `@abp/jquery-form` | `JQueryForm/` | `/libs/jquery-form/jquery.form.min.js` |
+| `@abp/jquery-validation` | `JQueryValidation/` | `/libs/jquery-validation/jquery.validate.js`, `/libs/jquery-validation/localization/...` |
+| `@abp/jquery-validation-unobtrusive` | `JQueryValidationUnobtrusive/` | `/libs/jquery-validation-unobtrusive/jquery.validate.unobtrusive.js` |
+| `@abp/clipboard` | `Clipboard/` | `/libs/clipboard/clipboard.min.js` |
+| `@abp/anchor-js` | `Anchor/` | `/libs/anchor-js/anchor.js` |
+| `@abp/highlight.js` | `Highlight/` | `/libs/highlight.js/highlight.min.js`, `/libs/highlight.js/styles/...` |
+| `@abp/codemirror` | `Codemirror/` | `/libs/codemirror/codemirror.js`, theme/mode/addon paths |
+| `@abp/cropperjs` | `CropperJs/` | `/libs/cropperjs/js/cropper.min.js`, `/libs/cropperjs/css/cropper.min.css` |
+
+See [aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages) for the full catalogue.
+
+## Why ABP sometimes re-ships upstream files in `src/`
+
+Three of these packs (`@abp/jquery-form`, `@abp/jquery-validation`, plus `@abp/bootstrap-daterangepicker` documented on [packs/bootstrap-and-datatables](/packs/bootstrap-and-datatables)) read from their own `src/` instead of `node_modules/<upstream>/`. The motivations:
+
+1. **Stable filename.** Upstream sometimes renames its built artefacts between minor versions; pinning a local copy means a `~5.x` upstream bump can't break the contributor file path.
+2. **Bundled patches.** `@abp/jquery-form/src/jquery.form.min.js` includes a tiny shim that detects ABP's anti-forgery header layout. Re-shipping is the simplest delivery vehicle.
+3. **Reduced surface.** Upstream `jquery-validation` ships every locale file; ABP's `src/` keeps it small for the consumer-shim purpose while the locale files come from the upstream mapping line.
+
+## Cross-references
+
+<CardGroup cols={3}>
+  <Card title="Packs overview" icon="boxes-stacked" href="/packs/overview">
+    The pack catalogue + install-libs flow.
+  </Card>
+  <Card title="aspnetcore.mvc.ui" icon="cube" href="/packs/aspnetcore-mvc-ui">
+    The graph anchor; `@abp/core` + `@abp/utils` carry the `abp.js` / `abp.utils.js` files.
+  </Card>
+  <Card title="Theme: Shared" icon="layer-group" href="/packs/theme-shared">
+    Lists `@abp/jquery-form` and `@abp/jquery-validation-unobtrusive` directly.
+  </Card>
+  <Card title="CMS Kit packs" icon="newspaper" href="/packs/cms-kit-packs">
+    Pulls `@abp/codemirror`, `@abp/highlight.js`, `@abp/clipboard` transitively.
+  </Card>
+  <Card title="MVC UI Packages" icon="cube" href="/aspnetcore/mvc-ui-packages">
+    C# contributor catalogue.
+  </Card>
+  <Card title="install-libs CLI" icon="terminal" href="/cli/install-libs-and-add-package">
+    The CLI command that copies these files into wwwroot/libs/.
+  </Card>
+</CardGroup>

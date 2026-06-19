@@ -1,0 +1,404 @@
+---
+title: "Threading & Async Primitives in ABP"
+sidebarTitle: "Threading & Async"
+description: "AsyncHelper, AbpAsyncTimer, ICancellationTokenProvider, AsyncLocalAmbientDataContext, and the rest of the Volo.Abp.Threading toolbox."
+---
+
+ABP avoids hand-rolling concurrency primitives but it does ship a handful of small helpers that the framework — and your code — lean on. They live in two places: the parts inside `Volo.Abp.Core` ([`framework/src/Volo.Abp.Core/Volo/Abp/Threading/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Core/Volo/Abp/Threading)) and the richer set in the sibling [`Volo.Abp.Threading`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Threading) package.
+
+## What ships where
+
+| Helper | Package | Use |
+| --- | --- | --- |
+| `AsyncHelper.RunSync`, `IsAsync`, `UnwrapTask` | `Volo.Abp.Core` | Bridge sync/async at module boundaries. |
+| `OneTimeRunner`, `AsyncOneTimeRunner` | `Volo.Abp.Core` | Idempotent one-shot initializers. |
+| `LockExtensions`, `SemaphoreSlimExtensions` | `Volo.Abp.Core` | `using` patterns over `Monitor` / `SemaphoreSlim`. |
+| `TaskCache` | `Volo.Abp.Core` | Pre-allocated `Task<bool>` constants. |
+| `InternalAsyncHelper.AwaitTaskWithFinally` | `Volo.Abp.Core` | Internal — the interceptors use it to bolt cleanup onto an awaited task. |
+| `AbpAsyncTimer`, `AbpTimer` | `Volo.Abp.Threading` | Non-overlapping periodic work. |
+| `ICancellationTokenProvider`, `CancellationTokenProviderBase`, `NullCancellationTokenProvider` | `Volo.Abp.Threading` | Ambient cancellation token. |
+| `IAmbientDataContext`, `AsyncLocalAmbientDataContext`, `IAmbientScopeProvider<T>`, `AmbientDataContextAmbientScopeProvider<T>` | `Volo.Abp.Threading` | `AsyncLocal`-backed ambient state with nested scopes. |
+| `IRunnable` | `Volo.Abp.Threading` | Marker for long-running components like background workers. |
+
+## `AsyncHelper` — sync ↔ async bridge
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Threading/AsyncHelper.cs
+public static class AsyncHelper
+{
+    public static bool IsAsync([NotNull] this MethodInfo method)
+    {
+        Check.NotNull(method, nameof(method));
+        return method.ReturnType.IsTaskOrTaskOfT();
+    }
+
+    public static bool IsTaskOrTaskOfT([NotNull] this Type type)
+    {
+        return type == typeof(Task) ||
+               (type.GetTypeInfo().IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>));
+    }
+
+    public static bool IsTaskOfT([NotNull] this Type type)
+    {
+        return type.GetTypeInfo().IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>);
+    }
+
+    public static Type UnwrapTask([NotNull] Type type)
+    {
+        Check.NotNull(type, nameof(type));
+        if (type == typeof(Task)) return typeof(void);
+        if (type.IsTaskOfT()) return type.GenericTypeArguments[0];
+        return type;
+    }
+
+    public static TResult RunSync<TResult>(Func<Task<TResult>> func)
+    {
+        return AsyncContext.Run(func);
+    }
+
+    public static void RunSync(Func<Task> action)
+    {
+        AsyncContext.Run(action);
+    }
+}
+```
+
+`AsyncHelper.RunSync` is the **only** sanctioned way to call an async method from sync code in ABP. It delegates to [Nito.AsyncEx's `AsyncContext.Run`](https://github.com/StephenCleary/AsyncEx), which installs a single-threaded synchronization context for the duration of the call. That avoids the classic `Task.Result` / `Task.Wait` deadlocks.
+
+| Method | Use case |
+| --- | --- |
+| `AsyncHelper.RunSync(() => svc.DoAsync())` | A console app, a static initializer, or an interceptor that must bridge from a sync interface to an async implementation. |
+| `method.IsAsync()` | Used pervasively by the dynamic proxy interceptors to decide between `InterceptAsync` and a synchronous unwrap. |
+| `AsyncHelper.UnwrapTask(returnType)` | Turn `Task<Book>` into `Book` for reflection-based result handling. |
+
+<Warning>
+  `AsyncHelper.RunSync` is the right escape hatch *only when you cannot return `Task` upstream*. If you can change the calling code to `async`, do that instead — `RunSync` costs you the standard caller-context propagation and adds overhead.
+</Warning>
+
+## `AbpAsyncTimer` — non-overlapping periodic work
+
+The big-ticket item in the Threading package. Used by every framework component that needs to "do something every N milliseconds, but never start a new run while the previous one is in flight":
+
+```csharp
+// framework/src/Volo.Abp.Threading/Volo/Abp/Threading/AbpAsyncTimer.cs
+public class AbpAsyncTimer : ITransientDependency
+{
+    public Func<AbpAsyncTimer, Task> Elapsed = _ => Task.CompletedTask;
+
+    /// <summary>
+    /// Task period of timer (as milliseconds).
+    /// </summary>
+    public int Period { get; set; }
+
+    /// <summary>
+    /// Indicates whether timer raises Elapsed event on Start method of Timer for once.
+    /// Default: False.
+    /// </summary>
+    public bool RunOnStart { get; set; }
+
+    public ILogger<AbpAsyncTimer> Logger { get; set; }
+    public IExceptionNotifier ExceptionNotifier { get; set; }
+
+    private readonly Timer _taskTimer;
+    private volatile bool _performingTasks;
+    private volatile bool _isRunning;
+
+    public AbpAsyncTimer()
+    {
+        ExceptionNotifier = NullExceptionNotifier.Instance;
+        Logger = NullLogger<AbpAsyncTimer>.Instance;
+
+        _taskTimer = new Timer(TimerCallBack!, null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public void Start(CancellationToken cancellationToken = default)
+    {
+        if (Period <= 0)
+        {
+            throw new AbpException("Period should be set before starting the timer!");
+        }
+
+        lock (_taskTimer)
+        {
+            _taskTimer.Change(RunOnStart ? 0 : Period, Timeout.Infinite);
+            _isRunning = true;
+        }
+    }
+
+    public void Stop(CancellationToken cancellationToken = default)
+    {
+        lock (_taskTimer)
+        {
+            _taskTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            while (_performingTasks)
+            {
+                Monitor.Wait(_taskTimer);
+            }
+            _isRunning = false;
+        }
+    }
+
+    private void TimerCallBack(object state)
+    {
+        lock (_taskTimer)
+        {
+            if (!_isRunning || _performingTasks) { return; }
+            _taskTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            _performingTasks = true;
+        }
+        _ = Timer_Elapsed();
+    }
+
+    private async Task Timer_Elapsed()
+    {
+        try { await Elapsed(this); }
+        catch (Exception ex)
+        {
+            Logger.LogException(ex);
+            await ExceptionNotifier.NotifyAsync(ex);
+        }
+        finally
+        {
+            lock (_taskTimer)
+            {
+                _performingTasks = false;
+                if (_isRunning) { _taskTimer.Change(Period, Timeout.Infinite); }
+                Monitor.Pulse(_taskTimer);
+            }
+        }
+    }
+}
+```
+
+The non-overlap guarantee is the bit you can't easily reproduce with `System.Threading.Timer` alone:
+
+- The callback pre-checks `_performingTasks` under the lock — a second tick during a long run is dropped.
+- Exceptions are forwarded to `IExceptionNotifier` (see [Exception handling](/core/exception-handling)), then the next tick is rescheduled in the `finally`.
+- `Stop` waits (`Monitor.Wait`) until the in-flight tick finishes before returning.
+
+Usage pattern:
+
+```csharp
+public class CleanupWorker : IHostedService
+{
+    private readonly AbpAsyncTimer _timer;
+
+    public CleanupWorker(AbpAsyncTimer timer)
+    {
+        _timer = timer;
+        _timer.Period = 60_000;            // 1 minute
+        _timer.Elapsed = DoCleanupAsync;
+    }
+
+    public Task StartAsync(CancellationToken ct) { _timer.Start(ct); return Task.CompletedTask; }
+    public Task StopAsync (CancellationToken ct) { _timer.Stop (ct); return Task.CompletedTask; }
+
+    private Task DoCleanupAsync(AbpAsyncTimer _) { /* ... */ return Task.CompletedTask; }
+}
+```
+
+`AbpAsyncTimer` is registered transient — every consumer gets its own instance, which is what you want for an instance-state object.
+
+The sibling `AbpTimer` is the synchronous variant for cases where there is no async work.
+
+## `ICancellationTokenProvider` — ambient cancellation
+
+```csharp
+// framework/src/Volo.Abp.Threading/Volo/Abp/Threading/ICancellationTokenProvider.cs
+public interface ICancellationTokenProvider
+{
+    CancellationToken Token { get; }
+
+    IDisposable Use(CancellationToken cancellationToken);
+}
+```
+
+Implementations stack overrides via the ambient scope mechanism so a request-scoped cancellation token can be substituted for a finer-grained one inside a `using` block:
+
+```csharp
+// CancellationTokenProviderBase.cs (excerpt)
+public abstract class CancellationTokenProviderBase : ICancellationTokenProvider
+{
+    public const string CancellationTokenOverrideContextKey =
+        "Volo.Abp.Threading.CancellationToken.Override";
+
+    public abstract CancellationToken Token { get; }
+
+    protected IAmbientScopeProvider<CancellationTokenOverride> CancellationTokenOverrideScopeProvider { get; }
+    // Use(CancellationToken) opens an ambient scope keyed by CancellationTokenOverrideContextKey
+}
+```
+
+The token resolution chain:
+
+| Source | When honored |
+| --- | --- |
+| `provider.Use(token)` active in the current async flow | Always wins. |
+| The implementation's own `Token` (e.g. `HttpContext.RequestAborted`) | Otherwise. |
+| `NullCancellationTokenProvider.Instance.Token` (= `CancellationToken.None`) | Fallback for tests or non-request contexts. |
+
+Convenient extension:
+
+```csharp
+// framework/src/Volo.Abp.Threading/Volo/Abp/Threading/CancellationTokenProviderExtensions.cs
+public static CancellationToken FallbackToProvider(this ICancellationTokenProvider provider,
+    CancellationToken prefferedValue = default)
+{
+    return prefferedValue == default || prefferedValue == CancellationToken.None
+        ? provider.Token
+        : prefferedValue;
+}
+```
+
+`FallbackToProvider` is what repositories call to honor a passed-in token if one is provided, and fall back to the ambient one otherwise. The framework's EF Core and MongoDB integrations rely on this so you don't have to plumb the token through every call site.
+
+## `AsyncLocalAmbientDataContext` — `AsyncLocal` made reusable
+
+A single `AsyncLocal<object?>` per key, cached in a static dictionary:
+
+```csharp
+// framework/src/Volo.Abp.Threading/Volo/Abp/Threading/AsyncLocalAmbientDataContext.cs
+public class AsyncLocalAmbientDataContext : IAmbientDataContext, ISingletonDependency
+{
+    private static readonly ConcurrentDictionary<string, AsyncLocal<object?>> AsyncLocalDictionary = new();
+
+    public void SetData(string key, object? value)
+    {
+        var asyncLocal = AsyncLocalDictionary.GetOrAdd(key, (k) => new AsyncLocal<object?>());
+        asyncLocal.Value = value;
+    }
+
+    public object? GetData(string key)
+    {
+        var asyncLocal = AsyncLocalDictionary.GetOrAdd(key, (k) => new AsyncLocal<object?>());
+        return asyncLocal.Value;
+    }
+}
+```
+
+You don't usually consume this directly. The pair you actually use is `IAmbientScopeProvider<T>` + its default implementation, `AmbientDataContextAmbientScopeProvider<T>`. That class wraps an `IAmbientDataContext` and gives you **nested scopes**:
+
+```csharp
+// framework/src/Volo.Abp.Threading/Volo/Abp/Threading/AmbientDataContextAmbientScopeProvider.cs (excerpt)
+public IDisposable BeginScope(string contextKey, T value)
+{
+    var item = new ScopeItem(value, GetCurrentItem(contextKey));
+    if (!ScopeDictionary.TryAdd(item.Id, item))
+    {
+        throw new AbpException("Can not add item! ScopeDictionary.TryAdd returns false!");
+    }
+    _dataContext.SetData(contextKey, item.Id);
+
+    return new DisposeAction<...>(static (state) =>
+    {
+        var (scopeDictionary, item, dataContext, contextKey) = state;
+        scopeDictionary.TryRemove(item.Id, out item);
+        if (item == null) return;
+        if (item.Outer == null) { dataContext.SetData(contextKey, null); return; }
+        dataContext.SetData(contextKey, item.Outer.Id);
+    }, (ScopeDictionary, item, _dataContext, contextKey));
+}
+```
+
+Inner scopes save the outer scope and restore it on dispose, so call sites can compose without leaking. This pattern is what powers `ICurrentTenant.Change(tenantId)`, the unit-of-work nesting in `IUnitOfWorkManager`, and `ICancellationTokenProvider.Use(token)`.
+
+Usage shape:
+
+```csharp
+using (_cancellationProvider.Use(myToken))
+{
+    await _someService.DoAsync();  // observes myToken
+}                                  // restores the previous ambient token
+```
+
+## `OneTimeRunner` and `AsyncOneTimeRunner`
+
+A double-check-locking helper:
+
+```csharp
+// Volo.Abp.Core/Volo/Abp/Threading/OneTimeRunner.cs (paraphrased)
+public class OneTimeRunner
+{
+    private volatile bool _runBefore;
+    public void Run(Action action)
+    {
+        if (_runBefore) return;
+        lock (this)
+        {
+            if (_runBefore) return;
+            action();
+            _runBefore = true;
+        }
+    }
+}
+```
+
+Use it when a singleton needs idempotent late initialization that doesn't fit a static constructor. The async variant uses a `SemaphoreSlim` instead of `lock`.
+
+## `LockExtensions` and `SemaphoreSlimExtensions`
+
+Thin `using` wrappers:
+
+```csharp
+lock (_sync) { /* */ }
+// becomes
+using (_sync.Lock()) { /* */ }
+
+await _semaphore.WaitAsync();
+try { /* */ } finally { _semaphore.Release(); }
+// becomes
+using (await _semaphore.LockAsync()) { /* */ }
+```
+
+Useful in interceptors and pipeline code where a `try/finally` would be visually noisy.
+
+## `TaskCache`
+
+```csharp
+// Volo.Abp.Core/Volo/Abp/Threading/TaskCache.cs (paraphrased)
+public static class TaskCache
+{
+    public static readonly Task<bool> TrueResult = Task.FromResult(true);
+    public static readonly Task<bool> FalseResult = Task.FromResult(false);
+}
+```
+
+A micro-optimization. The auth/permission stack returns `TaskCache.TrueResult` or `FalseResult` thousands of times per request; cached `Task<bool>` instances avoid the allocations.
+
+## `InternalAsyncHelper.AwaitTaskWithFinally`
+
+Internal — used by the interceptor pipeline (see [Dynamic proxy & aspects](/core/dynamic-proxy-and-aspects)) to attach a cleanup action to a method that returns a `Task`. The trick: an interceptor sees a `MethodInfo` returning `Task`, calls `ProceedAsync()`, and now has to `await` the task **and** run a `finally` (commit a UoW, log an audit entry). `AwaitTaskWithFinally` is the glue.
+
+## Patterns at a glance
+
+<AccordionGroup>
+  <Accordion title="Don't ever block on a Task in framework code">
+    The only sanctioned bridge is `AsyncHelper.RunSync`. Calling `.Result`, `.GetAwaiter().GetResult()`, or `.Wait()` from inside a request is a deadlock waiting to happen.
+  </Accordion>
+  <Accordion title="Always honor the ambient cancellation token">
+    In repositories, app services, and background workers, accept a `CancellationToken` parameter and call `_provider.FallbackToProvider(ct)` to pick the most specific one available.
+  </Accordion>
+  <Accordion title="Use AbpAsyncTimer for every N seconds work">
+    Don't roll your own `System.Threading.Timer` if non-overlap matters — `AbpAsyncTimer` already handles the lock + drain semantics correctly.
+  </Accordion>
+  <Accordion title="Use AmbientDataContextAmbientScopeProvider<T> for new ambient state">
+    Don't add another raw `AsyncLocal<T>`. The scope provider gives you nested override semantics for free and integrates with the framework's disposal patterns.
+  </Accordion>
+</AccordionGroup>
+
+## Related reading
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.Core tour" icon="cube" href="/core/volo-abp-core">
+    The `Threading/` folder index — what's in Core vs. the sibling Threading package.
+  </Card>
+  <Card title="Timing" icon="clock" href="/core/timing">
+    `IClock` is the timing-aware companion to the timer primitives documented here.
+  </Card>
+  <Card title="Application lifecycle" icon="play" href="/core/abp-application-base">
+    `AbpApplicationBase.SetupTelemetryTrackingAsync` uses `AsyncHelper.RunSync` to bridge from `Initialize()`.
+  </Card>
+  <Card title="Dynamic proxy & aspects" icon="layer-group" href="/core/dynamic-proxy-and-aspects">
+    Where `InternalAsyncHelper.AwaitTaskWithFinally` is consumed.
+  </Card>
+</CardGroup>

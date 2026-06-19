@@ -1,0 +1,352 @@
+---
+title: "MailKit: MailKitSmtpEmailSender, AbpMailKitOptions, BuildClientAsync"
+sidebarTitle: "MailKit"
+description: "Production-grade SMTP for ABP. Replaces the obsolete System.Net.Mail.SmtpClient with MailKit's SmtpClient and gives you SecureSocketOption, STARTTLS/SslOnConnect control and SmtpClient access for advanced scenarios."
+---
+
+`Volo.Abp.MailKit` is the **production-grade SMTP** provider for ABP's emailing pipeline. It does one thing: replace the built-in `SmtpEmailSender` (which uses the obsolete `System.Net.Mail.SmtpClient`) with a `MailKitSmtpEmailSender` that uses **MailKit** + **MimeKit**. The rest of the [emailing abstractions](/misc/emailing) — settings, queueing, normalization — stay exactly the same.
+
+Source: `framework/src/Volo.Abp.MailKit/Volo/Abp/MailKit/`
+
+## Why MailKit
+
+Microsoft itself recommends MailKit instead of `System.Net.Mail.SmtpClient`. The latter has known limitations around modern protocols (lacks proper STARTTLS negotiation, no IPv6 in some cases, no async cancellation on the wire). The built-in `SmtpEmailSender` even prints a warning that says exactly this:
+
+```text
+WARN  We don't recommend that you use the SmtpClient class for new development because SmtpClient doesn't
+      support many modern protocols. Use MailKit or other libraries instead.
+```
+
+Adding `Volo.Abp.MailKit` makes that warning go away.
+
+## How the replacement happens
+
+```csharp
+// framework/src/Volo.Abp.MailKit/Volo/Abp/MailKit/MailKitSmtpEmailSender.cs
+using SmtpClient = MailKit.Net.Smtp.SmtpClient;
+
+namespace Volo.Abp.MailKit;
+
+[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]
+public class MailKitSmtpEmailSender : EmailSenderBase, IMailKitSmtpEmailSender
+{
+    protected AbpMailKitOptions AbpMailKitOptions { get; }
+    protected ISmtpEmailSenderConfiguration SmtpConfiguration { get; }
+
+    public MailKitSmtpEmailSender(
+        ICurrentTenant currentTenant,
+        ISmtpEmailSenderConfiguration smtpConfiguration,
+        IBackgroundJobManager backgroundJobManager,
+        IOptions<AbpMailKitOptions> abpMailKitConfiguration)
+        : base(currentTenant, smtpConfiguration, backgroundJobManager)
+    {
+        AbpMailKitOptions = abpMailKitConfiguration.Value;
+        SmtpConfiguration = smtpConfiguration;
+    }
+    // …
+}
+```
+
+Two annotations do all the work:
+
+- **`[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]`** — DI registers this as transient and replaces *every* prior registration of the services it exposes.
+- **`IMailKitSmtpEmailSender : IEmailSender`** — by implementing both the marker interface and inheriting `EmailSenderBase` (which `[ExposeServices]` chains include `IEmailSender`), it takes over the resolved `IEmailSender` slot.
+
+Net effect: every caller in your app already injecting `IEmailSender` automatically goes through MailKit. No call-site changes.
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.MailKit/Volo/Abp/MailKit/AbpMailKitModule.cs
+[DependsOn(typeof(AbpEmailingModule))]
+public class AbpMailKitModule : AbpModule
+{
+}
+```
+
+That's the entire module. The `[DependsOn]` makes sure the emailing abstractions are loaded; the `MailKitSmtpEmailSender` registration via attributes handles the rest. Add `AbpMailKitModule` to your host module's `[DependsOn]` and you're done.
+
+## The interface
+
+```csharp
+// framework/src/Volo.Abp.MailKit/Volo/Abp/MailKit/IMailKitSmtpEmailSender.cs
+public interface IMailKitSmtpEmailSender : IEmailSender
+{
+    Task<SmtpClient> BuildClientAsync();
+}
+```
+
+`BuildClientAsync()` is an escape hatch — for the rare case you need to drive the MailKit client yourself (custom MIME composition, raw extension commands, capability checks). It returns a **fully connected and authenticated** `MailKit.Net.Smtp.SmtpClient`. You're responsible for `DisconnectAsync(true)` and `Dispose` when you're done.
+
+## The send path
+
+```csharp
+protected async override Task SendEmailAsync(MailMessage mail)
+{
+    using (var client = await BuildClientAsync())
+    {
+        var message = MimeMessage.CreateFromMailMessage(mail);
+        message.MessageId = MimeUtils.GenerateMessageId();
+        await client.SendAsync(message);
+        await client.DisconnectAsync(true);
+    }
+}
+```
+
+Three points worth noticing:
+
+1. **`MimeMessage.CreateFromMailMessage(mail)`** is the bridge: the `EmailSenderBase` still works with `System.Net.Mail.MailMessage`, so all the `AdditionalEmailSendingArgs`, attachments, CC, and normalization logic stay intact. MailKit translates that into its own `MimeMessage` type.
+2. **`message.MessageId = MimeUtils.GenerateMessageId()`** — guarantees a unique `Message-ID` header even if the caller didn't set one. Some receivers reject messages without it.
+3. **`DisconnectAsync(true)`** sends a polite `QUIT` to the server. Without this the connection hangs around for a moment longer than it should.
+
+## Building the client
+
+```csharp
+public async Task<SmtpClient> BuildClientAsync()
+{
+    var client = new SmtpClient();
+
+    try
+    {
+        await ConfigureClient(client);
+        return client;
+    }
+    catch
+    {
+        client.Dispose();
+        throw;
+    }
+}
+
+protected virtual async Task ConfigureClient(SmtpClient client)
+{
+    await client.ConnectAsync(
+        await SmtpConfiguration.GetHostAsync(),
+        await SmtpConfiguration.GetPortAsync(),
+        await GetSecureSocketOption()
+    );
+
+    if (await SmtpConfiguration.GetUseDefaultCredentialsAsync())
+    {
+        return;
+    }
+
+    await client.AuthenticateAsync(
+        await SmtpConfiguration.GetUserNameAsync(),
+        await SmtpConfiguration.GetPasswordAsync()
+    );
+}
+```
+
+The `BuildClientAsync` wrapper guarantees that if `ConfigureClient` throws (DNS failure, auth rejection, TLS handshake failure), the half-built `SmtpClient` is disposed before the exception propagates. This is the standard "factory that owns disposal on failure" pattern; copy it whenever you write a similar factory.
+
+Settings come from the same `ISmtpEmailSenderConfiguration` the built-in SMTP sender used, which is backed by `EmailSettingNames.Smtp.*`:
+
+| Setting | Used for |
+|---|---|
+| `Abp.Mailing.Smtp.Host` | `ConnectAsync(host, …)` |
+| `Abp.Mailing.Smtp.Port` | `ConnectAsync(…, port, …)` |
+| `Abp.Mailing.Smtp.EnableSsl` | Chooses default `SecureSocketOption` |
+| `Abp.Mailing.Smtp.UseDefaultCredentials` | Skip the `AuthenticateAsync` step entirely |
+| `Abp.Mailing.Smtp.UserName` | `AuthenticateAsync` |
+| `Abp.Mailing.Smtp.Password` | `AuthenticateAsync` (stored encrypted) |
+| `Abp.Mailing.Smtp.Domain` | Not currently used by MailKit (it's an NTLM artefact) |
+
+## `AbpMailKitOptions`
+
+```csharp
+// framework/src/Volo.Abp.MailKit/Volo/Abp/MailKit/AbpMailKitOptions.cs
+using MailKit.Security;
+
+namespace Volo.Abp.MailKit;
+
+public class AbpMailKitOptions
+{
+    public SecureSocketOptions? SecureSocketOption { get; set; }
+}
+```
+
+A single nullable property. The default policy is in `MailKitSmtpEmailSender.GetSecureSocketOption`:
+
+```csharp
+protected virtual async Task<SecureSocketOptions> GetSecureSocketOption()
+{
+    if (AbpMailKitOptions.SecureSocketOption.HasValue)
+    {
+        return AbpMailKitOptions.SecureSocketOption.Value;
+    }
+
+    return await SmtpConfiguration.GetEnableSslAsync()
+        ? SecureSocketOptions.SslOnConnect
+        : SecureSocketOptions.StartTlsWhenAvailable;
+}
+```
+
+Rules:
+
+- If you set `AbpMailKitOptions.SecureSocketOption` explicitly, MailKit uses exactly that — no further checks.
+- Otherwise, look at the `Abp.Mailing.Smtp.EnableSsl` setting:
+  - `true` → `SslOnConnect` (port 465 style — implicit TLS from the first byte)
+  - `false` → `StartTlsWhenAvailable` (port 587 / 25 — opportunistic STARTTLS upgrade)
+
+For most modern providers (Gmail, Microsoft 365, Mailgun, SendGrid) the default `StartTlsWhenAvailable` against port 587 is correct, with `EnableSsl` left `false`.
+
+### The four `SecureSocketOptions` values, in plain English
+
+| Value | What it does |
+|---|---|
+| `None` | Plain text. Don't. |
+| `Auto` | Let MailKit pick based on port (465 → SSL, others → STARTTLS if offered). |
+| `SslOnConnect` | Implicit TLS from byte zero. Use with port 465. |
+| `StartTls` | STARTTLS mandatory — fail if the server doesn't advertise it. |
+| `StartTlsWhenAvailable` | STARTTLS if the server advertises it, otherwise plain. ABP's default fallback. |
+
+### Pinning a specific policy
+
+```csharp
+[DependsOn(typeof(AbpMailKitModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpMailKitOptions>(options =>
+        {
+            options.SecureSocketOption = SecureSocketOptions.StartTls;
+        });
+    }
+}
+```
+
+For a security-conscious deployment, set `StartTls` (not `StartTlsWhenAvailable`) so the worker hard-fails on a misconfigured server instead of leaking creds over plain text.
+
+## OAuth2 and custom auth
+
+For Gmail XOAUTH2, IMAP-backed mail relays, etc., subclass `MailKitSmtpEmailSender` and override `ConfigureClient`:
+
+```csharp
+[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]
+[ExposeServices(typeof(IEmailSender), typeof(IMailKitSmtpEmailSender))]
+public class OAuth2MailKitSmtpEmailSender : MailKitSmtpEmailSender
+{
+    private readonly IGoogleTokenSource _tokens;
+
+    public OAuth2MailKitSmtpEmailSender(
+        ICurrentTenant currentTenant,
+        ISmtpEmailSenderConfiguration smtpConfiguration,
+        IBackgroundJobManager backgroundJobManager,
+        IOptions<AbpMailKitOptions> opts,
+        IGoogleTokenSource tokens)
+        : base(currentTenant, smtpConfiguration, backgroundJobManager, opts)
+    {
+        _tokens = tokens;
+    }
+
+    protected override async Task ConfigureClient(MailKit.Net.Smtp.SmtpClient client)
+    {
+        await client.ConnectAsync(
+            await SmtpConfiguration.GetHostAsync(),
+            await SmtpConfiguration.GetPortAsync(),
+            await GetSecureSocketOption());
+
+        var user  = await SmtpConfiguration.GetUserNameAsync();
+        var token = await _tokens.GetAccessTokenAsync();
+        var oauth2 = new SaslMechanismOAuth2(user, token);
+
+        await client.AuthenticateAsync(oauth2);
+    }
+}
+```
+
+Because `MailKitSmtpEmailSender` exposes `IEmailSender`, `IMailKitSmtpEmailSender`, **and** the protected `ConfigureClient` is virtual, you can pivot the auth without touching anything else in the pipeline. The `ReplaceServices = true` on your derived class re-claims the registration that the base class originally took.
+
+## Driving MailKit directly
+
+`IMailKitSmtpEmailSender.BuildClientAsync` is the official escape hatch. Reach for it when you need:
+
+- **DSN / delivery-status notification** flags (`MimeMessage.Headers.Add("Return-Receipt-To", ...)`).
+- **Multiple recipients with per-recipient envelope-From** that `System.Net.Mail.MailMessage` can't express cleanly.
+- **Capability probing** before composing the body (e.g. only attach inline images if `client.Capabilities` includes `BINARYMIME`).
+
+```csharp
+public class DigestSender
+{
+    private readonly IMailKitSmtpEmailSender _sender;
+
+    public DigestSender(IMailKitSmtpEmailSender sender)
+    {
+        _sender = sender;
+    }
+
+    public async Task SendDigestAsync(MimeMessage message)
+    {
+        using var client = await _sender.BuildClientAsync();
+        await client.SendAsync(message);
+        await client.DisconnectAsync(true);
+    }
+}
+```
+
+You still get `[Dependency]` lifecycle, settings, and tenant scope for free — just don't fight the rules of the `using` block.
+
+## Common pitfalls
+
+<Warning>**Mismatched `EnableSsl` and port.** If `Abp.Mailing.Smtp.EnableSsl=true` but the port is 587, MailKit will try `SslOnConnect` against a STARTTLS endpoint and the TLS handshake will fail before any SMTP traffic. Set `EnableSsl=false` and let `StartTlsWhenAvailable` do its thing, or set `AbpMailKitOptions.SecureSocketOption = SecureSocketOptions.StartTls` explicitly.</Warning>
+
+<Warning>**Default credentials on Linux.** `Abp.Mailing.Smtp.UseDefaultCredentials=true` made sense for IIS-on-Windows scenarios with Kerberos. On Linux it almost always means "don't send credentials at all", which makes most public SMTP relays reject the message. Set it to `false` and provide explicit `UserName` / `Password`.</Warning>
+
+<Warning>**Connection pooling.** This sender opens a fresh connection per send. That's deliberate — multitenant scenarios may change `Host`/credentials per tenant. If you need a long-lived connection for bursts, wrap your batch logic with one `BuildClientAsync()` and call `client.SendAsync(message)` in a loop, then `DisconnectAsync(true)`.</Warning>
+
+## Configuration example
+
+`appsettings.json`-driven settings would go through your tenant or default setting provider, but for a quick smoke test you can seed `ISettingDefinitionManager` defaults:
+
+```csharp
+public class DevEmailSettingsContributor : SettingDefinitionProvider
+{
+    public override void Define(ISettingDefinitionContext context)
+    {
+        context.GetOrNull(EmailSettingNames.DefaultFromAddress)
+            ?.WithProperty("Default", "noreply@contoso.local");
+
+        context.GetOrNull(EmailSettingNames.Smtp.Host)
+            ?.WithProperty("Default", "smtp.mailtrap.io");
+
+        context.GetOrNull(EmailSettingNames.Smtp.Port)
+            ?.WithProperty("Default", "587");
+    }
+}
+```
+
+…and then add `AbpMailKitModule` to your host module:
+
+```csharp
+[DependsOn(
+    typeof(AbpMailKitModule)
+)]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpMailKitOptions>(opts =>
+        {
+            opts.SecureSocketOption = SecureSocketOptions.StartTlsWhenAvailable;
+        });
+    }
+}
+```
+
+Now `IEmailSender.SendAsync` goes through MailKit.
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Emailing core" icon="envelope" href="/misc/emailing">
+    The `IEmailSender` contract, `EmailSenderBase`, normalization and queueing.
+  </Card>
+  <Card title="Options & configuration" icon="gear" href="/core/options-and-configuration">
+    Where `AbpMailKitOptions` and `EmailSettingNames` get their values from.
+  </Card>
+  <Card title="Identity module" icon="user-shield" href="/modules/identity/overview">
+    Triggers password-reset and email-confirmation messages through `IEmailSender`.
+  </Card>
+</CardGroup>

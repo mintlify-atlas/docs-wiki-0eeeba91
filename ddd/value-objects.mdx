@@ -1,0 +1,304 @@
+---
+title: "ABP Value Objects: ValueObject Base Class Reference"
+sidebarTitle: "Value Objects"
+description: "ValueObject base class, GetAtomicValues equality contract, structural recursion and composition patterns with BasicAggregateRoot and entities."
+---
+
+The `Volo/Abp/Domain/Values/` folder under `framework/src/Volo.Abp.Ddd.Domain/` contains a single file — `ValueObject.cs` — but it encodes one of DDD's most important building blocks. A **value object** is an immutable type identified only by the value of its attributes (`Address("221B", "Baker St", "London") == Address("221B", "Baker St", "London")` always), as opposed to an entity which is identified by an Id. ABP's `ValueObject` base class implements structural equality via the `GetAtomicValues` template method and is intentionally tiny so you can compose it freely inside entities and aggregate roots.
+
+This page documents the source, walks the equality algorithm, and shows how value objects compose with `BasicAggregateRoot`/`AggregateRoot`.
+
+## Source
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Values/ValueObject.cs
+using System.Collections.Generic;
+
+namespace Volo.Abp.Domain.Values;
+
+// Inspired from https://docs.microsoft.com/en-us/dotnet/standard/microservices-architecture/microservice-ddd-cqrs-patterns/implement-value-objects
+
+public abstract class ValueObject
+{
+    protected abstract IEnumerable<object> GetAtomicValues();
+
+    public bool ValueEquals(object obj)
+    {
+        if (obj == null || obj.GetType() != GetType())
+        {
+            return false;
+        }
+
+        var other = (ValueObject)obj;
+
+        var thisValues = GetAtomicValues().GetEnumerator();
+        var otherValues = other.GetAtomicValues().GetEnumerator();
+
+        var thisMoveNext = thisValues.MoveNext();
+        var otherMoveNext = otherValues.MoveNext();
+        while (thisMoveNext && otherMoveNext)
+        {
+            if (ReferenceEquals(thisValues.Current, null) ^ ReferenceEquals(otherValues.Current, null))
+            {
+                return false;
+            }
+
+            if (thisValues.Current is ValueObject currentValueObject && otherValues.Current is ValueObject otherValueObject)
+            {
+                if (!currentValueObject.ValueEquals(otherValueObject))
+                {
+                    return false;
+                }
+            }
+            else if (thisValues.Current != null && !thisValues.Current.Equals(otherValues.Current))
+            {
+                return false;
+            }
+
+            thisMoveNext = thisValues.MoveNext();
+            otherMoveNext = otherValues.MoveNext();
+
+            if (thisMoveNext != otherMoveNext)
+            {
+                return false;
+            }
+        }
+
+        return !thisMoveNext && !otherMoveNext;
+    }
+}
+```
+
+The base class is intentionally minimal:
+
+- `GetAtomicValues()` is the only thing you must override. Yield the fields that *define* the value.
+- `ValueEquals` walks both sequences in lock-step and short-circuits on the first mismatch.
+- The equality is **recursive**: if an atomic value is itself a `ValueObject`, it's compared via `ValueEquals` rather than `Equals`. Nested value objects work without extra code.
+
+## How equality works step-by-step
+
+1. **Null guard / type check** — `obj` must be non-null and the same runtime type. `Address` is not equal to `BillingAddress` even if both carry the same fields.
+2. **Atomic sequences** — both instances yield their atomic values via `GetAtomicValues`.
+3. **Walk in lock-step** — for each pair:
+   - If one is null and the other isn't, not equal.
+   - If both are value objects, recurse into `ValueEquals`.
+   - Otherwise call `Equals` (covering primitives and reference types that override `Equals`).
+4. **Length match** — if one enumerator finishes before the other, the objects are not equal.
+
+This is robust to:
+
+- Different runtime types with the same field shape.
+- Nested value objects (e.g. `Address` containing a `Coordinates` value object).
+- Null fields on either side.
+
+## Idiomatic value object
+
+```csharp
+public class Address : ValueObject
+{
+    public string Street { get; }
+    public string City { get; }
+    public string PostalCode { get; }
+    public Country Country { get; } // nested value object
+
+    public Address(string street, string city, string postalCode, Country country)
+    {
+        Street = street;
+        City = city;
+        PostalCode = postalCode;
+        Country = country;
+    }
+
+    protected override IEnumerable<object> GetAtomicValues()
+    {
+        yield return Street;
+        yield return City;
+        yield return PostalCode;
+        yield return Country;
+    }
+}
+
+public class Country : ValueObject
+{
+    public string IsoCode { get; }
+    public string Name { get; }
+
+    public Country(string isoCode, string name) { IsoCode = isoCode; Name = name; }
+
+    protected override IEnumerable<object> GetAtomicValues()
+    {
+        yield return IsoCode;
+        yield return Name;
+    }
+}
+```
+
+`Address.ValueEquals` will recurse into `Country.ValueEquals` automatically because the algorithm checks `is ValueObject` per atomic value.
+
+## Immutability convention
+
+Although `ValueObject` doesn't *enforce* immutability, every property in the example above is `{ get; }` set only via the constructor. The convention every ABP module follows:
+
+- All properties are publicly read-only.
+- A private parameterless constructor exists only when EF Core / MongoDB serialisation needs it.
+- "Mutators" (e.g. `Address WithStreet(string newStreet)`) return a **new** instance.
+
+Treat value objects like records: they are equal if their values are equal, and they never mutate.
+
+## Composition with entities and aggregate roots
+
+Value objects shine when composed inside aggregate roots:
+
+```csharp
+public class Order : AggregateRoot<Guid>
+{
+    public Address ShippingAddress { get; private set; }
+    public Money Subtotal { get; private set; }
+    public Money Tax { get; private set; }
+    public Money Total => Subtotal + Tax; // operator overloaded on Money
+
+    private Order() { /* ORM */ }
+
+    public Order(Guid id, Address shippingAddress) : base(id)
+    {
+        ShippingAddress = shippingAddress;
+        Subtotal = Money.Zero;
+        Tax = Money.Zero;
+    }
+
+    public void Recalculate(Money subtotal, Money tax)
+    {
+        Subtotal = subtotal;
+        Tax = tax;
+        AddLocalEvent(new OrderTotalsChangedEvent(Id, Total));
+    }
+}
+```
+
+`Order` is an `AggregateRoot<Guid>` (Id-based identity). `Address`, `Money`, etc. are value objects (value-based identity). The aggregate "owns" the value objects; they're replaced wholesale rather than mutated, which preserves the invariants ABP's auditing relies on.
+
+### `BasicAggregateRoot` composition
+
+When you don't want extra-properties or a concurrency stamp on an aggregate but you still want it to publish domain events, `BasicAggregateRoot<TKey>` (see [Entities & Aggregates](/ddd/entities-and-aggregates#basicaggregateroot)) is the right base. Value objects compose with `BasicAggregateRoot` identically — they don't care which level of the aggregate hierarchy you choose:
+
+```csharp
+public class Coupon : BasicAggregateRoot<Guid>
+{
+    public CouponCode Code { get; private set; }
+    public Money Discount { get; private set; }
+
+    private Coupon() { }
+
+    public Coupon(Guid id, CouponCode code, Money discount) : base(id)
+    {
+        Code = code;
+        Discount = discount;
+    }
+}
+```
+
+`Coupon` skips the `ExtraProperties` and `ConcurrencyStamp` ceremony of `AggregateRoot` but still benefits from `IGeneratesDomainEvents`, and it composes value objects without ambiguity.
+
+## Persisting value objects
+
+How the value object reaches storage depends on the provider:
+
+- **EF Core** typically owns value objects as `OwnsOne` mappings so their fields become columns on the parent table. The `Volo.Abp.EntityFrameworkCore` package — see [data/entityframeworkcore](/data/entityframeworkcore) — documents the conventions.
+- **MongoDB** serialises them as embedded BSON documents directly. See [data/mongodb](/data/mongodb).
+- **Dapper** maps the columns into the value-object constructor parameters. See [data/dapper](/data/dapper).
+
+Because the value object is immutable and its identity is its content, **never** create a separate table for it; always own it from the parent aggregate.
+
+## Equality, GetHashCode and dictionaries
+
+`ValueObject.ValueEquals` is a **method**, not an override of `Equals`/`GetHashCode`. ABP intentionally keeps the equality "opt-in" so that:
+
+- LINQ providers and EF Core change tracking don't accidentally treat two physical instances of the same value as identical.
+- You can still use a value object as a hash key if you override `Equals`/`GetHashCode` in the subclass with the same semantics:
+
+```csharp
+public override bool Equals(object obj) => obj is Address other && ValueEquals(other);
+public override int GetHashCode() => HashCode.Combine(Street, City, PostalCode, Country);
+```
+
+Once those are overridden, `Dictionary<Address, ShipmentMethod>` works as you'd expect.
+
+## Reading `ValueObject` via `EntityHelper`
+
+`EntityHelper.IsValueObject` returns true for any type derived from `ValueObject` and is used internally by ABP to differentiate aggregates from value objects during reflection-driven scenarios (validation, auditing, ETO mapping):
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/EntityHelper.cs
+public static Func<Type, bool> IsValueObjectPredicate = type => typeof(ValueObject).IsAssignableFrom(type);
+public static bool IsValueObject(Type type) { ... }
+public static bool IsValueObject(object? obj) => obj != null && IsValueObject(obj.GetType());
+```
+
+You can swap `IsValueObjectPredicate` if you adopt your own base class for value objects in a custom module.
+
+## Worked example: a `Money` value object with operators
+
+```csharp
+public sealed class Money : ValueObject
+{
+    public decimal Amount { get; }
+    public string Currency { get; }
+
+    public static Money Zero { get; } = new(0m, "USD");
+
+    public Money(decimal amount, string currency)
+    {
+        Amount = amount;
+        Currency = currency;
+    }
+
+    public static Money operator +(Money left, Money right)
+    {
+        if (left.Currency != right.Currency)
+            throw new BusinessException("Money:CurrencyMismatch")
+                .WithData("Left", left.Currency).WithData("Right", right.Currency);
+        return new Money(left.Amount + right.Amount, left.Currency);
+    }
+
+    public static Money operator -(Money left, Money right)
+    {
+        if (left.Currency != right.Currency)
+            throw new BusinessException("Money:CurrencyMismatch");
+        return new Money(left.Amount - right.Amount, left.Currency);
+    }
+
+    protected override IEnumerable<object> GetAtomicValues()
+    {
+        yield return Amount;
+        yield return Currency;
+    }
+}
+```
+
+The `Currency` mismatch raises a `BusinessException` so the application layer can translate the error code via [Exception Handling](/core/exception-handling).
+
+## When to choose value object vs entity
+
+| Question | If yes → | If no → |
+| --- | --- | --- |
+| Is the object identified by its data (not an Id)? | Value object | Entity / Aggregate root |
+| Is it immutable? Will any change produce a *new* one? | Value object | Entity |
+| Does it have a lifecycle of its own (created, updated, deleted)? | Aggregate root | Value object |
+| Will it be referenced from outside its parent? | Aggregate root | Value object |
+
+When in doubt, start with a value object. It's much easier to "promote" a value object to an entity later than to reverse the migration.
+
+## Cross-references
+
+- [Domain](/ddd/domain) — the package that owns the `Values/` folder.
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — composition target for value objects; covers `BasicAggregateRoot` referenced from this page.
+- [Domain Services](/ddd/domain-services) — domain services often accept value objects as inputs and return them.
+- [Specifications](/ddd/specifications) — predicates that operate on aggregates can read value-object fields directly.
+- [Object Mapping](/ddd/object-mapping) — DTOs typically contain plain-record analogues of value objects; map both ways via `IObjectMapper`.
+- [data/entityframeworkcore](/data/entityframeworkcore) — owns-one mapping recipe.
+- [data/mongodb](/data/mongodb) — embedded document mapping.
+- [core/exception-handling](/core/exception-handling) — `BusinessException` for validation failures inside operators.
+
+<Tip>
+The Microsoft documentation linked in the ABP source ("Implement Value Objects") is the canonical primer if you want to dive deeper into the pattern's rationale.
+</Tip>

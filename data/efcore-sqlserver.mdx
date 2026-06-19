@@ -1,0 +1,300 @@
+---
+title: "EF Core SQL Server Adapter: UseSqlServer and Checker"
+sidebarTitle: "EF Core: SQL Server"
+description: "Volo.Abp.EntityFrameworkCore.SqlServer is a thin adapter: UseSqlServer extension, sequential GUID strategy, and a live connection checker."
+---
+
+`Volo.Abp.EntityFrameworkCore.SqlServer` is the ABP adapter for Microsoft SQL Server. It is intentionally tiny — the whole package is one module, one options extension, one model‑builder helper, and one connection‑string checker. The real work happens in [`Volo.Abp.EntityFrameworkCore`](/data/entityframeworkcore). The source lives in `framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/`.
+
+## Package contents
+
+```
+framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/
+├── Microsoft/EntityFrameworkCore/
+│   └── AbpSqlServerModelBuilderExtensions.cs
+└── Volo/Abp/EntityFrameworkCore/
+    ├── AbpDbContextConfigurationContextSqlServerExtensions.cs
+    ├── AbpDbContextOptionsSqlServerExtensions.cs
+    ├── ConnectionStrings/SqlServerConnectionStringChecker.cs
+    └── SqlServer/AbpEntityFrameworkCoreSqlServerModule.cs
+```
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/Volo/Abp/EntityFrameworkCore/SqlServer/AbpEntityFrameworkCoreSqlServerModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreSqlServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAtEnd;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+Two settings worth knowing:
+
+- **`SequentialGuidType.SequentialAtEnd`** — best for SQL Server's clustered GUID PKs. Sequential bytes go at the **end** of the GUID, matching SQL Server's `newsequentialid()` ordering. (PostgreSQL uses `SequentialAsString`, Oracle/MySQL use other variants — see those pages.)
+- **`AbpEfCoreGlobalFilterOptions.UseDbFunction = true`** — tells `AbpDbContext` to emit the soft‑delete/multi‑tenant filter as a *database function* (a `CASE WHEN @p = 0 OR IsDeleted = 0` reduces to a stored UDF). Better plan cache reuse than inlining the boolean every query.
+
+## The UseSqlServer extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsSqlServerExtensions.cs
+public static class AbpDbContextOptionsSqlServerExtensions
+{
+    public static void UseSqlServer(
+        [NotNull] this AbpDbContextOptions options,
+        Action<SqlServerDbContextOptionsBuilder>? sqlServerOptionsAction = null)
+    {
+        options.Configure(context =>
+        {
+            context.UseSqlServer(sqlServerOptionsAction);
+        });
+    }
+
+    public static void UseSqlServer<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<SqlServerDbContextOptionsBuilder>? sqlServerOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseSqlServer(sqlServerOptionsAction);
+        });
+    }
+}
+```
+
+The companion `AbpDbContextConfigurationContextSqlServerExtensions.cs` adds the `UseSqlServer` to an individual `AbpDbContextConfigurationContext` (the per‑DbContext context handed to `Configure(...)`). The implementations all funnel into EF Core's stock `SqlServerDbContextOptionsBuilder`.
+
+Usage in your module:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpDbContextOptions>(options =>
+    {
+        options.UseSqlServer();                                  // for every DbContext
+        // or
+        options.UseSqlServer<MyAppDbContext>(b => b.CommandTimeout(60));  // per-context
+    });
+
+    context.Services.AddAbpDbContext<MyAppDbContext>(opts =>
+    {
+        opts.AddDefaultRepositories(includeAllEntities: true);
+    });
+}
+```
+
+## The connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/Volo/Abp/EntityFrameworkCore/ConnectionStrings/SqlServerConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class SqlServerConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new SqlConnectionStringBuilder(connectionString) { ConnectTimeout = 1 };
+            var oldDatabaseName = connString.InitialCatalog;
+            connString.InitialCatalog = "master";
+
+            await using var conn = new SqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+It replaces the default no‑op `IConnectionStringChecker`. The check is two‑step:
+
+1. Connect to `master` with `ConnectTimeout = 1` — answers "is the server alive?".
+2. `ChangeDatabaseAsync` to the original DB — answers "does the database exist?".
+
+The SaaS host uses both flags to decide between "create database", "run migrations" and "fail tenant onboarding".
+
+## Model-builder helpers
+
+`Microsoft/EntityFrameworkCore/AbpSqlServerModelBuilderExtensions.cs` exposes SQL Server–only conveniences (table hints, computed columns) that integrate with ABP's conventional configurers. Browse the file for the up‑to‑date list; you'll typically reach for these from a custom `OnModelCreating`:
+
+```csharp
+modelBuilder.Entity<Book>(b =>
+{
+    b.ConfigureByConvention();
+    b.Property(x => x.NameLower)
+        .HasComputedColumnSql("LOWER([Name])", stored: true);
+});
+```
+
+## NuGet / module wiring
+
+```xml
+<PackageReference Include="Volo.Abp.EntityFrameworkCore.SqlServer" Version="..." />
+```
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreSqlServerModule),
+    // ... your other modules
+)]
+public class MyAppEntityFrameworkCoreModule : AbpModule
+{
+    // see ConfigureServices above
+}
+```
+
+## End-to-end: from `UseSqlServer` to a row
+
+Putting it all together for a Books module on SQL Server:
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreSqlServerModule),
+    typeof(BooksDomainModule)
+)]
+public class BooksEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseSqlServer<BooksDbContext>(b =>
+            {
+                b.CommandTimeout(30);
+                b.MigrationsAssembly("MyCompany.Books.EntityFrameworkCore");
+            });
+        });
+
+        context.Services.AddAbpDbContext<BooksDbContext>(opts =>
+        {
+            opts.AddDefaultRepositories(includeAllEntities: true);
+            opts.Entity<Book>(b =>
+            {
+                b.DefaultWithDetailsFunc = q => q.Include(x => x.Author);
+            });
+        });
+    }
+}
+```
+
+```csharp
+[ConnectionStringName(BooksDbProperties.ConnectionStringName)]   // "Books"
+public class BooksDbContext : AbpDbContext<BooksDbContext>
+{
+    public DbSet<Book> Books { get; set; }
+
+    public BooksDbContext(DbContextOptions<BooksDbContext> options)
+        : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.Entity<Book>(b =>
+        {
+            b.ToTable(BooksDbProperties.DbTablePrefix + "Books");
+            b.ConfigureByConvention();      // audit, soft-delete, ExtraProperties, multi-tenant
+            b.Property(x => x.Name).IsRequired().HasMaxLength(128);
+        });
+    }
+}
+```
+
+`appsettings.json`:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=.;Database=MyApp;Trusted_Connection=True;TrustServerCertificate=True",
+    "Books":   "Server=.;Database=MyApp;Trusted_Connection=True;TrustServerCertificate=True"
+  }
+}
+```
+
+`Server=.;Trusted_Connection=True` is the typical dev string for SQL Server Developer / Express running on Windows; switch to `User Id=sa;Password=...` for sa auth or `Authentication=Active Directory Default` for Entra ID.
+
+## DbMigrator host
+
+Running `dotnet ef migrations add Books_Initial -p MyCompany.Books.EntityFrameworkCore` works as usual — the `MigrationsAssembly` you set in `UseSqlServer<BooksDbContext>` tells EF Core where to write the migration. `IDesignTimeDbContextFactory<BooksDbContext>` (a small DbMigrator‑style factory ABP templates include) supplies a connection string and bootstraps a minimal DI graph for the design‑time tooling.
+
+For a multi‑module app the ABP DbMigrator console (`MyCompany.MyApp.DbMigrator`) loops every module's `DbContext`, runs pending migrations, then calls `IDataSeeder.SeedAsync()` (see [`/data/data-seeding`](/data/data-seeding)).
+
+## Tips for SQL Server in production
+
+<AccordionGroup>
+  <Accordion title="Always set TrustServerCertificate carefully">
+    On `Microsoft.Data.SqlClient` 4.0+ the default is `Encrypt=Mandatory`. In dev that breaks against unverified certs — set `TrustServerCertificate=True` only for dev. In prod, deploy a proper certificate and remove the flag.
+  </Accordion>
+  <Accordion title="Sequential-at-end GUIDs reduce page splits">
+    `SequentialGuidType.SequentialAtEnd` keeps newly inserted GUID PKs in increasing clustered order. This minimizes page splits on the clustered index; SQL Server's own `newsequentialid()` follows the same pattern.
+  </Accordion>
+  <Accordion title="ConfigureWarnings(PendingModelChangesWarning)">
+    `AbpDbContext.OnConfiguring` ignores EF Core 9's `PendingModelChangesWarning`. ABP relies on the conventional configurers (e.g. `ConfigureByConvention`) to add columns at model build time; that's a legitimate warning in EF Core's view but normal for ABP.
+  </Accordion>
+  <Accordion title="Hot connection probe">
+    The `SqlServerConnectionStringChecker` opens against `master` with a 1‑second timeout. Behind a slow VPN this can return a false negative — replace it (via `[Dependency(ReplaceServices = true)]`) with a more lenient probe in such environments.
+  </Accordion>
+</AccordionGroup>
+
+## What this adapter does **not** do
+
+<Warning>
+This package is **only** a provider adapter. It contains no repositories, no DbContext, no model. All of those live in `Volo.Abp.EntityFrameworkCore` (the base) plus your application's own `MyAppDbContext`. If you find yourself looking at this package for behavior changes, you're probably looking in the wrong place — see [`/data/entityframeworkcore`](/data/entityframeworkcore).
+</Warning>
+
+## File index
+
+| File                                                                                | Role                                          |
+| ----------------------------------------------------------------------------------- | --------------------------------------------- |
+| `SqlServer/AbpEntityFrameworkCoreSqlServerModule.cs`                                | Module: sets SequentialAtEnd, UseDbFunction.  |
+| `AbpDbContextOptionsSqlServerExtensions.cs`                                         | `UseSqlServer(this AbpDbContextOptions)`.     |
+| `AbpDbContextConfigurationContextSqlServerExtensions.cs`                            | `UseSqlServer` on `AbpDbContextConfigurationContext`. |
+| `ConnectionStrings/SqlServerConnectionStringChecker.cs`                             | Live probe via `master`.                      |
+| `Microsoft/EntityFrameworkCore/AbpSqlServerModelBuilderExtensions.cs`               | Model-builder convenience extensions.         |
+
+Five files, zero surprises. Anything you change here has equivalents in [`PostgreSQL`](/data/efcore-postgresql), [`MySQL`](/data/efcore-mysql), [`Oracle`](/data/efcore-oracle) and [`SQLite`](/data/efcore-sqlite).
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    The base implementation everything sits on.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    Where `[ConnectionStringName]` and `SqlServerConnectionStringChecker` plug in.
+  </Card>
+  <Card title="PostgreSQL adapter" icon="elephant" href="/data/efcore-postgresql">
+    Same shape, different provider.
+  </Card>
+  <Card title="SQLite adapter" icon="feather" href="/data/efcore-sqlite">
+    Includes the test‑friendly `AbpUnitTestSqliteConnection`.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The domain face of the EF Core repository.
+  </Card>
+  <Card title="UoW transaction flow" icon="diagram-project" href="/flows/unit-of-work-lifecycle">
+    End‑to‑end commit narrative.
+  </Card>
+</CardGroup>

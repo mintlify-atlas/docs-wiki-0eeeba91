@@ -1,0 +1,404 @@
+---
+title: "IMultiTenant Data Filtering Across EF Core and MongoDB"
+sidebarTitle: "Tenant Filtering"
+description: "See how IMultiTenant becomes an EF Core global query filter, a MongoDB $match stage and a LINQ WhereIf, plus override patterns for cross-tenant queries."
+---
+
+ABP turns the `IMultiTenant` marker interface into a per‑provider query filter automatically: EF Core registers a global query filter in `AbpDbContext.CreateFilterExpression`, MongoDB injects a `$match` stage in `MongoDbRepository.GetMongoQueryableAsync`, and the base in‑memory `RepositoryBase` adds a LINQ `WhereIf` predicate. All three branches read the same two pieces of state — `ICurrentTenant.Id` and `IDataFilter.IsEnabled<IMultiTenant>()` — so toggling the filter or temporarily switching tenants works identically across providers. This page traces each integration in the source, explains the override patterns and calls out the gotchas around host‑side data and aggregated queries.
+
+For the underlying `IDataFilter<T>` abstraction, see [`/data/data-filtering`](/data/data-filtering); for the `ICurrentTenant` scope semantics see [`/tenancy/multi-tenancy-core`](/tenancy/multi-tenancy-core).
+
+## The marker interface
+
+Source: `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IMultiTenant.cs`.
+
+```csharp
+public interface IMultiTenant
+{
+    /// <summary>
+    /// Id of the related tenant.
+    /// </summary>
+    Guid? TenantId { get; }
+}
+```
+
+That's it — a single nullable `Guid?`. The value is `null` for host‑owned rows and the tenant's id for tenant‑owned rows. ABP's entity base classes (`AggregateRoot<TKey>`, `Entity<TKey>`) do **not** implement this interface; you opt in by adding it to the entity you want scoped.
+
+```csharp
+public class Product : AggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; private set; }
+    public string Name { get; private set; } = default!;
+
+    protected Product() { }
+
+    public Product(Guid id, Guid? tenantId, string name) : base(id)
+    {
+        TenantId = tenantId;
+        Name = name;
+    }
+}
+```
+
+The `EntityHelper.IsMultiTenant<TEntity>()` reflection helper is what every provider uses internally to decide whether to apply the filter (`framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/EntityHelper.cs`):
+
+```csharp
+public static bool IsMultiTenant<TEntity>() where TEntity : IEntity
+    => IsMultiTenant(typeof(TEntity));
+
+public static bool IsMultiTenant(Type type)
+    => typeof(IMultiTenant).IsAssignableFrom(type);
+```
+
+It is also used by `EntityHelper.EntityEquals` so that two entities with the same `Id` but different `TenantId` are treated as distinct — a subtle but important property when the same id space is reused across tenants.
+
+## EF Core integration
+
+ABP's `AbpDbContext<TDbContext>` exposes two protected hooks that subclasses normally don't touch: `ShouldFilterEntity` (decides which entity types get filtered) and `CreateFilterExpression` (constructs the predicate). Both are called from `OnModelCreating` via a generic helper that walks the model's mutable entity types.
+
+Source: `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs`.
+
+```csharp
+public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext, ...
+{
+    protected virtual Guid? CurrentTenantId => CurrentTenant?.Id;
+
+    protected virtual bool IsMultiTenantFilterEnabled
+        => DataFilter?.IsEnabled<IMultiTenant>() ?? false;
+
+    public ICurrentTenant CurrentTenant
+        => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+
+    public IDataFilter DataFilter
+        => LazyServiceProvider.LazyGetRequiredService<IDataFilter>();
+
+    // ...
+}
+```
+
+`ICurrentTenant` and `IDataFilter` are pulled lazily — the context never blocks on them at construction time, and a unit test can swap either through its lazy provider.
+
+### Deciding to filter
+
+```csharp
+protected virtual bool ShouldFilterEntity<TEntity>(IMutableEntityType entityType)
+    where TEntity : class
+{
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+    {
+        return true;
+    }
+
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    {
+        return true;
+    }
+
+    return false;
+}
+```
+
+Any entity that implements `IMultiTenant` *or* `ISoftDelete` gets a filter expression generated. The two predicates are AND‑combined by `CreateFilterExpression`.
+
+### Building the predicate
+
+```csharp
+protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntity>(
+    ModelBuilder modelBuilder,
+    EntityTypeBuilder<TEntity> entityTypeBuilder)
+    where TEntity : class
+{
+    Expression<Func<TEntity, bool>>? expression = null;
+
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    {
+        var softDeleteColumnName = entityTypeBuilder.Metadata
+            .FindProperty(nameof(ISoftDelete.IsDeleted))?.GetColumnName() ?? "IsDeleted";
+        expression = e => !IsSoftDeleteFilterEnabled
+                       || !EF.Property<bool>(e, softDeleteColumnName);
+
+        if (UseDbFunction())
+        {
+            expression = e => AbpEfCoreDataFilterDbFunctionMethods
+                .SoftDeleteFilter(((ISoftDelete)e).IsDeleted, true);
+            modelBuilder.ConfigureSoftDeleteDbFunction(
+                AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilterMethodInfo,
+                this.GetService<AbpEfCoreCurrentDbContext>());
+        }
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+    {
+        var multiTenantColumnName = entityTypeBuilder.Metadata
+            .FindProperty(nameof(IMultiTenant.TenantId))?.GetColumnName() ?? "TenantId";
+
+        Expression<Func<TEntity, bool>> multiTenantFilter =
+            e => !IsMultiTenantFilterEnabled
+              || EF.Property<Guid>(e, multiTenantColumnName) == CurrentTenantId;
+
+        if (UseDbFunction())
+        {
+            multiTenantFilter = e => AbpEfCoreDataFilterDbFunctionMethods
+                .MultiTenantFilter(((IMultiTenant)e).TenantId, CurrentTenantId, true);
+            modelBuilder.ConfigureMultiTenantDbFunction(
+                AbpEfCoreDataFilterDbFunctionMethods.MultiTenantFilterMethodInfo,
+                this.GetService<AbpEfCoreCurrentDbContext>());
+        }
+
+        expression = expression == null
+            ? multiTenantFilter
+            : QueryFilterExpressionHelper.CombineExpressions(expression, multiTenantFilter);
+    }
+
+    return expression;
+}
+```
+
+<Steps>
+  <Step title="Find the TenantId column">
+    The entity model's `FindProperty(nameof(IMultiTenant.TenantId))` returns the configured column name, falling back to the literal `"TenantId"` if no explicit mapping is found.
+  </Step>
+  <Step title="Compose the predicate">
+    `!IsMultiTenantFilterEnabled || EF.Property<Guid>(e, multiTenantColumnName) == CurrentTenantId` — when the filter is enabled, rows must match the current tenant id; when disabled, all rows pass. `EF.Property<Guid>` is a server‑translatable accessor that lets EF Core fold the predicate into SQL.
+  </Step>
+  <Step title="Optionally lift into a DB function">
+    If `UseDbFunction()` returns true (configurable via `AbpEfCoreGlobalFilterOptions.UseDbFunction`), the predicate becomes a CLR‑bound `AbpEfCoreDataFilterDbFunctionMethods.MultiTenantFilter` call. This pushes the closure over `CurrentTenantId` into a SQL Server `dbo.AbpMultiTenantFilter` UDF, which dramatically improves query plan reuse for high‑churn endpoints.
+  </Step>
+  <Step title="Combine with soft-delete">
+    `QueryFilterExpressionHelper.CombineExpressions` AND‑combines the soft‑delete and tenant predicates so a single `HasQueryFilter` call configures both.
+  </Step>
+</Steps>
+
+<Note>
+`CurrentTenantId` is read *inside* the lambda, so it captures the live `ICurrentTenant` every time EF compiles or invalidates the query. The `GetCompiledQueryCacheKey()` method (`$"{CurrentTenantId?.ToString() ?? "Null"}:{IsSoftDeleteFilterEnabled}:{IsMultiTenantFilterEnabled}"`) ensures EF Core's compiled query cache keys depend on the current tenant — so two tenants never share a cached query plan that hard‑codes the other's id.
+</Note>
+
+### Auto-setting TenantId on insert
+
+`AbpDbContext.ApplyAbpConceptsForAddedEntity` (called from `SaveChanges`) sets `TenantId` automatically for `IMultiTenant` entities so application code doesn't have to: when the property is the default `Guid?` (null), the context fills it with `CurrentTenantId` via `CheckAndSetId`. Combined with the query filter, this gives "insert under current tenant, query within current tenant" for free.
+
+## MongoDB integration
+
+`MongoDbRepository<TMongoDbContext, TEntity>.GetMongoQueryableAsync` is the analog of EF Core's filter expression. Source: `framework/src/Volo.Abp.MongoDB/Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepository.cs`.
+
+```csharp
+// ApplyDataFilters is called by GetMongoQueryableAsync to build the aggregate pipeline
+public async Task<IAggregateFluent<TEntity>> GetAggregateAsync(
+    AggregateOptions? aggregateOptions = null,
+    CancellationToken cancellationToken = default)
+{
+    var dbContext = await GetDbContextAsync(cancellationToken);
+    var collection = await GetCollectionAsync(cancellationToken);
+
+    var aggregate = dbContext.SessionHandle != null
+        ? collection.Aggregate(dbContext.SessionHandle, aggregateOptions)
+        : collection.Aggregate(aggregateOptions);
+
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity))
+        && DataFilter.IsEnabled<ISoftDelete>())
+    {
+        aggregate = aggregate.Match(e => ((ISoftDelete)e).IsDeleted == false);
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity))
+        && DataFilter.IsEnabled<IMultiTenant>())
+    {
+        var tenantId = CurrentTenant.Id;
+        aggregate = aggregate.Match(e => ((IMultiTenant)e).TenantId == tenantId);
+    }
+
+    return aggregate;
+}
+```
+
+Two differences from the EF Core branch:
+
+- The check is "feature‑enabled AND interface implemented" rather than a single global filter compiled once — Mongo evaluates the conditions every aggregate call. The cost is a couple of typeof checks per query; the benefit is no compiled‑query‑cache invalidation needed when tenants switch.
+- The predicate uses a *captured* `tenantId` local, not a live read of `CurrentTenant.Id`. This means a single aggregate pipeline always uses the tenant id observed at construction time, even if the surrounding code disposes the `ICurrentTenant.Change` scope before iterating.
+
+`MongoDbRepository.ApplyDataFilters` (override) wires repository‑filterer hooks for soft‑delete bulk operations:
+
+```csharp
+protected override TQueryable ApplyDataFilters<TQueryable, TOtherEntity>(TQueryable query)
+{
+    if (typeof(TOtherEntity) == typeof(TEntity))
+    {
+        return base.ApplyDataFilters<TQueryable, TOtherEntity>(
+            (TQueryable)RepositoryFilterer.FilterQueryable(query.As<IQueryable<TEntity>>()));
+    }
+    return base.ApplyDataFilters<TQueryable, TOtherEntity>(query);
+}
+```
+
+The keyed override (`MongoDbRepository<,,TKey>`) does the same with `RepositoryFiltererWithKey`. The actual filterer implementations apply soft‑delete and multi‑tenant predicates to update/delete operations so a `DeleteAsync(predicate)` call respects the same scopes as a read.
+
+## In-memory and base repository integration
+
+Even providers that don't have a model builder get tenant filtering through `RepositoryBase`'s default `ApplyDataFilters`. Source: `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/RepositoryBase.cs`.
+
+```csharp
+protected virtual TQueryable ApplyDataFilters<TQueryable>(TQueryable query)
+    where TQueryable : IQueryable<TEntity>
+    => ApplyDataFilters<TQueryable, TEntity>(query);
+
+protected virtual TQueryable ApplyDataFilters<TQueryable, TOtherEntity>(TQueryable query)
+    where TQueryable : IQueryable<TOtherEntity>
+{
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TOtherEntity)))
+    {
+        query = (TQueryable)query.WhereIf(
+            DataFilter.IsEnabled<ISoftDelete>(),
+            e => ((ISoftDelete)e!).IsDeleted == false);
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TOtherEntity)))
+    {
+        var tenantId = CurrentTenant.Id;
+        query = (TQueryable)query.WhereIf(
+            DataFilter.IsEnabled<IMultiTenant>(),
+            e => ((IMultiTenant)e!).TenantId == tenantId);
+    }
+
+    return query;
+}
+```
+
+This is what `Volo.Abp.MemoryDb` uses unchanged — `MemoryDbRepository` inherits and gets the same `WhereIf` predicates applied to its in‑memory `IQueryable`. The `WhereIf` extension is a no‑op when the boolean is `false`, so disabling the filter via `IDataFilter.Disable<IMultiTenant>()` makes the predicate disappear.
+
+### MemoryDb host fallback for `[IgnoreMultiTenancy]`
+
+`UnitOfWorkMemoryDatabaseProvider.ResolveConnectionStringAsync` shows a different use of the marker — entire `MemoryDbContext` types can opt out of tenancy:
+
+```csharp
+private async Task<string> ResolveConnectionStringAsync()
+{
+    // Multi-tenancy unaware contexts should always use the host connection string
+    if (typeof(TMemoryDbContext).IsDefined(typeof(IgnoreMultiTenancyAttribute), false))
+    {
+        using (_currentTenant.Change(null))
+        {
+            return await _connectionStringResolver.ResolveAsync<TMemoryDbContext>();
+        }
+    }
+
+    return await _connectionStringResolver.ResolveAsync<TMemoryDbContext>();
+}
+```
+
+`[IgnoreMultiTenancy]` on a context class temporarily switches to the host scope while resolving the connection string — so a host‑only catalog (say, system settings) goes to the host database even when called inside a tenant request.
+
+## Switching tenants at runtime
+
+The canonical way to read another tenant's data — or the host's — is `using (CurrentTenant.Change(...))`:
+
+<Tabs>
+  <Tab title="Read host data inside a tenant request">
+
+```csharp
+public class SomeAppService
+{
+    private readonly ICurrentTenant _currentTenant;
+    private readonly IRepository<Tenant, Guid> _tenantRepo;
+
+    public async Task<List<Tenant>> ListAllTenantsAsync()
+    {
+        using (_currentTenant.Change(null))
+        {
+            return await _tenantRepo.GetListAsync();
+        }
+    }
+}
+```
+
+This is exactly how `TenantStore.GetCacheItemAsync` (in the tenant management module) reads the `Tenant` aggregate when no tenant context is set — see [`/tenancy/tenant-management-module`](/tenancy/tenant-management-module#caching-and-host-scope).
+  </Tab>
+  <Tab title="Read another tenant's data">
+
+```csharp
+public async Task<long> CountForTenantAsync(Guid tenantId)
+{
+    using (_currentTenant.Change(tenantId))
+    {
+        return await _orderRepo.GetCountAsync();
+    }
+}
+```
+
+The `using` block is what restores the previous scope on exit; even if the call throws, the disposable returned by `Change` rewinds the `AsyncLocal`.
+  </Tab>
+  <Tab title="Disable the filter for cross-tenant analytics">
+
+```csharp
+public async Task<List<TenantUsage>> GetUsageAsync()
+{
+    using (_dataFilter.Disable<IMultiTenant>())
+    {
+        // queries return rows from every tenant; useful for host-side reporting
+        return await _orderRepo
+            .GroupBy(o => o.TenantId)
+            .Select(g => new TenantUsage(g.Key, g.Count()))
+            .ToListAsync();
+    }
+}
+```
+
+Disabling the filter doesn't change `ICurrentTenant.Id` — useful when you want to read everything but keep auditing or settings under the original tenant.
+  </Tab>
+</Tabs>
+
+<Warning>
+Disabling `IMultiTenant` returns rows from every tenant in one query — exposing this surface to tenant‑side callers leaks data across tenants. Audit every `_dataFilter.Disable<IMultiTenant>()` call: it should run only inside host‑only application services protected by `[Authorize]` and policies scoped to `MultiTenancySides.Host`.
+</Warning>
+
+## Practical patterns
+
+<Accordion title="Background jobs and message consumers">
+
+`AsyncLocalCurrentTenantAccessor` preserves the tenant across awaits, but background queues don't — they hand off across processes. Use `ICurrentTenant.Change(jobArgs.TenantId)` as the first line of the handler to restore scope:
+
+```csharp
+public class SendInvoiceJob : IAsyncBackgroundJob<SendInvoiceArgs>
+{
+    private readonly ICurrentTenant _currentTenant;
+    private readonly IRepository<Invoice, Guid> _invoices;
+
+    public async Task ExecuteAsync(SendInvoiceArgs args)
+    {
+        using (_currentTenant.Change(args.TenantId))
+        {
+            var invoice = await _invoices.GetAsync(args.InvoiceId);
+            // ...
+        }
+    }
+}
+```
+
+ABP's built‑in distributed event bus and background job manager already capture the current tenant id into the message envelope and re‑establish it on the consumer side — verify by checking the job/event arg DTO for a `Guid? TenantId` property.
+</Accordion>
+
+<Accordion title="Working with included navigations">
+
+EF Core query filters apply to the *root* entity of the query. Included child collections are filtered transparently if the child also implements `IMultiTenant`. If a parent is `IMultiTenant` but a child collection is not, the child rows are returned unfiltered — which is usually fine because the parent constrains the join, but be deliberate about it when writing host‑side reports.
+</Accordion>
+
+<Accordion title="Bulk operations and ExecuteUpdate / ExecuteDelete">
+
+EF Core 7+'s `ExecuteUpdate`/`ExecuteDelete` still respect global query filters, so a `_repo.Where(x => x.IsObsolete).ExecuteDeleteAsync()` inside a tenant scope deletes only that tenant's rows. If you need to bypass the filter, combine `IgnoreQueryFilters()` with explicit `Where(x => x.TenantId == ...)` and a `DataFilter.Disable<IMultiTenant>()` block — and add a code review checklist item.
+</Accordion>
+
+## Performance and caching
+
+- **Compiled query cache keying**: `AbpDbContext.GetCompiledQueryCacheKey()` returns `"{CurrentTenantId|Null}:{IsSoftDeleteFilterEnabled}:{IsMultiTenantFilterEnabled}"`. EF Core uses it to partition the cache so tenants don't share plans.
+- **DB function lift**: enabling `AbpEfCoreGlobalFilterOptions.UseDbFunction` swaps the captured `CurrentTenantId` for a UDF call. This makes the SQL parameterized rather than constant‑folded, increasing plan reuse for shared‑database deployments.
+- **Mongo aggregate caching**: there is none at the driver level; the predicate is a literal in the pipeline. Build aggregates inside the tenant scope you actually want.
+
+## Cross-references
+
+- [`/data/data-filtering`](/data/data-filtering) — the generic `IDataFilter<T>` abstraction, enable/disable semantics and how it composes with `ISoftDelete`.
+- [`/data/entityframeworkcore`](/data/entityframeworkcore) — `AbpDbContext` lifecycle, `OnModelCreating` hooks and global filter wiring.
+- [`/data/mongodb`](/data/mongodb) — `MongoDbRepository` internals and aggregate pipeline construction.
+- [`/data/memorydb`](/data/memorydb) — the in‑memory repository used by tests; uses the same `RepositoryBase.ApplyDataFilters` path.
+- [`/tenancy/multi-tenancy-core`](/tenancy/multi-tenancy-core) — `ICurrentTenant.Change` semantics and `AsyncLocalCurrentTenantAccessor`.
+- [`/tenancy/tenant-management-module`](/tenancy/tenant-management-module) — `using (CurrentTenant.Change(null))` for host‑side tenant store reads.
+- [`/security/security-helpers`](/security/security-helpers) — `MultiTenancySides`, `[Authorize]` and host/tenant scoping of features and settings.
+- [`/flows/multi-tenancy-resolution`](/flows/multi-tenancy-resolution) — the request flow that opens the scope read here.

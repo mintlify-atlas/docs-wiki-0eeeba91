@@ -1,0 +1,254 @@
+---
+title: "ABP Domain Services: DomainService and IDomainService"
+sidebarTitle: "Domain Services"
+description: "The DomainService base class and IDomainService marker — how ABP wires logger, clock, GUID generator, current tenant and async executer for free."
+---
+
+The `Volo/Abp/Domain/Services/` folder of `framework/src/Volo.Abp.Ddd.Domain/` contains exactly two files — `IDomainService.cs` and `DomainService.cs` — but those two types encode an important ABP convention: how to write a stateless coordinator that lives **inside** the domain layer, holds business logic that doesn't naturally belong to a single aggregate root, and gets DI-resolved with all the common cross-cutting services already wired.
+
+This page documents the marker interface, the base class, and the patterns for using them effectively.
+
+## What is a domain service?
+
+A domain service is a stateless object that:
+
+- **Lives in the domain layer** (`MyApp.Domain` project), not in `Application` or `Infrastructure`.
+- **Coordinates business rules** that span multiple aggregates or that require infrastructure access (e.g. checking a uniqueness constraint via a repository query before raising an `OrderAccepted` domain event).
+- **Does not return DTOs** — domain services return entities or value objects. DTO mapping is the application service's responsibility.
+- **Does not handle HTTP/UI concerns** — no `IStringLocalizer L`, no `[Authorize]`, no `[RemoteService]`.
+
+If a method only needs the state of a single aggregate root, prefer putting it on the aggregate. Reach for a `DomainService` when you need to consult more than one repository or call into shared infrastructure.
+
+## IDomainService
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/IDomainService.cs
+using Volo.Abp.DependencyInjection;
+
+namespace Volo.Abp.Domain.Services;
+
+/// <summary>
+/// This interface can be implemented by all domain services to identify them by convention.
+/// </summary>
+public interface IDomainService : ITransientDependency
+{
+}
+```
+
+The interface is empty but doubles as a `ITransientDependency` marker. Any class that implements `IDomainService` is automatically registered in DI as transient — see [core/dependency-injection](/core/dependency-injection) for the conventional registration rules.
+
+The naming convention `*Manager` (e.g. `UserManager`, `IdentityRoleManager`, `OrderShippingManager`) is the canonical ABP form for a domain service. ABP modules consistently use `Manager` for domain coordinators and `Service` for application services, which makes module source easy to scan.
+
+## DomainService base class
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Services/DomainService.cs
+using System;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Volo.Abp.DependencyInjection;
+using Volo.Abp.Guids;
+using Volo.Abp.Linq;
+using Volo.Abp.MultiTenancy;
+using Volo.Abp.Timing;
+
+namespace Volo.Abp.Domain.Services;
+
+public abstract class DomainService : IDomainService
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    [Obsolete("Use LazyServiceProvider instead.")]
+    public IServiceProvider ServiceProvider { get; set; } = default!;
+
+    protected IClock Clock => LazyServiceProvider.LazyGetRequiredService<IClock>();
+
+    protected IGuidGenerator GuidGenerator =>
+        LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+
+    protected ILoggerFactory LoggerFactory => LazyServiceProvider.LazyGetRequiredService<ILoggerFactory>();
+
+    protected ICurrentTenant CurrentTenant => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+
+    protected IAsyncQueryableExecuter AsyncExecuter =>
+        LazyServiceProvider.LazyGetRequiredService<IAsyncQueryableExecuter>();
+
+    protected ILogger Logger => LazyServiceProvider.LazyGetService<ILogger>(
+        provider => LoggerFactory?.CreateLogger(GetType().FullName!) ?? NullLogger.Instance);
+}
+```
+
+### Member breakdown
+
+| Member | Resolved from | Used for |
+| --- | --- | --- |
+| `LazyServiceProvider` | property-injected | the entire lazy resolution pattern; see [core/dependency-injection](/core/dependency-injection) |
+| `Clock` | `IClock` (`Volo.Abp.Timing`) | `Clock.Now` for "current" timestamps without sneaking `DateTime.UtcNow` into domain code |
+| `GuidGenerator` | `IGuidGenerator` or `SimpleGuidGenerator.Instance` | sequential Guid creation for aggregate ids |
+| `LoggerFactory` / `Logger` | `ILoggerFactory` | category-named logger that falls back to `NullLogger.Instance` when none is registered |
+| `CurrentTenant` | `ICurrentTenant` | tenant-aware logic, especially around `BeginTenant`/`Change` scopes |
+| `AsyncExecuter` | `IAsyncQueryableExecuter` | provider-agnostic async LINQ for queries derived from `IRepository.GetQueryableAsync()` |
+
+Every property uses `LazyGetRequiredService` / `LazyGetService`, so the underlying services are **not** resolved until you touch them. That keeps subclass constructors light and makes unit-testing trivial: stub the `IAbpLazyServiceProvider` to return mocks only for the dependencies that the test actually exercises.
+
+## Why property injection?
+
+ABP intentionally uses property injection for the common services (`Clock`, `Logger`, `GuidGenerator`, `CurrentTenant`) so subclasses can inherit those properties for free without writing constructor boilerplate. Domain-specific dependencies — repositories, other domain services, settings — still come through the constructor and remain required. This is exactly the same pattern as [`ApplicationService`](/ddd/application#applicationservice-base-class).
+
+## Idiomatic usage
+
+```csharp
+public class OrderShippingManager : DomainService
+{
+    private readonly IRepository<Order, Guid> _orders;
+    private readonly IRepository<Shipment, Guid> _shipments;
+
+    public OrderShippingManager(
+        IRepository<Order, Guid> orders,
+        IRepository<Shipment, Guid> shipments)
+    {
+        _orders = orders;
+        _shipments = shipments;
+    }
+
+    public async Task<Shipment> ShipAsync(Guid orderId, Address destination)
+    {
+        var order = await _orders.GetAsync(orderId);
+        if (order.Status != OrderStatus.Paid)
+            throw new BusinessException("OrderShop:CannotShipUnpaidOrder")
+                .WithData("OrderId", orderId);
+
+        var shipment = new Shipment(
+            id: GuidGenerator.Create(),
+            orderId: order.Id,
+            destination: destination,
+            shippedAt: Clock.Now,
+            tenantId: CurrentTenant.Id);
+
+        await _shipments.InsertAsync(shipment);
+        order.MarkAsShipped();
+
+        Logger.LogInformation("Shipped order {OrderId} to {Destination}", orderId, destination);
+
+        return shipment;
+    }
+}
+```
+
+Things to notice:
+
+- **No HTTP, no DTOs.** `ShipAsync` takes an `Address` (a value object) and returns a `Shipment` entity. The application service maps to a DTO.
+- **Uses `Clock.Now`, not `DateTime.UtcNow`.** Lets tests override clock with `MockClock`.
+- **Uses `GuidGenerator.Create()`.** Honours the configured strategy (sequential GUIDs by default — see [core/guids](/core/guids)).
+- **Reads `CurrentTenant.Id`.** No need to hardcode tenant resolution.
+- **Throws `BusinessException` with a code.** The exception handler resolves the code through the same localization resource the module ships, see [core/exception-handling](/core/exception-handling).
+
+## Calling domain services from application services
+
+```csharp
+public class OrderAppService :
+    CrudAppService<Order, OrderDto, Guid, PagedAndSortedResultRequestDto, CreateOrderDto, UpdateOrderDto>,
+    IOrderAppService
+{
+    private readonly OrderShippingManager _shipping;
+
+    public OrderAppService(IRepository<Order, Guid> orders, OrderShippingManager shipping)
+        : base(orders)
+    {
+        _shipping = shipping;
+    }
+
+    public async Task<ShipmentDto> ShipAsync(Guid id, AddressDto destination)
+    {
+        var shipment = await _shipping.ShipAsync(
+            id,
+            ObjectMapper.Map<AddressDto, Address>(destination));
+
+        return ObjectMapper.Map<Shipment, ShipmentDto>(shipment);
+    }
+}
+```
+
+The application service:
+
+1. Maps inbound DTOs to domain types (`Address`).
+2. Delegates to the domain service.
+3. Maps the resulting entity back to a DTO.
+
+That separation keeps your domain code free of `*Dto` references and lets unit tests of `OrderShippingManager` ignore any HTTP concerns.
+
+## Multi-tenancy in domain services
+
+Because `DomainService` exposes `ICurrentTenant`, you can either read the current tenant for invariants (the example above) or temporarily switch tenants for cross-tenant work:
+
+```csharp
+public async Task SyncCatalogAsync(Guid tenantId, IEnumerable<CatalogItem> items)
+{
+    using (CurrentTenant.Change(tenantId))
+    {
+        // Every repository call inside this scope will be tenant-stamped
+        // for `tenantId` regardless of the ambient tenant.
+        await _items.InsertManyAsync(items, autoSave: true);
+    }
+}
+```
+
+The `Change(Guid?)` API comes from `Volo.Abp.MultiTenancy.AbpMultiTenancyAbstractionsModule`. ABP's data filters described in [data/data-filtering](/data/data-filtering) will pick up the new ambient tenant.
+
+## DomainService vs ApplicationService
+
+| Concern | `DomainService` | `ApplicationService` |
+| --- | --- | --- |
+| Layer | `MyApp.Domain` | `MyApp.Application` |
+| Inputs / outputs | Entities & value objects | DTOs |
+| Cross-cutting concerns enabled | None by default | Validation, authorization, auditing, unit of work, global features |
+| Project references | `Volo.Abp.Ddd.Domain` | `Volo.Abp.Ddd.Application` |
+| Naming convention | `*Manager` | `*AppService` |
+| Lazy services | `Clock`, `GuidGenerator`, `Logger`, `CurrentTenant`, `AsyncExecuter` | All of the above plus `ObjectMapper`, `L`, `AuthorizationService`, `FeatureChecker`, `SettingProvider`, `IDataFilter`, `IUnitOfWork`, `ICurrentUser`, etc. |
+| Implements | `IDomainService` (`ITransientDependency`) | `IApplicationService` (`IRemoteService` + many markers) |
+
+## Testing tips
+
+Because `DomainService` only uses property injection for ambient services, unit tests can construct one directly:
+
+```csharp
+[Fact]
+public async Task Should_Reject_Shipping_Unpaid_Orders()
+{
+    var orders = Substitute.For<IRepository<Order, Guid>>();
+    var shipments = Substitute.For<IRepository<Shipment, Guid>>();
+
+    var sut = new OrderShippingManager(orders, shipments)
+    {
+        LazyServiceProvider = TestLazyServiceProvider.With(
+            Substitute.For<IClock>(),
+            Substitute.For<IGuidGenerator>(),
+            Substitute.For<ICurrentTenant>())
+    };
+
+    orders.GetAsync(Arg.Any<Guid>()).Returns(_ => Task.FromResult(new Order(Guid.NewGuid()) { Status = OrderStatus.Draft }));
+
+    await Assert.ThrowsAsync<BusinessException>(() => sut.ShipAsync(Guid.NewGuid(), new Address(...)));
+}
+```
+
+`TestLazyServiceProvider` is conceptual — in practice you'd use `AbpLazyServiceProvider` against a small `IServiceCollection` populated for the test.
+
+## When not to use a domain service
+
+- **Single-aggregate invariants** belong inside the aggregate. If the method only reads/mutates `this`, put it on `Order`, not in `OrderShippingManager`.
+- **Application orchestration** (auth checks, DTO mapping, response shaping) belongs in `ApplicationService`. Don't push `IObjectMapper` into a domain service.
+- **Pure infrastructure helpers** (e.g. "send email", "publish to S3") belong in an infrastructure module exposing a small interface; they shouldn't carry the `IDomainService` marker.
+
+## Cross-references
+
+- [Domain](/ddd/domain) — the package that hosts this folder.
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — where most behaviour first belongs.
+- [Repositories](/ddd/repositories) — injected through the constructor of every realistic domain service.
+- [Specifications](/ddd/specifications) — predicate composition used inside domain services.
+- [Application](/ddd/application) — the next layer up, which calls into domain services.
+- [core/dependency-injection](/core/dependency-injection) — `IAbpLazyServiceProvider`, conventional registration, and lifetime markers.
+- [core/timing](/core/timing) — `IClock` injected via `Clock`.
+- [core/guids](/core/guids) — `IGuidGenerator` injected via `GuidGenerator`.
+- [core/exception-handling](/core/exception-handling) — `BusinessException` is the canonical way to surface a domain rule violation from a domain service.
+- [data/unit-of-work](/data/unit-of-work) — even though domain services don't declare `IUnitOfWorkEnabled`, they participate in the surrounding application service's UOW.

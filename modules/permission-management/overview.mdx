@@ -1,0 +1,307 @@
+---
+title: "Permission Management Module Overview and Architecture"
+sidebarTitle: "Overview"
+description: "ABP permission management module that persists grants for users, roles, and OpenIddict clients into a PermissionGrant store with distributed cache."
+---
+
+The **Permission Management module** (`Volo.Abp.PermissionManagement.*`) is the persistence and administration layer behind ABP's [authorization system](/security/authorization). It is the durable side of the contract: the [permission system](/security/permissions) defines *what* permissions exist and *who* can be a subject (user, role, client), while this module records *which* of those permissions are actually granted to each subject as `PermissionGrant` rows, then feeds the cached answer back to the authorization pipeline through `IPermissionStore`.
+
+The module is split across the standard ABP layering — `Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `HttpApi`, `HttpApi.Client`, `Web`, `Blazor`, `EntityFrameworkCore`, `MongoDB` — plus two satellite packages that bridge it to other modules: `Volo.Abp.PermissionManagement.Domain.Identity` (users + roles) and `Volo.Abp.PermissionManagement.Domain.OpenIddict` (clients). Each provider knows how to read and write grants for one kind of subject; `PermissionManager` aggregates the providers.
+
+<Info>
+**Source root.** Every type referenced on these pages lives under [`modules/permission-management/src/`](https://github.com/abpframework/abp/tree/dev/modules/permission-management/src), with subject‑specific providers under [`modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/`](https://github.com/abpframework/abp/tree/dev/modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity) and [`modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict/`](https://github.com/abpframework/abp/tree/dev/modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict).
+</Info>
+
+## What the module gives you
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="cube" href="/modules/permission-management/domain">
+    `PermissionGrant`, `IPermissionGrantRepository`, `PermissionGrantCacheItem`, `PermissionManager`, `PermissionStore` (the `IPermissionStore` implementation), and the `PermissionManagementProvider` hierarchy: `UserPermissionManagementProvider`, `RolePermissionManagementProvider`, `ApplicationPermissionManagementProvider` (OpenIddict clients).
+  </Card>
+  <Card title="Application services" icon="layer-group" href="/modules/permission-management/application">
+    `IPermissionAppService` + `PermissionAppService` with `GetAsync` / `GetByGroupAsync` / `UpdateAsync`. DTOs: `PermissionGroupDto`, `PermissionGrantInfoDto`, `GetPermissionListResultDto`, `UpdatePermissionsDto`, `UpdatePermissionDto`, `ProviderInfoDto`.
+  </Card>
+  <Card title="HTTP API" icon="plug" href="/modules/permission-management/http-api">
+    `PermissionsController` mounted at `api/permission-management/permissions`, `PermissionIntegrationController` at `integration-api/…/is-granted`, and the static client proxies in `Volo.Abp.PermissionManagement.HttpApi.Client`.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-maximize" href="/modules/permission-management/web-and-blazor">
+    The Razor Pages `PermissionManagementModal` (`Pages/AbpPermissionManagement/PermissionManagementModal.cshtml`) and the Blazor `PermissionManagementModal` component (`Components/PermissionManagementModal.razor`), with `Blazor.Server` and `Blazor.WebAssembly` hosting modules.
+  </Card>
+  <Card title="EF Core provider" icon="table" href="/modules/permission-management/efcore-mongodb">
+    `PermissionManagementDbContext`, `ConfigurePermissionManagement()` model extension, `EfCorePermissionGrantRepository`, `EfCorePermissionDefinitionRecordRepository`, `EfCorePermissionGroupDefinitionRecordRepository`.
+  </Card>
+  <Card title="MongoDB provider" icon="leaf" href="/modules/permission-management/efcore-mongodb">
+    `PermissionManagementMongoDbContext`, `ConfigurePermissionManagement()` Mongo extension, `MongoPermissionGrantRepository`, `MongoPermissionDefinitionRecordRepository`, `MongoPermissionGroupDefinitionRecordRepository`.
+  </Card>
+</CardGroup>
+
+## How the pieces fit together
+
+`PermissionGrant` is the single persisted entity. Every grant is a tuple — `(Name, ProviderName, ProviderKey, TenantId)` — that says *"permission `Name` is granted to subject `ProviderKey` of kind `ProviderName` in tenant `TenantId`"*. The provider name is one of the `*PermissionValueProvider.ProviderName` constants from `Volo.Abp.Authorization` (`"U"` for user, `"R"` for role, `"C"` for client) and is shared with the in-process value providers used by the authorization handler.
+
+```mermaid
+flowchart LR
+    subgraph Subjects["Subjects"]
+        U["IdentityUser<br/>UserPermissionValueProvider<br/>ProviderName = U"]
+        R["IdentityRole<br/>RolePermissionValueProvider<br/>ProviderName = R"]
+        C["OpenIddictApplication<br/>ClientPermissionValueProvider<br/>ProviderName = C"]
+    end
+
+    subgraph Providers["IPermissionManagementProvider"]
+        UP[UserPermissionManagementProvider]
+        RP[RolePermissionManagementProvider]
+        CP[ApplicationPermissionManagementProvider]
+    end
+
+    PM[PermissionManager<br/>aggregates providers]
+
+    subgraph Persistence["Domain + DB"]
+        Repo[IPermissionGrantRepository<br/>EfCore / Mongo]
+        Grants[("AbpPermissionGrants<br/>Name | ProviderName | ProviderKey | TenantId")]
+    end
+
+    Cache[(IDistributedCache&lt;PermissionGrantCacheItem&gt;<br/>key: pn:{provider},pk:{key},n:{name})]
+
+    Store[PermissionStore<br/>IPermissionStore]
+    Auth[Authorization pipeline<br/>IsGrantedAsync]
+
+    U --> UP
+    R --> RP
+    C --> CP
+    UP --> PM
+    RP --> PM
+    CP --> PM
+    PM --> Repo
+    Repo --> Grants
+
+    Auth --> Store
+    Store --> Cache
+    Cache -.miss.-> Store
+    Store --> Repo
+    Store --> Cache
+```
+
+The arrows flow in two directions: **writes** travel down (admin UI ➝ `IPermissionAppService.UpdateAsync` ➝ `PermissionManager.SetAsync` ➝ provider ➝ `IPermissionGrantRepository.InsertAsync` / `DeleteAsync`), and **reads** travel through `IPermissionStore` ➝ `IDistributedCache<PermissionGrantCacheItem>` ➝ repository, with `PermissionGrantCacheItemInvalidator` evicting cache entries whenever a grant is inserted, updated, or deleted.
+
+<Note>
+The module never asks "does user X have permission Y?" directly. It always asks **the provider** for `(name, providerName, providerKey)`. The mapping *user ➝ user's roles* lives inside `RolePermissionManagementProvider` (via `IUserRoleFinder` from the Identity module), which is why the role provider also handles `providerName == "U"` queries.
+</Note>
+
+## The `(Name, ProviderName, ProviderKey)` triple
+
+Every read and write goes through that same three-tuple. The shape is intentionally generic so that new subject types (organization units, editions, API keys, …) can be added by registering a new `PermissionManagementProvider` + value provider without touching the schema.
+
+| Provider | `ProviderName` constant | `ProviderKey` semantics | Defined in |
+|----------|-------------------------|-------------------------|------------|
+| User | `UserPermissionValueProvider.ProviderName` = `"U"` | `IdentityUser.Id` as string | `Volo.Abp.PermissionManagement.Domain.Identity` |
+| Role | `RolePermissionValueProvider.ProviderName` = `"R"` | `IdentityRole.Name` | `Volo.Abp.PermissionManagement.Domain.Identity` |
+| Client | `ClientPermissionValueProvider.ProviderName` = `"C"` | `OpenIddictApplication.ClientId` | `Volo.Abp.PermissionManagement.Domain.OpenIddict` |
+
+`PermissionGrant` also carries `TenantId` (it implements `IMultiTenant`) so the same permission name can be granted to the same user/role in two tenants without colliding. The unique index is `(TenantId, Name, ProviderName, ProviderKey)`.
+
+## Reading a grant: the `PermissionStore` path
+
+`PermissionStore` is the `IPermissionStore` implementation consumed by `Volo.Abp.Authorization` whenever it evaluates a permission. The shape of `IsGrantedAsync` is:
+
+```csharp
+public virtual async Task<bool> IsGrantedAsync(string name, string providerName, string providerKey)
+{
+    return (await GetCacheItemAsync(name, providerName, providerKey)).IsGranted;
+}
+```
+
+The work happens inside `GetCacheItemAsync`. On a miss, `PermissionStore` calls `IPermissionGrantRepository.GetListAsync(providerName, providerKey)` *once* and primes `IDistributedCache<PermissionGrantCacheItem>` for **every** permission defined by `IPermissionDefinitionManager.GetPermissionsAsync()` — granted permissions get `IsGranted = true`, the rest get `IsGranted = false`. Subsequent `IsGrantedAsync` calls for the same `(providerName, providerKey)` are all served by the cache.
+
+<Steps>
+  <Step title="Cache lookup">
+    `PermissionStore.GetCacheItemAsync` calls `Cache.GetAsync(CalculateCacheKey(name, providerName, providerKey))`. Cache key format: `"pn:{providerName},pk:{providerKey},n:{name}"` from `PermissionGrantCacheItem.CalculateCacheKey`.
+  </Step>
+  <Step title="Repository read on miss">
+    Inside `using (PermissionGrantRepository.DisableTracking())`, fetch *all* grants for `(providerName, providerKey)` from `IPermissionGrantRepository` and build a `HashSet<string>` of granted names.
+  </Step>
+  <Step title="Bulk prime the cache">
+    Iterate the full permission catalog returned by `IPermissionDefinitionManager.GetPermissionsAsync()`, compute one `PermissionGrantCacheItem` per permission, then call `Cache.SetManyAsync(cacheItems)` so future lookups are O(1).
+  </Step>
+  <Step title="Invalidation on write">
+    `PermissionGrantCacheItemInvalidator` listens to entity events on `PermissionGrant` and `Cache.RemoveAsync`s the affected key whenever a grant is inserted, updated, or deleted by `PermissionManager.SetAsync` / `UpdateProviderKeyAsync` / `DeleteAsync`.
+  </Step>
+</Steps>
+
+## Writing a grant: the `PermissionManager` path
+
+Updates always go through `PermissionManager` so that validation (`permission.IsEnabled`, `MultiTenancySide`, allowed providers, `ISimpleStateCheckerManager<PermissionDefinition>`) runs *before* a row is touched:
+
+```csharp
+public virtual async Task SetAsync(string permissionName, string providerName, string providerKey, bool isGranted)
+{
+    var permission = await PermissionDefinitionManager.GetOrNullAsync(permissionName);
+    if (permission == null) { return; } // silently ignore undefined
+
+    if (!permission.IsEnabled || !await SimpleStateCheckerManager.IsEnabledAsync(permission))
+        throw new ApplicationException($"The permission named '{permission.Name}' is disabled!");
+
+    if (permission.Providers.Any() && !permission.Providers.Contains(providerName))
+        throw new ApplicationException($"The permission named '{permission.Name}' has not compatible with the provider named '{providerName}'");
+
+    if (!permission.MultiTenancySide.HasFlag(CurrentTenant.GetMultiTenancySide()))
+        throw new ApplicationException($"… not compatible with the current multitenancy side …");
+
+    var currentGrantInfo = await GetInternalAsync(permission, providerName, providerKey);
+    if (currentGrantInfo.IsGranted == isGranted) { return; }
+
+    var provider = ManagementProviders.FirstOrDefault(m => m.Name == providerName)
+                   ?? throw new AbpException("Unknown permission management provider: " + providerName);
+
+    await provider.SetAsync(permissionName, providerKey, isGranted);
+}
+```
+
+The list of providers is built lazily from `PermissionManagementOptions.ManagementProviders`. The `Domain.Identity` and `Domain.OpenIddict` modules each add their own to that list in their `ConfigureServices`.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Domain internals" icon="cube" href="/modules/permission-management/domain">
+    `PermissionGrant`, `PermissionStore`, `PermissionManager`, every `*PermissionManagementProvider`, and the `Domain.Identity` / `Domain.OpenIddict` bridges.
+  </Card>
+  <Card title="Application services" icon="layer-group" href="/modules/permission-management/application">
+    `PermissionAppService.GetAsync` / `UpdateAsync`, DTO shapes, and how `PermissionManagementOptions.ProviderPolicies` gates each provider.
+  </Card>
+  <Card title="HTTP API" icon="plug" href="/modules/permission-management/http-api">
+    REST routes, integration endpoint for remote `IPermissionFinder`, and the static client proxies.
+  </Card>
+  <Card title="Web & Blazor UI" icon="window-maximize" href="/modules/permission-management/web-and-blazor">
+    The Razor Pages and Blazor permission modal, view model wiring, and how the Identity / OpenIddict UIs open it.
+  </Card>
+  <Card title="EF Core & MongoDB" icon="database" href="/modules/permission-management/efcore-mongodb">
+    DbContext registration, `ConfigurePermissionManagement()` model extensions, and the two repository implementations.
+  </Card>
+  <Card title="Permissions system" icon="key" href="/security/permissions">
+    The framework side: `PermissionDefinition`, `PermissionGroupDefinition`, `PermissionDefinitionProvider`, and the `IPermissionValueProvider` pipeline.
+  </Card>
+</CardGroup>
+
+## Module relationships
+
+<CardGroup cols={2}>
+  <Card title="Authorization" icon="shield-halved" href="/security/authorization">
+    `Volo.Abp.Authorization`'s `AbpAuthorizationService` and `PermissionRequirement` handler call `IPermissionChecker`, which is fed by `IPermissionStore` — implemented here.
+  </Card>
+  <Card title="Identity module" icon="user" href="/modules/identity/overview">
+    `Domain.Identity` plugs `UserPermissionManagementProvider` and `RolePermissionManagementProvider` in. `IUserRoleFinder` from Identity lets the role provider resolve a user's effective roles.
+  </Card>
+  <Card title="OpenIddict module" icon="lock" href="/modules/openiddict/overview">
+    `Domain.OpenIddict` plugs `ApplicationPermissionManagementProvider` in so client applications can have permission grants keyed by `ClientId`.
+  </Card>
+  <Card title="Feature management" icon="toggle-on" href="/security/permissions">
+    Permissions can be gated by feature flags via `ISimpleStateChecker<PermissionDefinition>`. `PermissionManager.SetAsync` enforces this before persisting a grant.
+  </Card>
+</CardGroup>
+
+## Static vs. dynamic permission catalog
+
+The module persists two different things in the database:
+
+- **Grants** in `AbpPermissionGrants` — the runtime data that says "this subject has this permission".
+- **Definitions** in `AbpPermissions` + `AbpPermissionGroups` — a *copy* of the in-memory permission catalog produced by every `PermissionDefinitionProvider` discovered at startup.
+
+The definition copy is what `PermissionManagementOptions.SaveStaticPermissionsToDatabase` (default `true`) and `IsDynamicPermissionStoreEnabled` (default `false`) control. The host module's `OnApplicationInitializationAsync` runs a background task — `InitializeDynamicPermissions` — that:
+
+<Steps>
+  <Step title="Resilient save">
+    Calls `IStaticPermissionSaver.SaveAsync()` inside a Polly `WaitAndRetryAsync(8, exponential)` policy so a slow database does not break app startup.
+  </Step>
+  <Step title="Pre-cache the dynamic store">
+    When `IsDynamicPermissionStoreEnabled` is `true`, eagerly calls `IDynamicPermissionDefinitionStore.GetGroupsAsync()` so the first request does not pay the round-trip.
+  </Step>
+  <Step title="React to changes">
+    `DynamicPermissionDefinitionsChangedEto` is published as a distributed event whenever a permission definition row changes; `DynamicPermissionDefinitionStoreInMemoryCache` listens and rebuilds its in-process snapshot.
+  </Step>
+</Steps>
+
+Most apps leave the dynamic store off and rely on the static `IPermissionDefinitionProvider` discovery — the copy in the database is then only used by *other* services that read it via the integration endpoint described in [the HTTP API page](/modules/permission-management/http-api).
+
+## Subject identifier conventions
+
+The `(ProviderName, ProviderKey)` triple is open-ended, but the three providers shipped by ABP have rigid conventions you must respect when calling `PermissionManager.SetAsync` from your own code:
+
+```csharp
+// Grant "AbpIdentity.Users.Create" to a single user
+await _permissionManager.SetAsync(
+    "AbpIdentity.Users.Create",
+    UserPermissionValueProvider.ProviderName,   // "U"
+    userId.ToString(),                          // not the username
+    isGranted: true);
+
+// Grant a permission to a role
+await _permissionManager.SetAsync(
+    "MyApp.Reports.Export",
+    RolePermissionValueProvider.ProviderName,   // "R"
+    role.Name,                                  // not the role id
+    isGranted: true);
+
+// Grant a permission to an OpenIddict client application
+await _permissionManager.SetAsync(
+    "MyApp.Reports.Export",
+    ClientPermissionValueProvider.ProviderName, // "C"
+    application.ClientId,                       // not the OpenIddict id
+    isGranted: true);
+```
+
+Pick the wrong key shape and `PermissionStore` will never find a matching cached row — the grant *exists* but no `IsGrantedAsync` query ever asks for the same key, so it stays invisible.
+
+## Bootstrap responsibilities checklist
+
+A correctly-wired application module needs:
+
+<Accordion title="EF Core / MongoDB DbContext registration">
+Whichever persistence package you reference (`Volo.Abp.PermissionManagement.EntityFrameworkCore` or `Volo.Abp.PermissionManagement.MongoDB`) must be added in `[DependsOn]` *and* its `ConfigurePermissionManagement` extension called on your composite DbContext's `OnModelCreating` — see [EF Core & MongoDB](/modules/permission-management/efcore-mongodb).
+</Accordion>
+
+<Accordion title="Provider satellite modules">
+For users + roles, add `[DependsOn(typeof(AbpPermissionManagementDomainIdentityModule))]` to your domain module. For OpenIddict clients, add `[DependsOn(typeof(AbpPermissionManagementDomainOpenIddictModule))]`. Each registers its `PermissionManagementProvider` and `ProviderPolicies` entry.
+</Accordion>
+
+<Accordion title="Web / Blazor module">
+For the admin modal, add `AbpPermissionManagementWebModule` (MVC) or `AbpPermissionManagementBlazorServerModule` / `AbpPermissionManagementBlazorWebAssemblyModule` depending on your UI stack. The Identity and OpenIddict UI modules already depend on these — you do not need to add them again if you mount the standard role / user / client management pages.
+</Accordion>
+
+<Accordion title="HTTP API client (microservices only)">
+If the permission DB lives in another service, add `AbpPermissionManagementHttpApiClientModule` *without* the `Domain` package. `HttpClientPermissionFinder` will then take over from the in-process `PermissionFinder`, and every authorization decision goes over HTTP to the integration endpoint.
+</Accordion>
+
+## Which API to call for what
+
+The module exposes four levels of API. Pick the highest one that fits — each level below is meant for fewer scenarios:
+
+| Scenario | API | Lives in |
+|----------|-----|----------|
+| Gate an MVC action or a Razor / Blazor page | `[Authorize("X")]` attribute | `Microsoft.AspNetCore.Authorization` (calls `IPermissionChecker`) |
+| Check a permission imperatively in business code | `IPermissionChecker.IsGrantedAsync` or extension `AuthorizationService.IsGrantedAsync` | `Volo.Abp.Authorization.Permissions` |
+| Render the **Permissions** admin modal | `IPermissionAppService.GetAsync` / `UpdateAsync` | `Volo.Abp.PermissionManagement.Application.Contracts` |
+| Read or write *which* providers granted a permission (tooling, audits) | `IPermissionManager.GetAsync` / `SetAsync` / `GetAllAsync` | `Volo.Abp.PermissionManagement` (Domain) |
+| Force-evict a cached grant (custom invalidator) | `IDistributedCache<PermissionGrantCacheItem>` + `PermissionGrantCacheItem.CalculateCacheKey` | `Volo.Abp.PermissionManagement` (Domain) |
+| Direct row access (data export, migration scripts) | `IPermissionGrantRepository` | `Volo.Abp.PermissionManagement` (Domain) |
+
+<Warning>
+**Do not query `IPermissionGrantRepository` directly from your application code** to check authorization. It returns *raw rows* without consulting the cache, the provider hierarchy, or `ISimpleStateCheckerManager`. Use `IAuthorizationService.AuthorizeAsync`, `IPermissionChecker.IsGrantedAsync`, or — for tooling that needs the breakdown of which provider granted what — `IPermissionManager.GetAsync`.
+</Warning>
+
+## Module package map at a glance
+
+| Package | Layer | What it ships |
+|---------|-------|---------------|
+| `Volo.Abp.PermissionManagement.Domain.Shared` | constants | `AbpPermissionManagementDbProperties`, `PermissionGrantConsts`, `IsGrantedRequest` / `Response`, `IPermissionFinder` |
+| `Volo.Abp.PermissionManagement.Domain` | domain | `PermissionGrant`, `PermissionStore`, `PermissionManager`, `PermissionManagementProvider`, `PermissionDataSeeder`, `DynamicPermissionDefinitionStore` |
+| `Volo.Abp.PermissionManagement.Domain.Identity` | satellite | `UserPermissionManagementProvider`, `RolePermissionManagementProvider` |
+| `Volo.Abp.PermissionManagement.Domain.OpenIddict` | satellite | `ApplicationPermissionManagementProvider` |
+| `Volo.Abp.PermissionManagement.Application.Contracts` | DTO + interface | `IPermissionAppService`, `IPermissionIntegrationService`, all DTOs |
+| `Volo.Abp.PermissionManagement.Application` | service | `PermissionAppService`, `PermissionIntegrationService` |
+| `Volo.Abp.PermissionManagement.HttpApi` | controller | `PermissionsController`, `PermissionIntegrationController` |
+| `Volo.Abp.PermissionManagement.HttpApi.Client` | client proxy | `PermissionsClientProxy`, `PermissionIntegrationClientProxy`, `HttpClientPermissionFinder` |
+| `Volo.Abp.PermissionManagement.Web` | Razor Pages | `PermissionManagementModal.cshtml` |
+| `Volo.Abp.PermissionManagement.Blazor` | Blazor | `PermissionManagementModal.razor` |
+| `Volo.Abp.PermissionManagement.Blazor.Server` | host | server-side theming wiring |
+| `Volo.Abp.PermissionManagement.Blazor.WebAssembly` | host | WebAssembly + HTTP API client wiring |
+| `Volo.Abp.PermissionManagement.EntityFrameworkCore` | persistence | `PermissionManagementDbContext`, `EfCore*Repository` |
+| `Volo.Abp.PermissionManagement.MongoDB` | persistence | `PermissionManagementMongoDbContext`, `Mongo*Repository` |

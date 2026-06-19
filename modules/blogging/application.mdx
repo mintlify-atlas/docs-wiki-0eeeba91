@@ -1,0 +1,699 @@
+---
+title: "Blogging — Application Layer"
+description: "Public PostAppService, BlogAppService, CommentAppService, TagAppService, FileAppService and the admin BlogManagementAppService."
+---
+
+The application layer is split into a **public** surface — what end users and authenticated authors hit through the front-of-house Razor Pages — and an **admin** surface reachable only from `/Blogging/Admin/Blogs`.
+
+| Layer | Project | Lives in |
+| --- | --- | --- |
+| Public DTOs + interfaces | `Volo.Blogging.Application.Contracts` | `modules/blogging/src/Volo.Blogging.Application.Contracts/Volo/Blogging/...` |
+| Shared permission/DTO | `Volo.Blogging.Application.Contracts.Shared` | `modules/blogging/src/Volo.Blogging.Application.Contracts.Shared/Volo/Blogging/...` |
+| Public services | `Volo.Blogging.Application` | `modules/blogging/src/Volo.Blogging.Application/Volo/Blogging/...` |
+| Admin interfaces | `Volo.Blogging.Admin.Application.Contracts` | `modules/blogging/src/Volo.Blogging.Admin.Application.Contracts/Volo/Blogging/Admin/...` |
+| Admin services | `Volo.Blogging.Admin.Application` | `modules/blogging/src/Volo.Blogging.Admin.Application/Volo/Blogging/Admin/...` |
+
+```text application contracts (public)
+Volo.Blogging.Application.Contracts/Volo/Blogging/
+  Blogs/IBlogAppService.cs
+  Posts/
+    IPostAppService.cs
+    CreatePostDto.cs   UpdatePostDto.cs
+    PostWithDetailsDto.cs   GetPostInput.cs
+    BlogUserDto.cs
+  Comments/
+    ICommentAppService.cs
+    Dtos/{CreateCommentDto, UpdateCommentDto,
+          CommentWithDetailsDto, CommentWithRepliesDto,
+          GetCommentListOfPostAsync}.cs
+  Tagging/
+    ITagAppService.cs
+    Dtos/{TagDto, CreateTagDto, UpdateTagDto,
+          GetTagListInput, GetPopularTagsInput,
+          PopularTagDto}.cs
+  Files/
+    IFileAppService.cs
+    FileUploadInputDto.cs   FileUploadOutputDto.cs   RawFileDto.cs
+    BloggingWebConsts.cs
+  Members/
+    IMemberAppService.cs
+    CustomIdentityBlogUserUpdateDto.cs
+  BloggingRemoteServiceConsts.cs
+```
+
+```text admin contracts
+Volo.Blogging.Admin.Application.Contracts/Volo/Blogging/Admin/
+  Blogs/
+    IBlogManagementAppService.cs
+    CreateBlogDto.cs   UpdateBlogDto.cs
+  BloggingAdminRemoteServiceConsts.cs
+```
+
+## Permissions
+
+All Blogging permissions are constants on `BloggingPermissions` and are registered by `BloggingPermissionDefinitionProvider` (both in the `*.Application.Contracts.Shared` package — they need to be visible to clients, not just to the host).
+
+```csharp Volo.Blogging.Application.Contracts.Shared/Volo/Blogging/BloggingPermissions.cs
+public class BloggingPermissions
+{
+    public const string GroupName = "Blogging";
+
+    public static class Blogs
+    {
+        public const string Default    = GroupName + ".Blog";
+        public const string Management = Default + ".Management";
+        public const string Delete     = Default + ".Delete";
+        public const string Update     = Default + ".Update";
+        public const string Create     = Default + ".Create";
+        public const string ClearCache = Default + ".ClearCache";
+    }
+    public static class Posts    { /* Create | Update | Delete */ }
+    public static class Tags     { /* Create | Update | Delete */ }
+    public static class Comments { /* Create | Update | Delete */ }
+}
+```
+
+```csharp BloggingPermissionDefinitionProvider.cs
+public override void Define(IPermissionDefinitionContext context)
+{
+    var bloggingGroup = context.AddGroup(BloggingPermissions.GroupName, L("Permission:Blogging"));
+
+    var blogs = bloggingGroup.AddPermission(BloggingPermissions.Blogs.Default, L("Permission:Blogs"));
+    blogs.AddChild(BloggingPermissions.Blogs.Management, L("Permission:Management"));
+    blogs.AddChild(BloggingPermissions.Blogs.Update,     L("Permission:Edit"));
+    blogs.AddChild(BloggingPermissions.Blogs.Delete,     L("Permission:Delete"));
+    blogs.AddChild(BloggingPermissions.Blogs.Create,     L("Permission:Create"));
+    blogs.AddChild(BloggingPermissions.Blogs.ClearCache, L("Permission:ClearCache"));
+
+    var posts = bloggingGroup.AddPermission(BloggingPermissions.Posts.Default, L("Permission:Posts"));
+    posts.AddChild(BloggingPermissions.Posts.Update, L("Permission:Edit"));
+    posts.AddChild(BloggingPermissions.Posts.Delete, L("Permission:Delete"));
+    posts.AddChild(BloggingPermissions.Posts.Create, L("Permission:Create"));
+
+    /* ...Tags, Comments... */
+}
+```
+
+`Posts.Update`/`Posts.Delete` and `Comments.Update`/`Comments.Delete` are checked indirectly through resource-based authorization — see [Authorization handlers](#authorization-handlers).
+
+## `IBlogAppService` / `BlogAppService`
+
+The public blog service is read-only — creation, mutation and deletion of blogs is the admin service's job (below).
+
+```csharp Volo.Blogging.Application.Contracts/Volo/Blogging/Blogs/IBlogAppService.cs
+public interface IBlogAppService : IApplicationService
+{
+    Task<ListResultDto<BlogDto>> GetListAsync();
+
+    Task<BlogDto> GetByShortNameAsync(string shortName);
+
+    Task<BlogDto> GetAsync(Guid id);
+}
+```
+
+```csharp Volo.Blogging.Application/Volo/Blogging/Blogs/BlogAppService.cs
+public class BlogAppService : BloggingAppServiceBase, IBlogAppService
+{
+    protected IBlogRepository BlogRepository { get; }
+
+    public BlogAppService(IBlogRepository blogRepository)
+        => BlogRepository = blogRepository;
+
+    public virtual async Task<ListResultDto<BlogDto>> GetListAsync()
+    {
+        var blogs = await BlogRepository.GetListAsync();
+        return new ListResultDto<BlogDto>(
+            ObjectMapper.Map<List<Blog>, List<BlogDto>>(blogs));
+    }
+
+    public virtual async Task<BlogDto> GetByShortNameAsync(string shortName)
+    {
+        Check.NotNullOrWhiteSpace(shortName, nameof(shortName));
+        var blog = await BlogRepository.FindByShortNameAsync(shortName);
+        if (blog == null) throw new EntityNotFoundException(typeof(Blog), shortName);
+        return ObjectMapper.Map<Blog, BlogDto>(blog);
+    }
+
+    public virtual async Task<BlogDto> GetAsync(Guid id)
+    {
+        var blog = await BlogRepository.GetAsync(id);
+        return ObjectMapper.Map<Blog, BlogDto>(blog);
+    }
+}
+```
+
+`BlogDto` is declared in the **shared** contracts package so it can be referenced from both public and admin contracts:
+
+```csharp Volo.Blogging.Application.Contracts.Shared/Volo/Blogging/Blogs/Dtos/BlogDto.cs
+public class BlogDto : FullAuditedEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public string Name             { get; set; }
+    public string ShortName        { get; set; }
+    public string Description      { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+## `IPostAppService` / `PostAppService`
+
+This is the workhorse of the module — it orchestrates the post cache, the `IDistributedCache<List<PostCacheItem>>` bucket, tag bookkeeping (`TagRepository.IncreaseUsageCount` / `DecreaseUsageCount`), comment cascade-delete, the writer projection (`BlogUserDto`) and `PostChangedEvent` publication.
+
+```csharp IPostAppService.cs
+public interface IPostAppService : IApplicationService
+{
+    Task<ListResultDto<PostWithDetailsDto>> GetListByBlogIdAndTagNameAsync(Guid blogId, string tagName);
+    Task<ListResultDto<PostWithDetailsDto>> GetTimeOrderedListAsync(Guid blogId);
+
+    Task<PostWithDetailsDto> GetForReadingAsync(GetPostInput input);
+    Task<PostWithDetailsDto> GetAsync(Guid id);
+
+    Task<PostWithDetailsDto> CreateAsync(CreatePostDto input);
+    Task<PostWithDetailsDto> UpdateAsync(Guid id, UpdatePostDto input);
+    Task DeleteAsync(Guid id);
+
+    Task<List<PostWithDetailsDto>> GetListByUserIdAsync(Guid userId);
+    Task<List<PostWithDetailsDto>> GetLatestBlogPostsAsync(Guid blogId, int count);
+}
+```
+
+### Dependencies
+
+```csharp PostAppService.cs (constructor)
+public PostAppService(
+    IPostRepository                              postRepository,
+    ITagRepository                               tagRepository,
+    ICommentRepository                           commentRepository,
+    IBlogUserLookupService                       userLookupService,
+    IDistributedCache<List<PostCacheItem>>       postsCache,
+    ILocalEventBus                               localEventBus)
+{
+    UserLookupService = userLookupService;
+    PostRepository    = postRepository;
+    TagRepository     = tagRepository;
+    CommentRepository = commentRepository;
+    PostsCache        = postsCache;
+    LocalEventBus     = localEventBus;
+}
+```
+
+### Listing — uncached and cached
+
+`GetListByBlogIdAndTagNameAsync` hits the repository directly (filtering on tag is done in memory using the post's own `Tags` collection); `GetTimeOrderedListAsync` uses the distributed cache:
+
+```csharp PostAppService.cs
+public virtual async Task<ListResultDto<PostWithDetailsDto>>
+    GetTimeOrderedListAsync(Guid blogId)
+{
+    var postCacheItems = await PostsCache.GetOrAddAsync(
+        blogId.ToString(),
+        async () => await GetTimeOrderedPostsAsync(blogId),
+        () => new DistributedCacheEntryOptions
+        {
+            AbsoluteExpiration = DateTimeOffset.Now.AddHours(1)
+        });
+
+    var postsWithDetails = ObjectMapper
+        .Map<List<PostCacheItem>, List<PostWithDetailsDto>>(postCacheItems);
+
+    /* populate post.Writer via UserLookupService.FindByIdAsync */
+    return new ListResultDto<PostWithDetailsDto>(postsWithDetails);
+}
+```
+
+Cache eviction is triggered by `PublishPostChangedEventAsync(blogId)` after every write (see [Domain → Post cache](/modules/blogging/domain#post-cache--postchangedevent)).
+
+### Read flow
+
+`GetForReadingAsync` looks the post up by `(BlogId, Url)`, bumps `ReadCount` on the aggregate (EF tracks it automatically) and projects writer + tags:
+
+```csharp PostAppService.cs
+public virtual async Task<PostWithDetailsDto> GetForReadingAsync(GetPostInput input)
+{
+    var post = await PostRepository.GetPostByUrl(input.BlogId, input.Url);
+    post.IncreaseReadCount();
+    var postDto = ObjectMapper.Map<Post, PostWithDetailsDto>(post);
+    postDto.Tags = await GetTagsOfPostAsync(postDto.Id);
+    if (postDto.CreatorId.HasValue)
+        postDto.Writer = ObjectMapper.Map<BlogUser, BlogUserDto>(
+            await UserLookupService.FindByIdAsync(postDto.CreatorId.Value));
+    return postDto;
+}
+```
+
+### Create / Update / Delete
+
+Writes are permission-checked at the class level **and** resource-checked at the aggregate level on update/delete:
+
+```csharp PostAppService.cs
+[Authorize(BloggingPermissions.Posts.Create)]
+public virtual async Task<PostWithDetailsDto> CreateAsync(CreatePostDto input)
+{
+    input.Url = await RenameUrlIfItAlreadyExistAsync(input.BlogId, input.Url);
+
+    var post = new Post(
+        id: GuidGenerator.Create(),
+        blogId: input.BlogId,
+        title: input.Title,
+        coverImage: input.CoverImage,
+        url: input.Url)
+    {
+        Content     = input.Content,
+        Description = input.Description
+    };
+
+    await PostRepository.InsertAsync(post);
+
+    await SaveTags(SplitTags(input.Tags), post);
+    await PublishPostChangedEventAsync(post.BlogId);
+
+    return ObjectMapper.Map<Post, PostWithDetailsDto>(post);
+}
+
+[Authorize(BloggingPermissions.Posts.Update)]
+public virtual async Task<PostWithDetailsDto> UpdateAsync(Guid id, UpdatePostDto input)
+{
+    var post = await PostRepository.GetAsync(id);
+    input.Url = await RenameUrlIfItAlreadyExistAsync(input.BlogId, input.Url, post);
+
+    await AuthorizationService.CheckAsync(post, CommonOperations.Update);
+
+    post.SetTitle(input.Title);
+    post.SetUrl(input.Url);
+    post.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+    post.Content = input.Content;
+    post.Description = input.Description;
+    post.CoverImage = input.CoverImage;
+
+    post = await PostRepository.UpdateAsync(post);
+
+    await SaveTags(SplitTags(input.Tags), post);
+    await PublishPostChangedEventAsync(post.BlogId);
+
+    return ObjectMapper.Map<Post, PostWithDetailsDto>(post);
+}
+
+[Authorize(BloggingPermissions.Posts.Delete)]
+public virtual async Task DeleteAsync(Guid id)
+{
+    var post = await PostRepository.GetAsync(id);
+    await AuthorizationService.CheckAsync(post, CommonOperations.Delete);
+
+    var tags = await GetTagsOfPostAsync(id);
+    await TagRepository.DecreaseUsageCountOfTagsAsync(tags.Select(t => t.Id).ToList());
+    await CommentRepository.DeleteOfPost(id);
+
+    await PostRepository.DeleteAsync(id);
+    await PublishPostChangedEventAsync(post.BlogId);
+}
+```
+
+The URL-uniqueness helper is interesting — instead of throwing on collision, it appends a 5-char GUID suffix so authors never lose a draft to a slug clash:
+
+```csharp PostAppService.cs
+private async Task<string> RenameUrlIfItAlreadyExistAsync(
+    Guid blogId, string url, Post existingPost = null)
+{
+    if (await PostRepository.IsPostUrlInUseAsync(blogId, url, existingPost?.Id))
+        return url + "-" + Guid.NewGuid().ToString().Substring(0, 5);
+    return url;
+}
+```
+
+### Tag bookkeeping
+
+`SaveTags` lowercases + deduplicates the incoming comma-separated string, removes tags no longer referenced (decreasing their `UsageCount`) and inserts new ones with `UsageCount = 1`:
+
+```csharp PostAppService.cs
+private async Task SaveTags(ICollection<string> tags, Post post)
+{
+    tags = tags.Select(t => t.ToLowerInvariant()).Distinct().ToList();
+    await RemoveOldTags(tags, post);
+    await AddNewTags(tags, post);
+}
+
+private async Task AddNewTags(IEnumerable<string> newTags, Post post)
+{
+    var tags = await TagRepository.GetListAsync(post.BlogId);
+
+    foreach (var newTag in newTags)
+    {
+        var tag = tags.FirstOrDefault(
+            t => t.Name.Equals(newTag, StringComparison.OrdinalIgnoreCase));
+
+        if (tag == null)
+            tag = await TagRepository.InsertAsync(
+                new Tag(GuidGenerator.Create(), post.BlogId, newTag, 1));
+        else
+            tag.IncreaseUsageCount();
+
+        post.AddTag(tag.Id);
+    }
+}
+```
+
+### Public DTOs
+
+```csharp Posts/CreatePostDto.cs
+public class CreatePostDto
+{
+    public Guid BlogId { get; set; }
+
+    [Required]
+    [DynamicStringLength(typeof(PostConsts), nameof(PostConsts.MaxTitleLength))]
+    public string Title { get; set; }
+
+    [Required] public string CoverImage { get; set; }
+
+    [Required]
+    [DynamicStringLength(typeof(PostConsts), nameof(PostConsts.MaxUrlLength))]
+    public string Url { get; set; }
+
+    [Required]
+    [DynamicStringLength(typeof(PostConsts), nameof(PostConsts.MaxContentLength))]
+    public string Content { get; set; }
+
+    public string Tags { get; set; }   // comma-separated
+
+    [DynamicStringLength(typeof(PostConsts), nameof(PostConsts.MaxDescriptionLength))]
+    public string Description { get; set; }
+}
+```
+
+```csharp Posts/PostWithDetailsDto.cs
+public class PostWithDetailsDto : FullAuditedEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public Guid    BlogId       { get; set; }
+    public string  Title        { get; set; }
+    public string  CoverImage   { get; set; }
+    public string  Url          { get; set; }
+    public string  Content      { get; set; }
+    public string  Description  { get; set; }
+    public int     ReadCount    { get; set; }
+    public int     CommentCount { get; set; }
+
+    [CanBeNull] public BlogUserDto Writer { get; set; }
+    public List<TagDto> Tags { get; set; }
+
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+## `ICommentAppService` / `CommentAppService`
+
+Comment writes require an authenticated user (`[Authorize]` with no specific permission); update / delete go through resource-based authorization that also accepts ownership:
+
+```csharp ICommentAppService.cs
+public interface ICommentAppService : IApplicationService
+{
+    Task<List<CommentWithRepliesDto>> GetHierarchicalListOfPostAsync(Guid postId);
+    Task<CommentWithDetailsDto> CreateAsync(CreateCommentDto input);
+    Task<CommentWithDetailsDto> UpdateAsync(Guid id, UpdateCommentDto input);
+    Task DeleteAsync(Guid id);
+}
+```
+
+The hierarchical projection flattens the parent/reply structure into `CommentWithRepliesDto { Comment, Replies }` groups, populated with each commenter's `BlogUserDto`:
+
+```csharp CommentAppService.cs (abbreviated)
+public virtual async Task<List<CommentWithRepliesDto>>
+    GetHierarchicalListOfPostAsync(Guid postId)
+{
+    var comments = await GetListOfPostAsync(postId);
+
+    /* populate BlogUserDto Writer via UserLookupService */
+
+    var hierarchicalComments = new List<CommentWithRepliesDto>();
+    foreach (var commentDto in comments)
+    {
+        var parent = hierarchicalComments.Find(
+            c => c.Comment.Id == commentDto.RepliedCommentId);
+
+        if (parent != null) parent.Replies.Add(commentDto);
+        else hierarchicalComments.Add(new CommentWithRepliesDto { Comment = commentDto });
+    }
+
+    return hierarchicalComments
+        .OrderByDescending(c => c.Comment.CreationTime).ToList();
+}
+
+[Authorize] public virtual async Task<CommentWithDetailsDto>
+    UpdateAsync(Guid id, UpdateCommentDto input)
+{
+    var comment = await CommentRepository.GetAsync(id);
+    await AuthorizationService.CheckAsync(comment, CommonOperations.Update);
+    comment.SetText(input.Text);
+    comment.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+    comment = await CommentRepository.UpdateAsync(comment);
+    return ObjectMapper.Map<Comment, CommentWithDetailsDto>(comment);
+}
+
+[Authorize] public virtual async Task DeleteAsync(Guid id)
+{
+    var comment = await CommentRepository.GetAsync(id);
+    await AuthorizationService.CheckAsync(comment, CommonOperations.Delete);
+    await CommentRepository.DeleteAsync(id);
+
+    foreach (var reply in await CommentRepository.GetRepliesOfComment(id))
+        await CommentRepository.DeleteAsync(reply.Id);
+}
+```
+
+## `ITagAppService` / `TagAppService`
+
+The public surface exposes only the "popular tags" sidebar query — full tag CRUD is internal to `PostAppService`'s tag bookkeeping (above).
+
+```csharp TagAppService.cs
+public class TagAppService : BloggingAppServiceBase, ITagAppService
+{
+    protected ITagRepository TagRepository { get; }
+
+    public TagAppService(ITagRepository tagRepository) => TagRepository = tagRepository;
+
+    public virtual async Task<List<TagDto>> GetPopularTagsAsync(
+        Guid blogId, GetPopularTagsInput input)
+    {
+        var postTags = (await TagRepository.GetListAsync(blogId))
+            .OrderByDescending(t => t.UsageCount)
+            .WhereIf(input.MinimumPostCount != null,
+                     t => t.UsageCount >= input.MinimumPostCount)
+            .Take(input.ResultCount)
+            .ToList();
+
+        return new List<TagDto>(
+            ObjectMapper.Map<List<Tag>, List<TagDto>>(postTags));
+    }
+}
+```
+
+The Razor sidebar calls it with `ResultCount = 10, MinimumPostCount = 2`.
+
+## `IFileAppService` / `FileAppService`
+
+Provides upload + retrieval for post images. `FileAppService` writes to a `BloggingFileContainer` (a typed BLOB container backed by ABP's BLOB Storing system):
+
+```csharp IFileAppService.cs
+public interface IFileAppService : IApplicationService
+{
+    Task<RawFileDto> GetAsync(string name);
+    Task<IRemoteStreamContent> GetFileAsync(string name);
+    Task<FileUploadOutputDto> CreateAsync(FileUploadInputDto input);
+}
+```
+
+`BlogFileOptions` (in `Volo.Blogging.Application/Volo/Blogging/Files/BlogFileOptions.cs`) controls the allowed MIME types and maximum size, and `ImageFormatHelper` enforces the rules. The corresponding HTTP routes are listed under [HTTP API → Files](/modules/blogging/http-api#blogfilescontroller).
+
+## `IMemberAppService` / `MemberAppService`
+
+Implements the public author profile page:
+
+```csharp MemberAppService.cs
+public class MemberAppService : BloggingAppServiceBase, IMemberAppService
+{
+    private readonly IRepository<BlogUser, Guid> _userRepository;
+
+    public MemberAppService(IRepository<BlogUser, Guid> userRepository)
+        => _userRepository = userRepository;
+
+    public virtual async Task<BlogUserDto> FindAsync(string username)
+    {
+        var user = await _userRepository.FindAsync(
+            x => x.UserName == username && x.IsActive);
+        if (user == null) return null;
+        return ObjectMapper.Map<BlogUser, BlogUserDto>(user);
+    }
+
+    public virtual async Task UpdateUserProfileAsync(CustomIdentityBlogUserUpdateDto input)
+    {
+        var user = await _userRepository.GetAsync(CurrentUser.Id.Value);
+        user.Name = input.Name; user.Surname = input.Surname;
+        user.WebSite = input.WebSite;
+        user.Twitter = input.Twitter; user.Github = input.Github;
+        user.Linkedin = input.Linkedin;
+        user.Company = input.Company; user.JobTitle = input.JobTitle;
+        user.Biography = input.Biography;
+        await _userRepository.UpdateAsync(user);
+    }
+}
+```
+
+## Authorization handlers
+
+`PostAuthorizationHandler` and `CommentAuthorizationHandler` implement resource-based authorization for the `CommonOperations.Update` / `CommonOperations.Delete` requirements. They succeed if the current user is the author **or** holds the corresponding permission.
+
+```csharp CommonOperations.cs
+public static class CommonOperations
+{
+    public static OperationAuthorizationRequirement Update
+        = new() { Name = nameof(Update) };
+    public static OperationAuthorizationRequirement Delete
+        = new() { Name = nameof(Delete) };
+}
+```
+
+```csharp PostAuthorizationHandler.cs
+public class PostAuthorizationHandler
+    : AuthorizationHandler<OperationAuthorizationRequirement, Post>
+{
+    protected IPermissionChecker PermissionChecker { get; }
+
+    public PostAuthorizationHandler(IPermissionChecker permissionChecker)
+        => PermissionChecker = permissionChecker;
+
+    protected override async Task HandleRequirementAsync(
+        AuthorizationHandlerContext context,
+        OperationAuthorizationRequirement requirement,
+        Post resource)
+    {
+        if (requirement.Name == CommonOperations.Delete.Name
+            && await HasDeletePermission(context, resource))
+        { context.Succeed(requirement); return; }
+
+        if (requirement.Name == CommonOperations.Update.Name
+            && await HasUpdatePermission(context, resource))
+        { context.Succeed(requirement); }
+    }
+
+    private async Task<bool> HasUpdatePermission(
+        AuthorizationHandlerContext context, Post resource)
+    {
+        if (resource.CreatorId != null
+            && resource.CreatorId == context.User.FindUserId())
+            return true;
+
+        return await PermissionChecker.IsGrantedAsync(
+            context.User, BloggingPermissions.Posts.Update);
+    }
+    /* HasDeletePermission is structurally identical with .Delete permission */
+}
+```
+
+`CommentAuthorizationHandler` is the analogous handler for `Comment`, swapping in `BloggingPermissions.Comments.*`.
+
+This combination — class-level `[Authorize(BloggingPermissions.Posts.Update)]` plus resource-level `AuthorizationService.CheckAsync(post, CommonOperations.Update)` — means: "you need either the permission, **or** you must be the post's creator". The permission check happens first as a coarse gate, then the handler examines `CreatorId`; if either matches, the call goes through.
+
+## Admin: `IBlogManagementAppService` / `BlogManagementAppService`
+
+The admin surface is in a separate project so a host can ship the public read APIs without exposing blog management at all.
+
+```csharp Volo.Blogging.Admin.Application.Contracts/Volo/Blogging/Admin/Blogs/IBlogManagementAppService.cs
+public interface IBlogManagementAppService : IApplicationService
+{
+    Task<ListResultDto<BlogDto>> GetListAsync();
+    Task<BlogDto> GetAsync(Guid id);
+
+    Task<BlogDto> CreateAsync(CreateBlogDto input);
+    Task<BlogDto> UpdateAsync(Guid id, UpdateBlogDto input);
+    Task DeleteAsync(Guid id);
+
+    Task ClearCacheAsync(Guid id);
+}
+```
+
+```csharp Volo.Blogging.Admin.Application/Volo/Blogging/Admin/Blogs/BlogManagementAppService.cs
+public class BlogManagementAppService
+    : BloggingAdminAppServiceBase, IBlogManagementAppService
+{
+    private readonly IBlogRepository _blogRepository;
+    private readonly IDistributedCache<List<PostCacheItem>> _postsCache;
+
+    public BlogManagementAppService(IBlogRepository blogRepository,
+        IDistributedCache<List<PostCacheItem>> postsCache)
+    { _blogRepository = blogRepository; _postsCache = postsCache; }
+
+    public virtual async Task<ListResultDto<BlogDto>> GetListAsync()
+        => new(ObjectMapper.Map<List<Blog>, List<BlogDto>>(
+                  await _blogRepository.GetListAsync()));
+
+    public virtual async Task<BlogDto> GetAsync(Guid id)
+        => ObjectMapper.Map<Blog, BlogDto>(await _blogRepository.GetAsync(id));
+
+    [Authorize(BloggingPermissions.Blogs.Create)]
+    public virtual async Task<BlogDto> CreateAsync(CreateBlogDto input)
+    {
+        var newBlog = new Blog(GuidGenerator.Create(), input.Name, input.ShortName)
+        {
+            Description = input.Description
+        };
+        newBlog = await _blogRepository.InsertAsync(newBlog);
+        return ObjectMapper.Map<Blog, BlogDto>(newBlog);
+    }
+
+    [Authorize(BloggingPermissions.Blogs.Update)]
+    public virtual async Task<BlogDto> UpdateAsync(Guid id, UpdateBlogDto input)
+    {
+        var blog = await _blogRepository.GetAsync(id);
+        blog.SetName(input.Name);
+        blog.SetShortName(input.ShortName);
+        blog.Description = input.Description;
+        blog.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+        return ObjectMapper.Map<Blog, BlogDto>(blog);
+    }
+
+    [Authorize(BloggingPermissions.Blogs.Delete)]
+    public virtual async Task DeleteAsync(Guid id)
+        => await _blogRepository.DeleteAsync(id);
+
+    [Authorize(BloggingPermissions.Blogs.ClearCache)]
+    public virtual async Task ClearCacheAsync(Guid id)
+        => await _postsCache.RemoveAsync(id.ToString());
+}
+```
+
+The admin service deliberately **does not** publish `PostChangedEvent` from `CreateAsync` / `UpdateAsync` / `DeleteAsync`: those operate on `Blog` aggregates, not `Post` ones, and the per-blog cache bucket is only stale if a post changes. `ClearCacheAsync` exists for the edge case where the cache must be flushed manually (e.g. after a seed or a manual SQL fix).
+
+### Admin DTOs
+
+```csharp CreateBlogDto.cs
+public class CreateBlogDto
+{
+    [Required]
+    [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxNameLength))]
+    public string Name { get; set; }
+
+    [Required]
+    [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxShortNameLength))]
+    public string ShortName { get; set; }
+
+    [DynamicStringLength(typeof(BlogConsts), nameof(BlogConsts.MaxDescriptionLength))]
+    public string Description { get; set; }
+}
+```
+
+`UpdateBlogDto` has the same three fields plus `string ConcurrencyStamp` to support optimistic concurrency.
+
+## Where the application layer is consumed
+
+<CardGroup cols={2}>
+  <Card title="HTTP API" icon="cloud" href="/modules/blogging/http-api">
+    `BlogsController` / `PostsController` / `CommentsController` / `TagsController` / `BlogFilesController` each implement the matching `I*AppService` interface and delegate every method to the injected service.
+  </Card>
+  <Card title="Web & Admin UI" icon="window" href="/modules/blogging/web-and-admin">
+    Razor `PageModel`s consume `IBlogAppService` / `IPostAppService` / etc. directly via DI — the dynamic client proxy is also generated for JS callers.
+  </Card>
+  <Card title="Domain layer" icon="cube" href="/modules/blogging/domain">
+    Aggregate roots, repositories, the `PostChangedEvent` consumed by `PostCacheInvalidator`.
+  </Card>
+  <Card title="CMS Kit Blogs" icon="newspaper" href="/modules/cms-kit/blogs">
+    Compare with `IBlogPostAdminAppService` and friends — CMS Kit splits public + admin similarly, but the DTOs and aggregates are different and live under `Volo.CmsKit.*`.
+  </Card>
+</CardGroup>

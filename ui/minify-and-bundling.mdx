@@ -1,0 +1,321 @@
+---
+title: "Minify and bundling"
+sidebarTitle: "Minify & bundling"
+description: "Volo.Abp.Minify (NUglify-based JS/CSS/HTML minifiers) and Volo.Abp.AspNetCore.Mvc.UI.Bundling — BundleManager, AbpBundlingOptions, the <abp-script-bundle> / <abp-style-bundle> tag helpers, and the global assets pipeline."
+---
+
+ABP's bundling pipeline is the glue between two things: a module's **bundle contributor** (a class that lists CSS/JS files plus modifiers) and the actual byte stream the browser receives. There are no `<script>` tags scattered across a module's Razor views — every theme writes:
+
+```cshtml
+<abp-style-bundle  name="@BasicThemeBundles.Styles.Global"  />
+<abp-script-bundle name="@BasicThemeBundles.Scripts.Global" />
+```
+
+…and at request time `BundleManager` resolves the bundle's contributors, reads the listed files from the [virtual file system](/ui/virtual-file-system), optionally concatenates and **minifies** them through `Volo.Abp.Minify` (NUglify), caches the result, and emits a `<link rel="stylesheet" href="/_bundles/Basic.Global.css?...">` (or one `<script>` per file in dev).
+
+Two packages cooperate:
+
+- `Volo.Abp.Minify` — abstract minifier contracts plus a NUglify-based implementation. UI-agnostic; usable from any module.
+- `Volo.Abp.AspNetCore.Mvc.UI.Bundling` — the ASP.NET Core bundling pipeline that ties contributors → minifiers → `IWebHostEnvironment` → `IDynamicFileProvider`.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.Minify/Volo/Abp/Minify/
+├── AbpMinifyModule.cs
+├── IMinifier.cs                             # the shared contract
+├── Scripts/   IJavascriptMinifier.cs        # : IMinifier
+├── Styles/    ICssMinifier.cs               # : IMinifier
+├── Html/      IHtmlMinifier.cs              # : IMinifier
+└── NUglify/
+    ├── NUglifyMinifierBase.cs               # ITransientDependency
+    ├── NUglifyJavascriptMinifier.cs
+    ├── NUglifyCssMinifier.cs
+    ├── NUglifyHtmlMinifier.cs
+    └── NUglifyException.cs
+
+framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/
+├── AbpAspNetCoreMvcUiBundlingModule.cs
+├── BundleManager.cs                         # ITransientDependency
+├── CachedBundleDynamicFileProvider.cs
+├── InMemoryFileInfoCacheItem.cs
+├── MvcUiBundlerBase.cs
+├── Scripts/ScriptBundler.cs                 # IScriptBundler
+├── Styles/StyleBundler.cs                   # IStyleBundler
+└── TagHelpers/
+    ├── AbpScriptBundleTagHelper.cs          # <abp-script-bundle>
+    ├── AbpStyleBundleTagHelper.cs           # <abp-style-bundle>
+    ├── AbpScriptTagHelper.cs                # asp-src-include enhancement
+    ├── AbpStyleTagHelper.cs
+    └── AbpBundleItemTagHelper.cs            # <abp-bundle-item>
+```
+
+## The minifier contract
+
+```csharp
+// IMinifier.cs
+public interface IMinifier
+{
+    string Minify(string source, string? fileName = null, string? originalFileName = null);
+}
+
+public interface IJavascriptMinifier : IMinifier { }
+public interface ICssMinifier        : IMinifier { }
+public interface IHtmlMinifier       : IMinifier { }
+```
+
+Three marker interfaces so you can register **different** minifiers per format without ambiguity.
+
+## The NUglify implementation
+
+```csharp
+// NUglify/NUglifyMinifierBase.cs
+public abstract class NUglifyMinifierBase : IMinifier, ITransientDependency
+{
+    public string Minify(string source, string? fileName = null, string? originalFileName = null)
+    {
+        try
+        {
+            var result = UglifySource(source, fileName);
+            CheckErrors(result, originalFileName);
+            return result.Code;
+        }
+        catch (Exception e)
+        {
+            throw new NUglifyException(
+                $"There is an error in uglifying the given source code!{Environment.NewLine}{e.Message}", e);
+        }
+    }
+
+    protected abstract UglifyResult UglifySource(string source, string? fileName);
+}
+
+public class NUglifyJavascriptMinifier : NUglifyMinifierBase, IJavascriptMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Js(source, fileName);
+}
+
+public class NUglifyCssMinifier : NUglifyMinifierBase, ICssMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Css(source, fileName);
+}
+```
+
+`CheckErrors` throws `NUglifyException` (with all NUglify diagnostic messages) if minification produced errors — which surfaces in the framework log with the original file name preserved, so you can find the broken script across hundreds of bundled files.
+
+All three minifiers are registered automatically through `ITransientDependency`. Replacing one is straightforward:
+
+```csharp
+context.Services.AddTransient<ICssMinifier, MyCustomCssMinifier>();
+```
+
+## The bundle manager
+
+`BundleManager` is the runtime that powers `<abp-script-bundle>` and `<abp-style-bundle>`. The MVC-specific subclass plugs in `IWebHostEnvironment`:
+
+```csharp
+public class BundleManager : BundleManagerBase, ITransientDependency
+{
+    public override bool IsBundlingEnabled()
+    {
+        switch (Options.Mode)
+        {
+            case BundlingMode.None:               return false;
+            case BundlingMode.Bundle:
+            case BundlingMode.BundleAndMinify:    return true;
+            case BundlingMode.Auto:               return !HostingEnvironment.IsDevelopment();
+            default: throw new AbpException($"Unhandled {nameof(BundlingMode)}: {Options.Mode}");
+        }
+    }
+
+    protected override bool IsMinficationEnabled()
+    {
+        switch (Options.Mode)
+        {
+            case BundlingMode.None:
+            case BundlingMode.Bundle:             return false;
+            case BundlingMode.BundleAndMinify:    return true;
+            case BundlingMode.Auto:               return !HostingEnvironment.IsDevelopment();
+            default: throw new AbpException($"Unhandled {nameof(BundlingMode)}: {Options.Mode}");
+        }
+    }
+
+    protected override IFileProvider GetFileProvider()
+        => HostingEnvironment.WebRootFileProvider;
+}
+```
+
+Two switches drive everything:
+
+| `AbpBundlingOptions.Mode` | Bundles? | Minifies? |
+| --- | --- | --- |
+| `None` | No — every contributor file is rendered as a separate `<script>` / `<link>`. | No |
+| `Bundle` | Yes | No |
+| `BundleAndMinify` | Yes | Yes |
+| `Auto` *(default)* | Yes when **not** `IsDevelopment()` | Yes when **not** `IsDevelopment()` |
+
+In `Development` you naturally get individual files (easy debugging, source maps work), in `Production` you get one minified bundle per `name`.
+
+## The bundlers
+
+`ScriptBundler` and `StyleBundler` are the concrete `IScriptBundler` / `IStyleBundler` instances `BundleManager` delegates to. They are intentionally thin — they get the `IMinifier` of the right marker type and only override `ProcessBeforeAddingToTheBundle` to fix per-format quirks:
+
+```csharp
+public class ScriptBundler : MvcUiBundlerBase, IScriptBundler
+{
+    public override string FileExtension => "js";
+
+    public ScriptBundler(IWebHostEnvironment hostingEnvironment,
+                         IJavascriptMinifier minifier,
+                         IOptions<AbpBundlingOptions> bundlingOptions)
+        : base(hostingEnvironment, minifier, bundlingOptions) { }
+
+    protected override string ProcessBeforeAddingToTheBundle(
+        IBundlerContext context, string filePath, string fileContent)
+        => fileContent.EnsureEndsWith(';') + Environment.NewLine;
+}
+
+public class StyleBundler : MvcUiBundlerBase, IStyleBundler
+{
+    public override string FileExtension => "css";
+
+    public StyleBundler(IWebHostEnvironment hostingEnvironment,
+                        ICssMinifier minifier,
+                        IOptions<AbpBundlingOptions> bundlingOptions)
+        : base(hostingEnvironment, minifier, bundlingOptions) { _hostingEnvironment = hostingEnvironment; }
+
+    public string GetAbsolutePath(string relativePath)
+        => Path.Combine(_hostingEnvironment.ContentRootPath, "wwwroot",
+                        relativePath.RemovePreFix("/"));
+
+    protected override string ProcessBeforeAddingToTheBundle(
+        IBundlerContext context, string filePath, string fileContent)
+        => CssRelativePath.Adjust(fileContent,
+                                  GetAbsolutePath(filePath),
+                                  GetAbsolutePath(context.BundleRelativePath));
+}
+```
+
+Notice two production-quality details:
+
+- `ScriptBundler` makes sure every concatenated file ends with `;` — protects you from a minified file dropping its trailing semicolon and breaking the next file in the bundle.
+- `StyleBundler` calls `CssRelativePath.Adjust` so that `url(...)` references inside a CSS file are rewritten relative to the **bundle** path rather than the source file's path. Without that, every bundled stylesheet's font/image references would be broken.
+
+## The tag helpers
+
+```csharp
+[HtmlTargetElement("abp-script-bundle", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpScriptBundleTagHelper
+    : AbpBundleTagHelper<AbpScriptBundleTagHelper, AbpScriptBundleTagHelperService>, IBundleTagHelper
+{
+    [HtmlAttributeName("defer")] public bool Defer { get; set; }
+}
+
+[HtmlTargetElement("abp-style-bundle", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpStyleBundleTagHelper
+    : AbpBundleTagHelper<AbpStyleBundleTagHelper, AbpStyleBundleTagHelperService>, IBundleTagHelper
+{
+    [HtmlAttributeName("preload")] public bool Preload { get; set; }
+}
+```
+
+Inline usage from a layout:
+
+```cshtml
+<abp-style-bundle name="@BasicThemeBundles.Styles.Global"
+                  preload="true" />
+@* ... *@
+<abp-script-bundle name="@BasicThemeBundles.Scripts.Global"
+                   defer="true" />
+```
+
+Both tag helpers resolve their `name` against `AbpBundlingOptions.StyleBundles` / `ScriptBundles`, ask `BundleManager` for the produced file(s), and emit the right `<link>` / `<script>` markup. When bundling is disabled they fall back to one tag per file.
+
+You can also drop files into a named bundle *inline* using `<abp-bundle-item>`:
+
+```cshtml
+<abp-script-bundle name="MyPage.Scripts">
+    <abp-bundle-item src="/scripts/extra.js" />
+</abp-script-bundle>
+```
+
+## Declaring a bundle in a module
+
+Bundles are configured on `AbpBundlingOptions`. The Basic theme is the canonical example:
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.StyleBundles.Add(BasicThemeBundles.Styles.Global, bundle =>
+    {
+        bundle
+            .AddBaseBundles(StandardBundles.Styles.Global)   // inherit shared/Global
+            .AddContributors(typeof(BasicThemeGlobalStyleContributor));
+    });
+
+    options.ScriptBundles.Add(BasicThemeBundles.Scripts.Global, bundle =>
+    {
+        bundle
+            .AddBaseBundles(StandardBundles.Scripts.Global)
+            .AddContributors(typeof(BasicThemeGlobalScriptContributor));
+    });
+});
+```
+
+A bundle contributor is plain code:
+
+```csharp
+public class BasicThemeGlobalStyleContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.Add(new BundleFile("/themes/basic/googlefonts.css", true));
+        context.Files.Add("/themes/basic/layout.css");
+    }
+}
+```
+
+The `BundleFile` second argument (`true`) marks the file as an **external** resource — i.e. emit a `<link>` even in bundle mode, do not try to concatenate it. That is what you want for a Google Fonts CSS at a different origin.
+
+## Global assets
+
+The bundling module supports pre-rendering one combined `global-script.js` / `global-styles.css` at application init, so that pages that bypass the tag helpers (a server-side error page, a SignalR negotiation page, …) still get the same script/style baseline:
+
+```csharp
+// AbpAspNetCoreMvcUiBundlingModule.cs (excerpt)
+protected virtual async Task InitialGlobalAssetsAsync(ApplicationInitializationContext context)
+{
+    var bundlingOptions = context.ServiceProvider
+        .GetRequiredService<IOptions<AbpBundlingOptions>>().Value;
+    if (!bundlingOptions.GlobalAssets.Enabled) return;
+
+    var bundleManager     = context.ServiceProvider.GetRequiredService<BundleManager>();
+    var dynamicFileProvider = context.ServiceProvider.GetRequiredService<IDynamicFileProvider>();
+
+    // ... reads each script/style in the configured global bundle,
+    //     concatenates them, and writes the result into the dynamic file provider:
+    dynamicFileProvider.AddOrUpdate(new InMemoryFileInfo(
+        "/wwwroot/" + bundlingOptions.GlobalAssets.JavaScriptFileName,
+        Encoding.UTF8.GetBytes(scripts),
+        bundlingOptions.GlobalAssets.JavaScriptFileName));
+}
+```
+
+The resulting `InMemoryFileInfo` ends up inside the same `CompositeFileProvider` that powers the [virtual file system](/ui/virtual-file-system) (`IDynamicFileProvider` is the first provider it consults), so a static file request for `/global.js` or `/global.css` is served straight out of memory.
+
+Enable it via `AbpBundlingOptions.GlobalAssets.Enabled = true` and point `GlobalStyleBundleName` / `GlobalScriptBundleName` at the bundle you want pre-rendered (typically your theme's `*.Global`).
+
+## When bundling is disabled
+
+In `AbpBundlingOptions.Mode = BundlingMode.None` (or in `Auto` while developing), the framework writes individual `<script src="/themes/basic/layout.js"></script>` tags instead of one bundled URL. The `StyleBundler` still rewrites `url(...)` paths (`CssRelativePath.Adjust`), but the minifier is bypassed entirely. This is the recommended setting in `Development` and the default — your stack traces and CSS rules still point at the original file.
+
+## Cross-references
+
+- The companion ASP.NET Core surface — how to configure modes, the `<abp-script>` / `<abp-style>` enhancement tag helpers, dynamic resources, and the bundler CLI: [/aspnetcore/mvc-ui-bundling](/aspnetcore/mvc-ui-bundling).
+- The `libs/` install flow that puts Bootstrap, FontAwesome, and friends into `wwwroot` so bundle contributors can reference them: [/aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages).
+- The shared theme's `StandardBundles.Global` and the contributors a Basic theme inherits: [/ui/theme-shared](/ui/theme-shared).
+- How `BasicThemeBundles.Styles.Global` extends those: [/ui/basic-theme](/ui/basic-theme), [/modules/basic-theme/overview](/modules/basic-theme/overview).
+- The virtual file system the bundlers read from and write to via `IDynamicFileProvider`: [/ui/virtual-file-system](/ui/virtual-file-system).
+- The Blazor counterpart: [/blazor/theming](/blazor/theming).

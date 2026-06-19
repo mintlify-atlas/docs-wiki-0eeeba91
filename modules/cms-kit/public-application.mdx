@@ -1,0 +1,309 @@
+---
+title: "Public Application Layer"
+description: "End-user app services for CMS Kit: BlogPostPublicAppService, PagePublicAppService, CommentPublicAppService, RatingPublicAppService, ReactionPublicAppService, MarkedItemPublicAppService, MenuItemPublicAppService, GlobalResourcePublicAppService. Mostly anonymous reads; authenticated writes for ratings, reactions, comments, marked items."
+---
+
+The public application layer is what anonymous and signed-in *end users* (not admins) hit. It exposes thin, slim DTOs (no audit fields, no draft posts) and tends to cache aggressively. Most read methods are anonymous; user actions like rating, reacting, commenting, or bookmarking require authentication.
+
+**Source:**
+
+- Contracts: [`modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public)
+- Impl: [`modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public)
+
+## Services at a glance
+
+```
+Volo.CmsKit.Public.Application/Volo/CmsKit/Public/
+├── Blogs/BlogPostPublicAppService.cs              # GetList, GetBySlug, authors, tag-name lookup
+├── Pages/PagePublicAppService.cs                  # FindBySlug, FindDefaultHomePage, cached
+├── Comments/CommentPublicAppService.cs            # GetList by entity, Create (with idempotency)
+├── Ratings/RatingPublicAppService.cs              # Create (upsert), histogram, Delete
+├── Reactions/ReactionPublicAppService.cs          # GetForSelection (with user state), Create, Delete
+├── MarkedItems/MarkedItemPublicAppService.cs      # GetForUser, Toggle
+├── Menus/MenuItemPublicAppService.cs              # GetList (ordered tree)
+└── GlobalResources/GlobalResourcePublicAppService.cs  # GetGlobalScript, GetGlobalStyle
+```
+
+| Service | Auth | Cache | Notes |
+| --- | --- | --- | --- |
+| `BlogPostPublicAppService` | Anonymous reads, auth for `DeleteAsync` (author only) | No | Only returns `BlogPostStatus.Published`. |
+| `PagePublicAppService` | Anonymous | `IDistributedCache<PageCacheItem>` | Caches per slug and the default home page. |
+| `CommentPublicAppService` | Auth for `CreateAsync`/`UpdateAsync`/`DeleteAsync` | No | Idempotency token short-circuits double-submit. |
+| `RatingPublicAppService` | Auth for `CreateAsync`/`DeleteAsync` | No | Upsert semantics — one rating per (entity, user). |
+| `ReactionPublicAppService` | Auth for `CreateAsync`/`DeleteAsync` | No | One reaction per (entity, user); replaces previous. |
+| `MarkedItemPublicAppService` | Auth | No | `ToggleAsync` flips bookmark state. |
+| `MenuItemPublicAppService` | Anonymous | Usually cached by the Razor renderer | Filters by `RequiredPermissionName` per current user. |
+| `GlobalResourcePublicAppService` | Anonymous | Cached at the view-component level | Returns the site-wide CSS / JS strings. |
+
+## `IBlogPostPublicAppService`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Blogs/IBlogPostPublicAppService.cs
+public interface IBlogPostPublicAppService : IApplicationService
+{
+    Task<PagedResultDto<BlogPostCommonDto>> GetListAsync(
+        [NotNull] string blogSlug, BlogPostGetListInput input);
+
+    Task<BlogPostCommonDto> GetAsync([NotNull] string blogSlug, [NotNull] string blogPostSlug);
+
+    Task<PagedResultDto<CmsUserDto>> GetAuthorsHasBlogPostsAsync(
+        BlogPostFilteredPagedAndSortedResultRequestDto input);
+
+    Task<CmsUserDto> GetAuthorHasBlogPostAsync(Guid id);
+
+    Task DeleteAsync(Guid id);
+
+    Task<string> GetTagNameAsync([NotNull] Guid tagId);
+}
+```
+
+`BlogPostCommonDto` is the slim public projection — title, slug, short description, content, cover image id, author, tags, publish time. No status, no audit metadata, no tenant id.
+
+`GetAsync(blogSlug, blogPostSlug)` is what the public blog detail Razor Page calls when the URL pattern is `/blogs/{blogSlug}/{blogPostSlug}`.
+
+`GetAuthorsHasBlogPostsAsync` powers the "Authors" sidebar — only authors who have *at least one* published post are listed.
+
+### Implementation excerpt
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Public.Application/Volo/CmsKit/Public/Blogs/BlogPostPublicAppService.cs
+[RequiresFeature(CmsKitFeatures.BlogEnable)]
+[RequiresGlobalFeature(typeof(BlogsFeature))]
+public class BlogPostPublicAppService : CmsKitPublicAppServiceBase, IBlogPostPublicAppService
+{
+    protected IBlogRepository BlogRepository { get; }
+    protected IBlogPostRepository BlogPostRepository { get; }
+    protected ITagRepository TagRepository { get; }
+    protected BlogPostManager BlogPostManager { get; }
+
+    public BlogPostPublicAppService(
+        IBlogRepository blogRepository,
+        IBlogPostRepository blogPostRepository,
+        ITagRepository tagRepository,
+        BlogPostManager blogPostManager)
+    {
+        BlogRepository = blogRepository;
+        BlogPostRepository = blogPostRepository;
+        TagRepository = tagRepository;
+        BlogPostManager = blogPostManager;
+    }
+
+    public virtual async Task<BlogPostCommonDto> GetAsync(
+        [NotNull] string blogSlug, [NotNull] string blogPostSlug)
+    {
+        var blog = await BlogRepository.GetBySlugAsync(blogSlug);
+        var blogPost = await BlogPostRepository.GetBySlugAsync(blog.Id, blogPostSlug);
+        return ObjectMapper.Map<BlogPost, BlogPostCommonDto>(blogPost);
+    }
+
+    public virtual async Task<PagedResultDto<BlogPostCommonDto>> GetListAsync(
+        [NotNull] string blogSlug, BlogPostGetListInput input)
+    {
+        var blog = await BlogRepository.GetBySlugAsync(blogSlug);
+
+        Guid? favoriteUserId = await GetFavoriteUserIdAsync(input.FilterOnFavorites);
+
+        var blogPosts = await BlogPostRepository.GetListAsync(
+            filter: null,
+            blogId: blog.Id,
+            authorId: input.AuthorId,
+            tagId: input.TagId,
+            favoriteUserId: favoriteUserId,
+            statusFilter: BlogPostStatus.Published,
+            maxResultCount: input.MaxResultCount,
+            skipCount: input.SkipCount,
+            sorting: input.Sorting);
+
+        return new PagedResultDto<BlogPostCommonDto>(
+            await BlogPostRepository.GetCountAsync(
+                blogId: blog.Id,
+                tagId: input.TagId,
+                favoriteUserId: favoriteUserId,
+                statusFilter: BlogPostStatus.Published,
+                authorId: input.AuthorId),
+            ObjectMapper.Map<List<BlogPost>, List<BlogPostCommonDto>>(blogPosts));
+    }
+}
+```
+
+The two things that distinguish this from the admin equivalent:
+
+1. **Hard-coded `statusFilter: BlogPostStatus.Published`** — drafts and review-pending posts are invisible to the public.
+2. **`favoriteUserId`** — when `input.FilterOnFavorites` is true (and the user is signed in), `GetFavoriteUserIdAsync` returns `CurrentUser.Id` and the repository filters to posts the user has bookmarked via `UserMarkedItem`.
+
+## `IPagePublicAppService`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Public.Application.Contracts/Volo/CmsKit/Public/Pages/IPagePublicAppService.cs
+public interface IPagePublicAppService : IApplicationService
+{
+    Task<PageDto> FindBySlugAsync([NotNull] string slug);
+    Task<bool> DoesSlugExistAsync([NotNull] string slug);
+    Task<PageDto> FindDefaultHomePageAsync();
+}
+```
+
+Three find-methods, all anonymous, all cache-backed:
+
+```csharp
+// PagePublicAppService.cs (excerpt)
+[RequiresFeature(CmsKitFeatures.PageEnable)]
+[RequiresGlobalFeature(typeof(PagesFeature))]
+public class PagePublicAppService : CmsKitPublicAppServiceBase, IPagePublicAppService
+{
+    protected IPageRepository PageRepository { get; }
+    protected PageManager PageManager { get; }
+    protected IDistributedCache<PageCacheItem> PageCache { get; }
+
+    public PagePublicAppService(
+        IPageRepository pageRepository,
+        PageManager pageManager,
+        IDistributedCache<PageCacheItem> pageCache)
+    {
+        PageRepository = pageRepository;
+        PageManager = pageManager;
+        PageCache = pageCache;
+    }
+
+    public virtual async Task<PageDto> FindBySlugAsync(string slug)
+    {
+        var cachedPage = await FindAndCacheBySlugAsync(slug);
+        if (cachedPage == null) return null;
+        return ObjectMapper.Map<PageCacheItem, PageDto>(cachedPage);
+    }
+
+    public virtual async Task<PageDto> FindDefaultHomePageAsync()
+    {
+        var pageCacheItem = await PageCache.GetAsync(
+            PageCacheItem.GetKey(PageConsts.DefaultHomePageCacheKey));
+        // ... falls through to PageManager.GetHomePageAsync if cache miss
+    }
+}
+```
+
+`PageCacheItem` is a serialized projection (title + slug + content + script + style + layoutName + IsHomePage). The cache invalidates on every admin write via `PageAdminAppService`.
+
+`DoesSlugExistAsync` is used by the public Razor middleware to decide whether a 404 should fall through to the page renderer.
+
+## `ICommentPublicAppService`
+
+```csharp
+public interface ICommentPublicAppService : IApplicationService
+{
+    Task<ListResultDto<CommentWithDetailsDto>> GetListAsync(string entityType, string entityId);
+    Task<CommentDto> CreateAsync(string entityType, string entityId, CreateCommentInput input);
+    Task<CommentDto> UpdateAsync(Guid id, UpdateCommentInput input);
+    Task DeleteAsync(Guid id);
+}
+```
+
+`CreateCommentInput` carries `Text`, `RepliedCommentId?`, and `IdempotencyToken`. The implementation:
+
+1. Reads `CmsKitSettings.Comments.RequireApprovement` (through `CommentManager`).
+2. Calls `CommentManager.CreateAsync(...)`.
+3. Assigns the idempotency token onto the entity.
+4. Inserts via `ICommentRepository`.
+
+`UpdateAsync` is restricted to the comment's `CreatorId == CurrentUser.Id` — users can only edit their own comments. `DeleteAsync` similarly requires either ownership or the `Comments.Delete` admin permission.
+
+## `IRatingPublicAppService`
+
+```csharp
+public interface IRatingPublicAppService : IApplicationService
+{
+    Task<RatingDto> CreateAsync(string entityType, string entityId, CreateUpdateRatingInput input);
+    Task DeleteAsync(string entityType, string entityId);
+    Task<List<RatingWithStarCountDto>> GetGroupedStarCountsAsync(string entityType, string entityId);
+}
+```
+
+`CreateAsync` is misleadingly named — it actually maps to `RatingManager.SetStarAsync`, which is the [upsert path](/modules/cms-kit/tags-and-ratings#ratingmanager). The name stuck because from the HTTP client's perspective, "I am submitting my rating" is a `POST`.
+
+`GetGroupedStarCountsAsync` returns histogram data for the public `Rating` view component (which renders the average + per-star bar chart).
+
+## `IReactionPublicAppService`
+
+```csharp
+public interface IReactionPublicAppService : IApplicationService
+{
+    Task<ListResultDto<ReactionWithSelectionDto>> GetForSelectionAsync(string entityType, string entityId);
+    Task CreateAsync(string entityType, string entityId, string reaction);
+    Task DeleteAsync(string entityType, string entityId, string reaction);
+}
+```
+
+`GetForSelectionAsync` returns every defined reaction *plus* the count *plus* a flag indicating whether the current user has selected it. That's three queries collapsed into one DTO for the reaction picker UI.
+
+`CreateAsync(entityType, entityId, reactionName)` is an upsert/replace: if the user already reacted with a different name, the previous reaction is removed and the new one inserted.
+
+## `IMarkedItemPublicAppService`
+
+```csharp
+public interface IMarkedItemPublicAppService : IApplicationService
+{
+    Task<MarkedItemWithToggleDto> GetForUserAsync(string entityType, string entityId);
+    Task<bool> ToggleAsync(string entityType, string entityId);
+}
+```
+
+Marked items are bookmarks/likes/favorites — see [Domain layer](/modules/cms-kit/domain#markeditems--bookmarks--likes--favorites). The public side is just *toggle*: if the user marked the item, unmark it; otherwise mark it. `ToggleAsync` returns the new state.
+
+`GetForUserAsync` is what the heart-shaped toggle widget calls on page load — returns whether the current user has marked this entity and how many users in total have marked it.
+
+## `IMenuItemPublicAppService`
+
+```csharp
+public interface IMenuItemPublicAppService : IApplicationService
+{
+    Task<List<MenuItemDto>> GetListAsync();
+}
+```
+
+The simplest service in the kit: one method, no inputs, returns the ordered list. The implementation calls `IMenuItemRepository.GetOrderedListAsync()` and filters out items whose `RequiredPermissionName` the current user doesn't hold.
+
+## `IGlobalResourcePublicAppService`
+
+```csharp
+public interface IGlobalResourcePublicAppService : IApplicationService
+{
+    Task<GlobalResourceDto> GetGlobalScriptAsync();
+    Task<GlobalResourceDto> GetGlobalStyleAsync();
+}
+```
+
+Two endpoints; both return a single string. Used by the `GlobalResources/Script` and `GlobalResources/Style` view components on every public page.
+
+## Base class
+
+```csharp
+public abstract class CmsKitPublicAppServiceBase : ApplicationService
+{
+    protected CmsKitPublicAppServiceBase()
+    {
+        LocalizationResource = typeof(CmsKitResource);
+        ObjectMapperContext  = typeof(CmsKitPublicApplicationModule);
+    }
+}
+```
+
+## Remote service identity
+
+```csharp
+public class CmsKitPublicRemoteServiceConsts
+{
+    public const string RemoteServiceName = "CmsKitPublic";
+    public const string ModuleName = "cms-kit-public";
+}
+```
+
+Every public controller carries `[RemoteService(Name = "CmsKitPublic")]` and `[Area("cms-kit-public")]`. A consuming SPA can configure a different base URL for `CmsKitPublic` than for `CmsKitAdmin` — useful when the public site lives on a CDN-fronted host and the admin lives on an internal subdomain.
+
+## Cross-references
+
+- Routes that expose these services: [HTTP API](/modules/cms-kit/http-api).
+- Razor Pages and view components consuming them: [Web UI](/modules/cms-kit/web-ui).
+- Admin counterparts: [Admin Application](/modules/cms-kit/admin-application).
+- Underlying domain: [Blogs](/modules/cms-kit/blogs), [Pages](/modules/cms-kit/pages), [Comments](/modules/cms-kit/comments), [Tags & Ratings](/modules/cms-kit/tags-and-ratings), [Menus & Media](/modules/cms-kit/menus-and-media).
+- The slim public DTOs vs full admin DTOs is the same split the [Blogging module](/modules/blogging/overview) pioneered; CMS Kit applies it across every capability.
+- For media bytes served from public endpoints, see [Blob Storing Database](/modules/blob-storing-database/overview).
+- Translating blog posts / pages for international readers: [Multi-lingual objects](/localization/multi-lingual-objects).

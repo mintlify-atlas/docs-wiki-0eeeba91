@@ -1,0 +1,323 @@
+---
+title: "framework/test/: The 84 Test Projects, By Category"
+sidebarTitle: "Framework test suite"
+description: "A categorized index of every test project under framework/test/ — AbpTestBase, AspNetCore, BackgroundJobs, BlobStoring, Caching, EntityFrameworkCore, EventBus, MongoDB, and the rest."
+---
+
+`framework/test/` contains **84 directories**: 81 test projects, two shared support projects (`AbpTestBase`, `Volo.Abp.TestApp`), and the `SimpleConsoleDemo` sample. Every directory maps one-to-one to a `framework/src/Volo.Abp.{Name}/` package — if there's a source project, there's almost always a `{Name}.Tests` next to it. This page enumerates them by category so you can find the prior art that matches whatever you're testing.
+
+```
+framework/test/
+├── AbpTestBase/                                 // shared helpers
+├── SimpleConsoleDemo/                           // sample, not a test project
+├── Volo.Abp.TestApp/                            // shared "TestApp" entities/services
+├── Volo.Abp.TestApp.Tests/                      // tests using TestApp + Memory DB
+└── Volo.Abp.{...}.Tests/                        // 80 individual test projects
+```
+
+Every test project uses xUnit + Shouldly + NSubstitute. `common.test.props` (imported at the top of every `*.Tests.csproj`) provides the package references:
+
+```xml
+<!-- Excerpt from framework/test/AbpTestBase/AbpTestBase.csproj -->
+<ItemGroup>
+  <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  <PackageReference Include="NSubstitute" />
+  <PackageReference Include="Shouldly" />
+  <PackageReference Include="xunit" />
+  <PackageReference Include="xunit.extensibility.execution" />
+  <PackageReference Include="xunit.runner.visualstudio" />
+</ItemGroup>
+```
+
+## Shared support projects (not tests themselves)
+
+<CardGroup cols={3}>
+  <Card title="AbpTestBase" icon="hammer">
+    Cross-test helpers. Contains `Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs` (extension methods like `services.ShouldContainSingleton<TService, TImpl>()`) and `Volo/Abp/TestBase/Logging/ICanLogOnObject.cs`. Many test projects reference it.
+  </Card>
+  <Card title="Volo.Abp.TestApp" icon="building">
+    A miniature ABP "application" — `Person`, `City`, `PersonRepository`, `IPersonAppService`, plus an `AbpTestAppDomainModule`. Used by data and DI tests that need real entities without dragging in a full module.
+  </Card>
+  <Card title="SimpleConsoleDemo" icon="terminal">
+    A console app that boots a tiny module via `AddApplication<TModule>()`. Reference material, not a test.
+  </Card>
+</CardGroup>
+
+`Volo.Abp.TestApp.Tests` is the one test project here — it uses `AbpTestApp` plus `Volo.Abp.MemoryDb` to exercise the repository abstractions against an in-memory store.
+
+## Core runtime
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Core.Tests` | Extension methods, conventional DI registration, `AbpTypeExtensions`, `PredicateBuilder`, `ObjectExtension`. The smallest tests inherit from nothing. |
+| `Volo.Abp.Autofac.Tests` | The Autofac container provider — `UseAutofac()`, property injection, interceptor wiring. See [Modularity](/core/modularity). |
+| `Volo.Abp.Castle.Core.Tests` | Castle DynamicProxy aspects used by the interception infrastructure. |
+| `Volo.Abp.Threading.Tests` | `AsyncHelper.RunSync`, `AmbientScopeProvider`, `OneTimeRunner`. |
+| `Volo.Abp.Timing.Tests` | `IClock`, time-zone handling, `DateTimeKindMapper`. |
+| `Volo.Abp.Json.Tests` | `IJsonSerializer`, System.Text.Json + Newtonsoft.Json adapters. |
+| `Volo.Abp.Serialization.Tests` | `IObjectSerializer` for binary scenarios. |
+| `Volo.Abp.ExceptionHandling.Tests` | `IExceptionToErrorInfoConverter`, `BusinessException`, `UserFriendlyException`. |
+| `Volo.Abp.Specifications.Tests` | The DDD specification combinators. |
+| `Volo.Abp.GlobalFeatures.Tests` | `GlobalFeatureManager` static feature toggles. |
+
+## DDD building blocks
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Ddd.Tests` | `AggregateRoot`, `Entity<TKey>`, domain events, entity equality. |
+| `Volo.Abp.ObjectMapping.Tests` | The `IObjectMapper` abstraction (provider-agnostic). |
+| `Volo.Abp.AutoMapper.Tests` | The AutoMapper integration. |
+| `Volo.Abp.Mapperly.Tests` | The Mapperly source-generator integration. |
+| `Volo.Abp.ObjectExtending.Tests` | The `ObjectExtensionManager` runtime extension system. |
+| `Volo.Abp.MultiLingualObjects.Tests` | The multi-translation entity pattern. |
+
+## Data & persistence
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Data.Tests` | The `IUnitOfWork` abstraction, `IDataSeeder`, `IConnectionStringResolver`. |
+| `Volo.Abp.Uow.Tests` | The actual unit-of-work implementation, ambient scope, transaction behavior. See [Unit of Work](/data/unit-of-work). |
+| `Volo.Abp.EntityFrameworkCore.Tests` | `AbpDbContext`, EF Core conventions, `IRepository<>` against EF Core. |
+| `Volo.Abp.EntityFrameworkCore.Tests.SecondContext` | A second DbContext used by `Volo.Abp.EntityFrameworkCore.Tests` to verify multi-context UoW. |
+| `Volo.Abp.MongoDB.Tests` | The Mongo `IRepository<>` and `AbpMongoDbContext`. |
+| `Volo.Abp.MongoDB.Tests.SecondContext` | Same second-context idea for Mongo. |
+| `Volo.Abp.MemoryDb.Tests` | The in-process `IMemoryDatabase` used in lightweight integration tests. |
+| `Volo.Abp.Dapper.Tests` | Dapper integration. |
+| `Volo.Abp.TestApp.Tests` | The "TestApp" rig, exercised against Memory DB. |
+
+## AspNetCore & MVC
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.AspNetCore.Tests` | Core ASP.NET Core integration: middleware, current-user accessor, request culture provider. |
+| `Volo.Abp.AspNetCore.Mvc.Tests` | Controllers, model binding, conventions, auto-API discovery. |
+| `Volo.Abp.AspNetCore.Mvc.PlugIn` | A plug-in MVC project loaded by `Mvc.Tests` (not a test project itself). |
+| `Volo.Abp.AspNetCore.Mvc.UI.Tests` | UI services (`IWebContentDirectoryFinder`, etc). |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Tests` | Shared theme rendering. |
+| `Volo.Abp.AspNetCore.Mvc.Versioning.Tests` | URL/query/header API versioning. |
+| `Volo.Abp.AspNetCore.SignalR.Tests` | `AbpHubBase`, hub authorization, current-user in hub context. |
+| `Volo.Abp.AspNetCore.Serilog.Tests` | Serilog enricher integration. |
+| `Volo.Abp.AspNetCore.MultiTenancy.Tests` | Tenant resolution from host/route/header. |
+| `Volo.Abp.AspNetCore.Authentication.OAuth.Tests` | The OAuth authentication handler customizations. |
+
+These tests inherit from `AbpAspNetCoreIntegratedTestBase<TStartupModule>` or `AbpWebApplicationFactoryIntegratedTest<TProgram>` — see [AspNetCore TestBase](/testing/aspnetcore-testbase).
+
+## Event bus
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.EventBus.Tests` | Local and distributed event bus, handler discovery, the outbox/inbox pattern. |
+
+The integration tests live in this single project; transport-specific tests (RabbitMQ, Kafka, Rebus) require external infrastructure and live in `test/DistEvents/` instead — see [DistEvents tests](/testing/dist-events-tests).
+
+## Background jobs
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.BackgroundJobs.Tests` | The job manager, the worker, retry/exponential backoff, in-memory job store. |
+
+## Blob storing — 9 projects, one per provider
+
+`Volo.Abp.BlobStoring.Tests` covers the abstraction. The others verify each provider implementation passes the shared contract:
+
+<CardGroup cols={3}>
+  <Card title="Volo.Abp.BlobStoring.Tests" icon="cube">Core: `IBlobContainer`, `IBlobProvider`, default container naming.</Card>
+  <Card title="Volo.Abp.BlobStoring.FileSystem.Tests" icon="folder">File-system provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Memory.Tests" icon="memory">In-process provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Aws.Tests" icon="aws">AWS S3 provider (integration tests run on demand).</Card>
+  <Card title="Volo.Abp.BlobStoring.Azure.Tests" icon="microsoft">Azure Blob Storage provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Google.Tests" icon="google">Google Cloud Storage provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Aliyun.Tests" icon="cloud">Aliyun OSS provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Minio.Tests" icon="server">Minio provider.</Card>
+  <Card title="Volo.Abp.BlobStoring.Bunny.Tests" icon="rabbit">Bunny.net provider.</Card>
+</CardGroup>
+
+## Caching
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Caching.Tests` | `IDistributedCache<TCacheItem>`, key normalization, hybrid cache, expiration. |
+| `Volo.Abp.Caching.StackExchangeRedis.Tests` | The Redis-backed cache: pipeline batching, `IDatabase` mocking. |
+
+## Imaging — 5 projects, one per provider
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Imaging.Abstractions.Tests` | The `IImageResizer` / `IImageCompressor` / `IImageConverter` contracts. |
+| `Volo.Abp.Imaging.AspNetCore.Tests` | The MVC integration. |
+| `Volo.Abp.Imaging.ImageSharp.Tests` | The ImageSharp implementation. |
+| `Volo.Abp.Imaging.MagickNet.Tests` | Magick.NET. |
+| `Volo.Abp.Imaging.SkiaSharp.Tests` | SkiaSharp. |
+
+## Text templating
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.TextTemplating.Tests` | The template-definition system, virtual file system integration. |
+| `Volo.Abp.TextTemplating.Scriban.Tests` | The Scriban renderer (default). |
+| `Volo.Abp.TextTemplating.Razor.Tests` | The Razor renderer. |
+
+## Identity & security
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Security.Tests` | `ICurrentPrincipalAccessor`, claims utilities. |
+| `Volo.Abp.Authorization.Tests` | Policy/permission authorization, `AddAlwaysAllowAuthorization` trick. |
+| `Volo.Abp.IdentityModel.Tests` | OAuth client helpers (token endpoint, client credentials). |
+| `Volo.Abp.Ldap.Tests` | LDAP authentication. |
+| `Volo.Abp.MultiTenancy.Tests` | Tenant resolution, `ICurrentTenant`, scoping. |
+| `Volo.Abp.Auditing.Tests` | `IAuditStore`, audit log interception. |
+
+## HTTP
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Http.Tests` | The `IRemoteServiceConfigurationProvider` and shared HTTP types. |
+| `Volo.Abp.Http.Client.Tests` | The dynamic C# client proxy generator. |
+| `Volo.Abp.Http.Client.IdentityModel.Web.Tests` | Token-aware HTTP clients (IdentityModel). |
+| `Volo.Abp.RemoteServices.Tests` | Remote service configuration plumbing. |
+
+## Cross-cutting concerns
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Settings.Tests` | `ISettingProvider`, value providers chain. |
+| `Volo.Abp.Features.Tests` | The feature management system (per-tenant features). |
+| `Volo.Abp.Localization.Tests` | `IStringLocalizer<T>`, virtual JSON resources, fallback culture. |
+| `Volo.Abp.Validation.Tests` | The validation interceptor (DataAnnotations). |
+| `Volo.Abp.FluentValidation.Tests` | The FluentValidation integration. |
+| `Volo.Abp.Emailing.Tests` | `IEmailSender`, templated emails, the null sender. |
+| `Volo.Abp.MailKit.Tests` | The MailKit-backed implementation. |
+| `Volo.Abp.UI.Navigation.Tests` | `IMenuManager`, menu tree composition. |
+| `Volo.Abp.Minify.Tests` | JS/CSS minification (`IJavaScriptMinifier`, `ICssMinifier`). |
+| `Volo.Abp.VirtualFileSystem.Tests` | The virtual file system, embedded providers, physical providers. |
+| `Volo.Abp.DistributedLocking.Abstractions.Tests` | The `IAbpDistributedLock` contract. |
+
+## SMS
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.Sms.Aliyun.Tests` | Aliyun SMS provider. |
+| `Volo.Abp.Sms.TencenCloud.Tests` | Tencent Cloud SMS provider. (Yes, the directory really is spelled "TencenCloud" in the repo.) |
+
+## AI & CLI
+
+| Project | Targets |
+| --- | --- |
+| `Volo.Abp.AI.Tests` | The `Volo.Abp.AI` integration — abstractions around chat-completion and embedding providers. |
+| `Volo.Abp.Cli.Core.Tests` | The `abp` CLI command parsing and project-template plumbing. |
+
+## How the test projects pick a base class
+
+Reading the pattern back out of this list:
+
+<CardGroup cols={2}>
+  <Card title="Library-only tests" icon="box">
+    `Volo.Abp.Core.Tests`, `Volo.Abp.Threading.Tests`, `Volo.Abp.Json.Tests`, `Volo.Abp.Settings.Tests`, most of the `*.Abstractions.Tests` — small surface-area unit tests with no module graph. Inherit from nothing.
+  </Card>
+  <Card title="Module-graph tests" icon="diagram-project">
+    `Volo.Abp.EventBus.Tests`, `Volo.Abp.BackgroundJobs.Tests`, `Volo.Abp.Authorization.Tests`, `Volo.Abp.EntityFrameworkCore.Tests`, all of the blob/cache/imaging provider tests — each has its own `*.TestModule` and inherits from `AbpIntegratedTest<TStartupModule>` (or the per-module variant). See [TestBase](/testing/testbase) and [Module test patterns](/testing/module-test-patterns).
+  </Card>
+  <Card title="HTTP tests" icon="globe">
+    `Volo.Abp.AspNetCore.*.Tests`, `Volo.Abp.Http.Client.Tests` — boot an in-memory web host via `AbpAspNetCoreIntegratedTestBase<T>` (legacy) or `AbpWebApplicationFactoryIntegratedTest<TProgram>` (current). See [AspNetCore TestBase](/testing/aspnetcore-testbase).
+  </Card>
+  <Card title="Data tests" icon="database">
+    `Volo.Abp.EntityFrameworkCore.Tests` / `Volo.Abp.MongoDB.Tests` — set up Sqlite in-memory or `MongoSandbox` in their startup module, then run repository tests. The `SecondContext` siblings verify multi-context UoW.
+  </Card>
+</CardGroup>
+
+## A grep-friendly count, by prefix
+
+```
+AbpTestBase / Volo.Abp.TestApp / SimpleConsoleDemo .... 3 support projects
+Volo.Abp.AspNetCore.*.Tests .......................... 10
+Volo.Abp.BlobStoring.*.Tests ......................... 9
+Volo.Abp.Imaging.*.Tests ............................. 5
+Volo.Abp.TextTemplating.*.Tests ...................... 3
+Volo.Abp.Caching.*.Tests ............................. 2
+Volo.Abp.Http.*.Tests ................................ 3
+Volo.Abp.Sms.*.Tests ................................. 2
+Volo.Abp.EntityFrameworkCore.* / MongoDB.* contexts .. 4
+Other Volo.Abp.{...}.Tests projects .................. 43
+Total ............................................... 84
+```
+
+The repository's CI build runs every one of these against in-memory backing stores; the provider-specific ones (Aws/Azure/Google blob, Aliyun/TencentCloud SMS) ship integration tests that are gated behind environment variables for credentials.
+
+## Reading a test project — the recipe
+
+Open any `framework/test/Volo.Abp.{Name}.Tests/` and you'll find the same handful of files:
+
+```
+Volo.Abp.{Name}.Tests/
+├── Volo.Abp.{Name}.Tests.csproj      // imports ../../common.test.props
+├── Volo.Abp.{Name}.Tests.abppkg      // ABP package metadata, mostly empty
+├── Properties/AssemblyInfo.cs        // declares assembly-level attributes
+└── Volo/Abp/{Name}/
+    ├── Abp{Name}TestModule.cs        // module + DependsOn graph
+    ├── Abp{Name}TestBase.cs          // : AbpIntegratedTest<Abp{Name}TestModule>
+    └── {Subject}_Tests.cs            // one file per subject
+```
+
+`Volo.Abp.Core.Tests` is the smallest concrete example. It does not even have a `TestBase`:
+
+```
+framework/test/Volo.Abp.Core.Tests/
+├── Microsoft/Extensions/DependencyInjection/
+│   ├── AbpConventionalDependencyInjectionExtensions_Tests.cs
+│   └── DependencyInjection_Tests.cs
+├── System/
+│   ├── AbpTypeExtensions_Tests.cs
+│   ├── Collections/Generic/AbpCollectionExtensions_Tests.cs
+│   ├── Collections/Generic/AbpListExtensions_Tests.cs
+│   ├── ComparableExtensions_Tests.cs
+│   ├── DayOfWeekExtensions_Tests.cs
+│   ├── Linq/PredicateBuilder_Tests.cs
+│   ├── ObjectExtension_Test.cs
+│   └── StringExtensions_Tests.cs
+└── Volo.Abp.Core.Tests.csproj
+```
+
+The directory structure under the project root mirrors the namespace under `Volo.Abp.Core` — `StringExtensions_Tests` sits at `System/StringExtensions_Tests.cs` because the class it tests is `System.StringExtensions` (an ABP-provided extension class).
+
+## The .abppkg / .abppkg.analyze.json files
+
+Every test project includes a tiny `*.abppkg` file. It is used by the ABP CLI to discover packages in the solution and by the `Volo.Abp.Studio` tooling — not by the test runner. You can ignore it when writing tests, but expect to see it next to every `.csproj`.
+
+## How tests use the TestApp rig
+
+`Volo.Abp.TestApp` is a miniature application reused by several test projects. It contains:
+
+- `Person` and `City` entities (the `Person` has a navigation to `City`).
+- `PersonRepository` (a default repository surface) and `IPersonRepository` plus extension methods.
+- `IPersonAppService` / `PersonAppService` to test application-service plumbing.
+- `AbpTestAppDomainModule` and `AbpTestAppApplicationModule` for the two layers.
+
+`Volo.Abp.TestApp.Tests` references it and `Volo.Abp.MemoryDb`, then composes a startup module to verify the Repository abstractions against an in-memory store. The same TestApp is reused by tests in `Volo.Abp.Data.Tests` for filter and `IUnitOfWork` scenarios.
+
+## When you should add a new test project versus extend an existing one
+
+<AccordionGroup>
+  <Accordion title="Add a new test project">
+    You added a new package under `framework/src/Volo.Abp.X/` and need integration coverage. Copy the closest existing test project's `.csproj`, add an empty `AbpXTestModule.cs` that depends on your new module + `AbpTestBaseModule` + `AbpAutofacModule`, and pattern-match the existing `*TestBase.cs` from a similar package.
+  </Accordion>
+  <Accordion title="Extend an existing test project">
+    You changed a public type and want one more `[Fact]`. Add the file under the namespace folder that matches the type's namespace. No infrastructure changes needed; the existing test base will pick the new file up by xUnit discovery.
+  </Accordion>
+  <Accordion title="Add an abstract repository test under TestBase">
+    Your change touches the `IRepository` contract and both EF Core and Mongo need to cover it. Add the test as an abstract class under `Volo.Abp.{Module}.TestBase`, then add a thin subclass in each of `*.EntityFrameworkCore.Tests` and `*.MongoDB.Tests` to bind it to that store. The Identity test base uses this exact pattern — see [Module test patterns](/testing/module-test-patterns).
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+The lack of a test project for a given source folder is itself signal. `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic`, for instance, has no test project — it's a runtime theme whose behavior is covered indirectly through the `Theme.Shared.Tests`. When you add a new package, ask whether your code needs its own project or whether it should hook into an existing one.
+</Tip>
+
+## Cross-references
+
+- [TestBase](/testing/testbase) — the `AbpIntegratedTest` base shared by every module-graph test in this list.
+- [AspNetCore TestBase](/testing/aspnetcore-testbase) — the base shared by every `*.AspNetCore.*.Tests` project.
+- [Module test patterns](/testing/module-test-patterns) — `modules/*/test/` follows the same conventions documented here.
+- [DistEvents tests](/testing/dist-events-tests) — the **manual** sample apps that exercise distributed transports with real broker infrastructure.
+- [Modularity](/core/modularity) — `[DependsOn]` graph traversal, the foundation under every test module.
+- [Unit of Work](/data/unit-of-work) — why the database tests disable transaction behavior.

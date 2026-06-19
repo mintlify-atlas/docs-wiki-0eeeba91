@@ -1,0 +1,541 @@
+---
+title: "Feature Management Application Layer: FeatureAppService"
+sidebarTitle: "Application"
+description: "FeatureAppService, GetFeatureListResultDto, UpdateFeaturesDto and the provider-policy authorization that gates every feature CRUD call."
+---
+
+The application layer is a thin orchestrator: take a `(providerName, providerKey)` pair from the caller, authorise it against the configured `ProviderPolicies`, walk every `FeatureDefinition` returned by `FeatureDefinitionManager`, and project the result into DTOs the [HTTP API](/modules/feature-management/http-api) and [Web / Blazor modal](/modules/feature-management/web-and-blazor) can render. The heavy lifting — `FeatureValue` persistence, provider hierarchy, cache — sits one layer down in the [domain](/modules/feature-management/domain).
+
+## Project files
+
+```
+modules/feature-management/src/
+├── Volo.Abp.FeatureManagement.Application.Contracts/
+│   └── Volo/Abp/FeatureManagement/
+│       ├── IFeatureAppService.cs
+│       ├── GetFeatureListResultDto.cs
+│       ├── FeatureGroupDto.cs
+│       ├── FeatureDto.cs
+│       ├── FeatureProviderDto.cs
+│       ├── UpdateFeaturesDto.cs
+│       ├── UpdateFeatureDto.cs
+│       ├── FeatureManagementPermissions.cs
+│       ├── FeaturePermissionDefinitionProvider.cs
+│       └── FeatureManagementRemoteServiceConsts.cs
+└── Volo.Abp.FeatureManagement.Application/
+    └── Volo/Abp/FeatureManagement/
+        ├── AbpFeatureManagementApplicationModule.cs
+        ├── FeatureManagementAppServiceBase.cs
+        └── FeatureAppService.cs
+```
+
+The contracts project has zero behaviour — it is the DTO/interface bag consumed by both server code and HTTP API clients. The application project carries one concrete service and one base class.
+
+## Module wiring
+
+```csharp
+// AbpFeatureManagementApplicationModule.cs
+[DependsOn(
+    typeof(AbpFeatureManagementDomainModule),
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpDddApplicationModule)
+)]
+public class AbpFeatureManagementApplicationModule : AbpModule { }
+```
+
+No `ConfigureServices` body — `FeatureAppService` is picked up by ABP's conventional registration as `[Authorize] ITransientDependency` via `IApplicationService`.
+
+## `IFeatureAppService` contract
+
+```csharp
+// IFeatureAppService.cs
+public interface IFeatureAppService : IApplicationService
+{
+    Task<GetFeatureListResultDto> GetAsync([NotNull] string providerName, string providerKey);
+
+    Task UpdateAsync([NotNull] string providerName, string providerKey, UpdateFeaturesDto input);
+
+    Task DeleteAsync([NotNull] string providerName, string providerKey);
+}
+```
+
+Three operations cover the entire CRUD surface — there is no `CreateAsync` because creation happens implicitly via `Update`. There is also no get‑by‑id; the `(providerName, providerKey)` tuple is the lookup key.
+
+## DTOs
+
+### `GetFeatureListResultDto`
+
+```csharp
+// GetFeatureListResultDto.cs
+public class GetFeatureListResultDto
+{
+    public List<FeatureGroupDto> Groups { get; set; }
+}
+```
+
+A pure container — the modal needs the groups separately because each one becomes a Blazorise / Bootstrap tab.
+
+### `FeatureGroupDto`
+
+```csharp
+// FeatureGroupDto.cs
+public class FeatureGroupDto
+{
+    public string Name { get; set; }
+
+    public string DisplayName { get; set; }
+
+    public List<FeatureDto> Features { get; set; }
+
+    public string GetNormalizedGroupName()
+    {
+        return Name.Replace(".", "_");
+    }
+}
+```
+
+`Name` is the technical id (e.g. `"MyApp.Reporting"`); `DisplayName` has already been localized at the server (see `CreateFeatureGroupDto` below). `GetNormalizedGroupName()` exists because feature groups frequently contain dots and the modal uses the name as an HTML id — dots break CSS selectors, so the dot is replaced with an underscore.
+
+### `FeatureDto`
+
+```csharp
+// FeatureDto.cs
+public class FeatureDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string Value { get; set; }
+    public FeatureProviderDto Provider { get; set; }
+    public string Description { get; set; }
+    public IStringValueType ValueType { get; set; }
+    public int Depth { get; set; }
+    public string ParentName { get; set; }
+}
+```
+
+A few notes:
+
+- **`Value` is a `string`.** The modal converts to/from `bool` for `ToggleStringValueType` and keeps strings for everything else.
+- **`Provider` is `FeatureProviderDto { string Name; string Key; }`** — the modal uses it to grey out values inherited from a higher provider so the operator knows "this is the edition default, not your override".
+- **`ValueType` is the live `IStringValueType` from `Volo.Abp.Validation`** — it serializes over the wire with its `Validator` and (for `SelectionStringValueType`) its `ItemSource`. The Blazorise modal pattern‑matches on `ToggleStringValueType` and `SelectionStringValueType` to pick the right input.
+- **`Depth` + `ParentName`** drive hierarchical features — children indent under their parent in the UI. Depth is computed server‑side by `SetFeatureDepth` (see below).
+
+### `UpdateFeaturesDto` & `UpdateFeatureDto`
+
+```csharp
+// UpdateFeaturesDto.cs
+public class UpdateFeaturesDto
+{
+    public List<UpdateFeatureDto> Features { get; set; }
+}
+
+// UpdateFeatureDto.cs
+public class UpdateFeatureDto
+{
+    public string Name { get; set; }
+    public string Value { get; set; }
+}
+```
+
+Updates are batched — the modal sends the entire form in one PUT and the service processes parents/children together so `forceToSet` semantics work (see below).
+
+## `FeatureAppService` walkthrough
+
+```csharp
+// FeatureAppService.cs (declaration)
+[Authorize]
+public class FeatureAppService : FeatureManagementAppServiceBase, IFeatureAppService
+{
+    protected FeatureManagementOptions Options { get; }
+    protected IFeatureManager FeatureManager { get; }
+    protected IFeatureDefinitionManager FeatureDefinitionManager { get; }
+
+    public FeatureAppService(
+        IFeatureManager featureManager,
+        IFeatureDefinitionManager featureDefinitionManager,
+        IOptions<FeatureManagementOptions> options)
+    {
+        FeatureManager = featureManager;
+        FeatureDefinitionManager = featureDefinitionManager;
+        Options = options.Value;
+    }
+}
+```
+
+The class is annotated `[Authorize]` — every call requires an authenticated user. Whether that user is *allowed* to read/write the requested provider is a second check, performed by `CheckProviderPolicy` and described in the next section.
+
+### `GetAsync` — building the modal payload
+
+```csharp
+// FeatureAppService.cs (read)
+public virtual async Task<GetFeatureListResultDto> GetAsync(
+    [NotNull] string providerName, string providerKey)
+{
+    await CheckProviderPolicy(providerName, providerKey);
+
+    var result = new GetFeatureListResultDto { Groups = new List<FeatureGroupDto>() };
+
+    foreach (var group in await FeatureDefinitionManager.GetGroupsAsync())
+    {
+        var groupDto = CreateFeatureGroupDto(group);
+
+        foreach (var featureDefinition in group.GetFeaturesWithChildren())
+        {
+            if (providerName == TenantFeatureValueProvider.ProviderName &&
+                CurrentTenant.Id == null &&
+                providerKey == null &&
+                !featureDefinition.IsAvailableToHost)
+            {
+                continue;
+            }
+
+            var feature = await FeatureManager.GetOrNullWithProviderAsync(
+                featureDefinition.Name, providerName, providerKey);
+
+            groupDto.Features.Add(CreateFeatureDto(feature, featureDefinition));
+        }
+
+        SetFeatureDepth(groupDto.Features, providerName, providerKey);
+
+        if (groupDto.Features.Any())
+        {
+            result.Groups.Add(groupDto);
+        }
+    }
+
+    return result;
+}
+```
+
+There are three subtle rules at play:
+
+1. **Host filtering.** When the caller is the host (`providerName == "T"`, no current tenant, no key) and the `FeatureDefinition` is marked `IsAvailableToHost = false`, the feature is skipped. SaaS features that only make sense per tenant (like "max users") never appear on the host's modal.
+2. **Single `GetOrNullWithProviderAsync` per feature.** This bundles the resolved value with the provider that produced it — so the UI can distinguish *"value 5 set on this tenant"* from *"value 5 inherited from the edition"*. Pattern‑match on `feature.Provider.Name` in your custom UIs.
+3. **Empty groups are dropped.** If host filtering removes every feature in a group, the group itself is omitted — no empty tabs in the modal.
+
+### `CreateFeatureGroupDto` and `CreateFeatureDto`
+
+```csharp
+// FeatureAppService.cs (mappers)
+private FeatureGroupDto CreateFeatureGroupDto(FeatureGroupDefinition groupDefinition)
+{
+    return new FeatureGroupDto
+    {
+        Name = groupDefinition.Name,
+        DisplayName = groupDefinition.DisplayName?.Localize(StringLocalizerFactory),
+        Features = new List<FeatureDto>()
+    };
+}
+
+private FeatureDto CreateFeatureDto(
+    FeatureNameValueWithGrantedProvider fnvwgp, FeatureDefinition featureDefinition)
+{
+    return new FeatureDto
+    {
+        Name = featureDefinition.Name,
+        DisplayName = featureDefinition.DisplayName?.Localize(StringLocalizerFactory),
+        Description = featureDefinition.Description?.Localize(StringLocalizerFactory),
+        ValueType = featureDefinition.ValueType,
+        ParentName = featureDefinition.Parent?.Name,
+        Value = fnvwgp.Value,
+        Provider = new FeatureProviderDto
+        {
+            Name = fnvwgp.Provider?.Name,
+            Key = fnvwgp.Provider?.Key
+        }
+    };
+}
+```
+
+Localization happens **server‑side** via the inherited `StringLocalizerFactory` — by the time the DTO reaches the wire, `DisplayName` already reflects the current request's culture. The Blazor / Razor modal does not re‑localize.
+
+### `SetFeatureDepth`
+
+```csharp
+// FeatureAppService.cs (depth computation)
+protected virtual void SetFeatureDepth(List<FeatureDto> features, string providerName, string providerKey,
+    FeatureDto parentFeature = null, int depth = 0)
+{
+    foreach (var feature in features)
+    {
+        if ((parentFeature == null && feature.ParentName == null) ||
+            (parentFeature != null && parentFeature.Name == feature.ParentName))
+        {
+            feature.Depth = depth;
+            SetFeatureDepth(features, providerName, providerKey, feature, depth + 1);
+        }
+    }
+}
+```
+
+A small DFS that writes `Depth` so the modal can indent children. The Blazor modal multiplies it by 20 px (`margin-left: {feature.Depth * 20}px`); the Razor / Blazorise versions do the same.
+
+### `UpdateAsync` — batched parent/child writes
+
+```csharp
+// FeatureAppService.cs (update, excerpt)
+public virtual async Task UpdateAsync(
+    [NotNull] string providerName, string providerKey, UpdateFeaturesDto input)
+{
+    await CheckProviderPolicy(providerName, providerKey);
+
+    var inputFeatureNames = input.Features.Select(f => f.Name).ToHashSet();
+    var featureMap = input.Features.ToDictionary(f => f.Name);
+    var features = new Dictionary<UpdateFeatureDto, List<UpdateFeatureDto>>();
+    var processed = new HashSet<string>();
+
+    foreach (var feature in input.Features)
+    {
+        if (!processed.Add(feature.Name)) continue;
+
+        var featureDefinition = await FeatureDefinitionManager.GetAsync(feature.Name);
+        var validChildren = new List<UpdateFeatureDto>();
+
+        foreach (var childFeature in featureDefinition.Children)
+        {
+            if (inputFeatureNames.Contains(childFeature.Name) &&
+                featureMap.TryGetValue(childFeature.Name, out var childDto) &&
+                processed.Add(childFeature.Name))
+            {
+                validChildren.Add(childDto);
+            }
+        }
+
+        features[feature] = validChildren;
+    }
+
+    foreach (var feature in features)
+    {
+        var forceToSet = false;
+        foreach (var childFeature in feature.Value)
+        {
+            await FeatureManager.SetAsync(
+                childFeature.Name, childFeature.Value, providerName, providerKey);
+
+            var value = await FeatureManager.GetOrNullWithProviderAsync(
+                childFeature.Name, providerName, providerKey);
+
+            if (value.Provider.Name == providerName && value.Provider.Key == providerKey)
+            {
+                forceToSet = true;
+            }
+        }
+
+        await FeatureManager.SetAsync(
+            feature.Key.Name, feature.Key.Value, providerName, providerKey, forceToSet: forceToSet);
+    }
+}
+```
+
+The non‑obvious bit is **why** the service tracks `forceToSet`. Recall from the [domain page](/modules/feature-management/domain) that `FeatureManager.SetAsync` will silently clear a value that matches its fallback (to avoid duplicating the inheritance). For a parent feature whose default equals what the user typed, that means the override is *not* persisted — but a child override only makes sense when its parent is explicitly set on the same provider. So if any child was actually stored, the service tells the parent's write to bypass the de‑duplication check and persist anyway.
+
+The dictionary build at the top groups children under their parents so the order of writes is parent‑last. The `processed` HashSet prevents a child appearing twice if it is listed both as its own entry and as a child of an explicit parent.
+
+### `DeleteAsync`
+
+```csharp
+// FeatureAppService.cs (delete)
+public virtual async Task DeleteAsync([NotNull] string providerName, string providerKey)
+{
+    await CheckProviderPolicy(providerName, providerKey);
+    await FeatureManager.DeleteAsync(providerName, providerKey);
+}
+```
+
+Equivalent to the modal's "Reset to default" button — drops every override row for the (providerName, providerKey) pair. The `FeatureManager.DeleteAsync` it calls iterates `GetAllAsync` and `ClearAsync`s each one.
+
+## Provider policies
+
+The single most important authorization concept in this module is **provider policies** — a map from `providerName` to permission name, consulted on every call:
+
+```csharp
+// FeatureAppService.cs (authorization)
+protected virtual async Task CheckProviderPolicy(string providerName, string providerKey)
+{
+    string policyName;
+    if (providerName == TenantFeatureValueProvider.ProviderName &&
+        CurrentTenant.Id == null &&
+        providerKey == null)
+    {
+        policyName = FeatureManagementPermissions.ManageHostFeatures;
+    }
+    else
+    {
+        policyName = Options.ProviderPolicies.GetOrDefault(providerName);
+        if (policyName.IsNullOrEmpty())
+        {
+            throw new AbpException(
+                $"No policy defined to get/set permissions for the provider '{providerName}'. " +
+                $"Use {nameof(FeatureManagementOptions)} to map the policy.");
+        }
+    }
+
+    await AuthorizationService.CheckAsync(policyName);
+}
+```
+
+The rule, in plain English:
+
+1. If the caller is the **host editing host defaults** (the only case where `providerName == "T"`, no current tenant, and no key all align), require `FeatureManagement.ManageHostFeatures`.
+2. Otherwise, look up `Options.ProviderPolicies[providerName]` and require that.
+3. If no entry exists, throw — there is no implicit "anyone can edit" policy.
+
+`FeatureManagementPermissions` is the static catalogue:
+
+```csharp
+// FeatureManagementPermissions.cs
+public class FeatureManagementPermissions
+{
+    public const string GroupName = "FeatureManagement";
+
+    public const string ManageHostFeatures = GroupName + ".ManageHostFeatures";
+
+    public static string[] GetAll()
+    {
+        return ReflectionHelper.GetPublicConstantsRecursively(typeof(FeatureManagementPermissions));
+    }
+}
+```
+
+The default map registered in `AbpFeatureManagementDomainModule`:
+
+| Provider name | Permission required |
+| --- | --- |
+| `T` (tenant, non‑host) | `AbpTenantManagement.Tenants.ManageFeatures` |
+| `T` (host, key = `null`) | `FeatureManagement.ManageHostFeatures` |
+| `E` (edition) | *unset by default — you must map it* |
+| `D` (default) | never reached — defaults are read‑only |
+
+<Warning>
+The fact that `E` is unmapped is intentional — most ABP applications do not surface editions until they install a SaaS module. If you turn editions on in your app, configure `Options.ProviderPolicies["E"]` to whatever role the operator needs, e.g. `AbpSaas.Editions.ManageFeatures`.
+</Warning>
+
+### Adding your own provider
+
+If you write a custom `IFeatureManagementProvider` (say, an organisation‑unit override), wire its policy in your module's `ConfigureServices`:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<FeatureManagementOptions>(options =>
+    {
+        options.Providers.Add<OrganizationUnitFeatureManagementProvider>();
+        options.ProviderPolicies["OU"] = "MyApp.Organizations.ManageFeatures";
+    });
+}
+```
+
+The provider's `Name` constant must match the dictionary key. Without the map entry, `FeatureAppService.CheckProviderPolicy` will throw on every CRUD call against that provider — exactly the safety net the framework intends.
+
+## `FeatureManagementAppServiceBase`
+
+A thin base class for your own custom application services that need the shared localizer + the conventional `ObjectMapperContext`:
+
+```csharp
+// FeatureManagementAppServiceBase.cs (essence)
+public abstract class FeatureManagementAppServiceBase : ApplicationService
+{
+    protected FeatureManagementAppServiceBase()
+    {
+        LocalizationResource = typeof(AbpFeatureManagementResource);
+        ObjectMapperContext = typeof(AbpFeatureManagementApplicationModule);
+    }
+}
+```
+
+Inheriting from it gives you `L["…"]` against the module's localization resource so messages line up with the rest of the UI.
+
+## `FeaturePermissionDefinitionProvider`
+
+```csharp
+// FeaturePermissionDefinitionProvider.cs (essence)
+public class FeaturePermissionDefinitionProvider : PermissionDefinitionProvider
+{
+    public override void Define(IPermissionDefinitionContext context)
+    {
+        var moduleGroup = context.AddGroup(
+            FeatureManagementPermissions.GroupName,
+            L("Permission:FeatureManagement"));
+
+        moduleGroup.AddPermission(
+            FeatureManagementPermissions.ManageHostFeatures,
+            L("Permission:ManageHostFeatures"));
+    }
+
+    private static LocalizableString L(string name)
+        => LocalizableString.Create<AbpFeatureManagementResource>(name);
+}
+```
+
+Only one permission is contributed — host‑feature management. Tenant‑feature management lives in the [Tenant Management module](/modules/tenant-management/overview) so that it sits inside the *Saas / Tenants* permission group rather than a "Feature Management" group nobody navigates to.
+
+## Remote‑service constants
+
+```csharp
+// FeatureManagementRemoteServiceConsts.cs
+public class FeatureManagementRemoteServiceConsts
+{
+    public const string RemoteServiceName = "AbpFeatureManagement";
+
+    public const string ModuleName = "featureManagement";
+}
+```
+
+`RemoteServiceName` is the key used by `AbpFeatureManagementHttpApiClientModule.AddStaticHttpClientProxies` to look up the base URL in `RemoteServices.AbpFeatureManagement.BaseUrl`. `ModuleName` is the area name applied to `FeaturesController`. See the [HTTP API page](/modules/feature-management/http-api) for both.
+
+## Calling the service from your code
+
+Use the contract type — never the concrete class — and inject it as `IFeatureAppService`. The same code works in a same‑process deployment and in a microservice topology where the proxy is wired by `AbpFeatureManagementHttpApiClientModule`:
+
+```csharp
+public class TenantOnboardingService : ITransientDependency
+{
+    private readonly IFeatureAppService _featureAppService;
+
+    public TenantOnboardingService(IFeatureAppService featureAppService)
+    {
+        _featureAppService = featureAppService;
+    }
+
+    public async Task ApplyStandardPlanAsync(Guid tenantId)
+    {
+        await _featureAppService.UpdateAsync(
+            providerName: TenantFeatureValueProvider.ProviderName,
+            providerKey: tenantId.ToString(),
+            input: new UpdateFeaturesDto
+            {
+                Features = new List<UpdateFeatureDto>
+                {
+                    new() { Name = "MyApp.Reporting", Value = "true" },
+                    new() { Name = "MyApp.MaxProjects", Value = "10" },
+                }
+            });
+    }
+}
+```
+
+Behind the scenes the call goes through `CheckProviderPolicy`, validates each value against `IStringValueType.Validator`, applies the parent/child batching, and writes the cache — your code only has to express *intent*.
+
+## Edge cases
+
+<CardGroup cols={2}>
+  <Card title="Anonymous calls" icon="user-slash">
+    The class‑level `[Authorize]` rejects unauthenticated callers before `CheckProviderPolicy` ever runs. There is no anonymous path into the application layer.
+  </Card>
+  <Card title="Wrong provider key shape" icon="triangle-exclamation">
+    Passing a non‑`Guid` `providerKey` for `T`/`E` is **not** rejected by `FeatureAppService` — `TenantFeatureManagementProvider` will silently fall back to the current tenant. If you want strict validation, override `CheckProviderPolicy` and `Guid.TryParse` the key.
+  </Card>
+  <Card title="`IsAvailableToHost` skip" icon="server">
+    Host edits silently drop features not marked `IsAvailableToHost` — they do not throw. Inspect the response's group count if you need to detect "this feature is tenant‑only".
+  </Card>
+  <Card title="Batching boundary" icon="layer-group">
+    `UpdateAsync` runs inside the implicit ASP.NET Core unit of work — if any provider write throws (e.g. validation), every preceding write in the same call is rolled back via `IUnitOfWorkManager`.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+- [HTTP API](/modules/feature-management/http-api) — how the controller surfaces this service.
+- [Web & Blazor](/modules/feature-management/web-and-blazor) — how the modal consumes the DTOs.
+- [Tenant Management](/modules/tenant-management/overview) — where the `Tenants.ManageFeatures` permission is defined.
+- [Features framework](/security/features) — `FeatureDefinition` and `IStringValueType` reference.

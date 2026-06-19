@@ -1,0 +1,694 @@
+---
+title: "EF Core & MongoDB providers"
+description: "AbpAuditLoggingDbContext, EfCoreAuditLogRepository, AuditLoggingMongoDbContext, MongoAuditLogRepository — model configuration and query composition for the audit-logging module."
+---
+
+This page covers the two persistence providers that ship with the [audit-logging module](/modules/audit-logging/overview): the EF Core integration in `modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/` and the MongoDB integration in `modules/audit-logging/src/Volo.Abp.AuditLogging.MongoDB/`. Both implement the same [`IAuditLogRepository`](/modules/audit-logging/domain#iauditlogrepository--the-query-surface) contract; the differences live entirely in *how* the queries are composed.
+
+Cross-references:
+
+- The `AuditLog` aggregate, child entities, and the repository contract are documented on the [domain page](/modules/audit-logging/domain).
+- For background on the ABP EF Core stack (`AbpDbContext<T>`, `IDbContextProvider<T>`, `EfCoreRepository<TContext, T, TKey>`, `IncludeDetails()`), see [/data/entityframeworkcore](/data/entityframeworkcore).
+- For the MongoDB stack (`AbpMongoDbContext`, `MongoDbRepository<TContext, T, TKey>`, `IMongoDbContextProvider<T>`), see [/data/mongodb](/data/mongodb).
+
+## EF Core provider
+
+### `IAuditLoggingDbContext`
+
+The integration is fronted by an interface so application-host `DbContext`s can implement it instead of registering a second physical context. This is the standard ABP "shared context" pattern.
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/Volo/Abp/AuditLogging/EntityFrameworkCore/IAuditLoggingDbContext.cs
+[ConnectionStringName(AbpAuditLoggingDbProperties.ConnectionStringName)]
+public interface IAuditLoggingDbContext : IEfCoreDbContext
+{
+    DbSet<AuditLog> AuditLogs { get; }
+
+    DbSet<AuditLogExcelFile> AuditLogExcelFiles { get; }
+}
+```
+
+`[ConnectionStringName("AbpAuditLogging")]` lets you ship audit logs to a separate database by adding an `"AbpAuditLogging"` entry to `ConnectionStrings`; without it, the resolver falls back to `"Default"`.
+
+### `AbpAuditLoggingDbContext`
+
+The concrete context is provided for hosts that want a dedicated database / connection. Otherwise an application's main context can simply implement `IAuditLoggingDbContext`.
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/Volo/Abp/AuditLogging/EntityFrameworkCore/AbpAuditLoggingDbContext.cs
+[ConnectionStringName(AbpAuditLoggingDbProperties.ConnectionStringName)]
+public class AbpAuditLoggingDbContext :
+    AbpDbContext<AbpAuditLoggingDbContext>,
+    IAuditLoggingDbContext
+{
+    public DbSet<AuditLog> AuditLogs { get; set; }
+    public DbSet<AuditLogExcelFile> AuditLogExcelFiles { get; set; }
+
+    public AbpAuditLoggingDbContext(DbContextOptions<AbpAuditLoggingDbContext> options)
+        : base(options)
+    {
+    }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureAuditLogging();
+    }
+}
+```
+
+`AbpDbContext<T>` brings in the standard ABP plumbing — soft-delete, multi-tenancy, extra-property and concurrency-stamp handling — and `ConfigureAuditLogging()` adds the audit-logging schema. The data-filter dependency is what makes tenant-scoped reads filter out other tenants' logs automatically.
+
+### The module class & repository registration
+
+The EF Core module wires both repositories so consumers can inject `IAuditLogRepository` (and `IAuditLogExcelFileRepository`) directly without registering them per-host:
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/Volo/Abp/AuditLogging/EntityFrameworkCore/AbpAuditLoggingEntityFrameworkCoreModule.cs
+[DependsOn(typeof(AbpAuditLoggingDomainModule))]
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpAuditLoggingEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<AbpAuditLoggingDbContext>(options =>
+        {
+            options.AddRepository<AuditLog, EfCoreAuditLogRepository>();
+            options.AddRepository<AuditLogExcelFile, EfCoreAuditLogExcelFileRepository>();
+        });
+    }
+}
+```
+
+`options.AddRepository<TEntity, TRepo>` is the canonical way to register an entity-specific repository with the ABP DI container — see [/data/entityframeworkcore](/data/entityframeworkcore) for how this binds `IRepository<AuditLog, Guid>`, `IAuditLogRepository`, and the underlying `EfCoreRepository<IAuditLoggingDbContext, AuditLog, Guid>` to the same instance.
+
+### `ConfigureAuditLogging()` — model builder
+
+`AbpAuditLoggingDbContextModelBuilderExtensions.ConfigureAuditLogging` is the schema definition. Every property is mapped explicitly so the column names stay stable across renames and the index plan is predictable. Each `Entity<T>(b => …)` block applies `ConfigureByConvention()`, sets `HasMaxLength` against the `Consts` values, declares relationships, and finishes with `ApplyObjectExtensionMappings()`. The relevant excerpts:
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/Volo/Abp/AuditLogging/EntityFrameworkCore/AbpAuditLoggingDbContextModelBuilderExtensions.cs
+builder.Entity<AuditLog>(b =>
+{
+    b.ToTable(AbpAuditLoggingDbProperties.DbTablePrefix + "AuditLogs",
+              AbpAuditLoggingDbProperties.DbSchema);
+    b.ConfigureByConvention();
+
+    b.Property(x => x.ApplicationName).HasMaxLength(AuditLogConsts.MaxApplicationNameLength);
+    b.Property(x => x.ClientIpAddress).HasMaxLength(AuditLogConsts.MaxClientIpAddressLength);
+    b.Property(x => x.Url).HasMaxLength(AuditLogConsts.MaxUrlLength);
+    b.Property(x => x.HttpMethod).HasMaxLength(AuditLogConsts.MaxHttpMethodLength);
+    b.Property(x => x.UserName).HasMaxLength(AuditLogConsts.MaxUserNameLength);
+    // ... TenantName, ClientName, ClientId, CorrelationId, BrowserInfo, Comments, impersonator columns ...
+
+    b.HasMany(a => a.Actions).WithOne().HasForeignKey(x => x.AuditLogId).IsRequired();
+    b.HasMany(a => a.EntityChanges).WithOne().HasForeignKey(x => x.AuditLogId).IsRequired();
+
+    b.HasIndex(x => new { x.TenantId, x.ExecutionTime });
+    b.HasIndex(x => new { x.TenantId, x.UserId, x.ExecutionTime });
+
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<AuditLogAction>(b =>
+{
+    b.ToTable(AbpAuditLoggingDbProperties.DbTablePrefix + "AuditLogActions",
+              AbpAuditLoggingDbProperties.DbSchema);
+    b.Property(x => x.ServiceName).HasMaxLength(AuditLogActionConsts.MaxServiceNameLength);
+    b.Property(x => x.MethodName).HasMaxLength(AuditLogActionConsts.MaxMethodNameLength);
+    b.Property(x => x.Parameters).HasMaxLength(AuditLogActionConsts.MaxParametersLength);
+    b.HasIndex(x => new { x.AuditLogId });
+    b.HasIndex(x => new { x.TenantId, x.ServiceName, x.MethodName, x.ExecutionTime });
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<EntityChange>(b =>
+{
+    b.ToTable(AbpAuditLoggingDbProperties.DbTablePrefix + "EntityChanges",
+              AbpAuditLoggingDbProperties.DbSchema);
+    b.Property(x => x.EntityTypeFullName)
+        .HasMaxLength(EntityChangeConsts.MaxEntityTypeFullNameLength).IsRequired();
+    b.Property(x => x.EntityId).HasMaxLength(EntityChangeConsts.MaxEntityIdLength);
+    b.HasMany(a => a.PropertyChanges).WithOne().HasForeignKey(x => x.EntityChangeId);
+    b.HasIndex(x => new { x.AuditLogId });
+    b.HasIndex(x => new { x.TenantId, x.EntityTypeFullName, x.EntityId });
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<EntityPropertyChange>(b =>
+{
+    b.ToTable(AbpAuditLoggingDbProperties.DbTablePrefix + "EntityPropertyChanges",
+              AbpAuditLoggingDbProperties.DbSchema);
+    b.Property(x => x.NewValue).HasMaxLength(EntityPropertyChangeConsts.MaxNewValueLength);
+    b.Property(x => x.OriginalValue).HasMaxLength(EntityPropertyChangeConsts.MaxOriginalValueLength);
+    b.Property(x => x.PropertyName)
+        .HasMaxLength(EntityPropertyChangeConsts.MaxPropertyNameLength).IsRequired();
+    b.HasIndex(x => new { x.EntityChangeId });
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.TryConfigureObjectExtensions<AbpAuditLoggingDbContext>();
+```
+
+Index design notes:
+
+- **`AbpAuditLogs (TenantId, ExecutionTime)`** powers the timeline view; tenant first so multi-tenant plans stay efficient. `(TenantId, UserId, ExecutionTime)` powers "show this user's recent activity" with a single index seek.
+- **`AbpAuditLogActions (TenantId, ServiceName, MethodName, ExecutionTime)`** powers per-endpoint analytics.
+- **`AbpEntityChanges (TenantId, EntityTypeFullName, EntityId)`** is the index `GetEntityChangesWithUsernameAsync` uses to assemble per-record history.
+
+`b.ApplyObjectExtensionMappings()` enables the entity-extension system: extra columns added via `ObjectExtensionManager` become real database columns through `TryConfigureObjectExtensions<AbpAuditLoggingDbContext>()`.
+
+### `EfCoreAuditLogRepository`
+
+The repository extends `EfCoreRepository<IAuditLoggingDbContext, AuditLog, Guid>`, which means it can be used either against the dedicated `AbpAuditLoggingDbContext` or against any host context that implements `IAuditLoggingDbContext`:
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.EntityFrameworkCore/Volo/Abp/AuditLogging/EntityFrameworkCore/EfCoreAuditLogRepository.cs
+public class EfCoreAuditLogRepository
+    : EfCoreRepository<IAuditLoggingDbContext, AuditLog, Guid>, IAuditLogRepository
+{
+    public EfCoreAuditLogRepository(IDbContextProvider<IAuditLoggingDbContext> dbContextProvider)
+        : base(dbContextProvider)
+    {
+    }
+    // ...
+}
+```
+
+#### `GetListAsync` — paging the timeline
+
+```csharp
+public virtual async Task<List<AuditLog>> GetListAsync(
+    string sorting = null,
+    int maxResultCount = 50,
+    int skipCount = 0,
+    DateTime? startTime = null,
+    DateTime? endTime = null,
+    string httpMethod = null,
+    string url = null,
+    string clientId = null,
+    Guid? userId = null,
+    string userName = null,
+    string applicationName = null,
+    string clientIpAddress = null,
+    string correlationId = null,
+    int? maxExecutionDuration = null,
+    int? minExecutionDuration = null,
+    bool? hasException = null,
+    HttpStatusCode? httpStatusCode = null,
+    bool includeDetails = false,
+    CancellationToken cancellationToken = default)
+{
+    var query = await GetListQueryAsync(
+        startTime, endTime, httpMethod, url, clientId, userId, userName,
+        applicationName, clientIpAddress, correlationId,
+        maxExecutionDuration, minExecutionDuration,
+        hasException, httpStatusCode, includeDetails);
+
+    var auditLogs = await query
+        .OrderBy(sorting.IsNullOrWhiteSpace()
+            ? (nameof(AuditLog.ExecutionTime) + " DESC")
+            : sorting)
+        .PageBy(skipCount, maxResultCount)
+        .ToListAsync(GetCancellationToken(cancellationToken));
+
+    return auditLogs;
+}
+```
+
+- **Dynamic `OrderBy`** comes from `System.Linq.Dynamic.Core` so the management UI can sort by any column name via a string. `PageBy(skipCount, maxResultCount)` is the ABP helper that wraps `Skip().Take()`.
+
+`GetCountAsync` has the same filter parameters minus `sorting` / paging / `includeDetails`, and routes through the *same* `GetListQueryAsync` so filter semantics can never diverge:
+
+```csharp
+var query = await GetListQueryAsync(/* same filters */);
+var totalCount = await query.LongCountAsync(GetCancellationToken(cancellationToken));
+return totalCount;
+```
+
+#### `GetListQueryAsync` — the filter composition
+
+This is the heart of both methods. Every parameter contributes a `WhereIf`, so the SQL only contains the predicates the caller actually used:
+
+```csharp
+protected virtual async Task<IQueryable<AuditLog>> GetListQueryAsync(
+    DateTime? startTime = null,
+    DateTime? endTime = null,
+    string httpMethod = null,
+    string url = null,
+    string clientId = null,
+    Guid? userId = null,
+    string userName = null,
+    string applicationName = null,
+    string clientIpAddress = null,
+    string correlationId = null,
+    int? maxExecutionDuration = null,
+    int? minExecutionDuration = null,
+    bool? hasException = null,
+    HttpStatusCode? httpStatusCode = null,
+    bool includeDetails = false)
+{
+    var nHttpStatusCode = (int?)httpStatusCode;
+    return (await GetDbSetAsync()).AsNoTracking()
+        .IncludeDetails(includeDetails)
+        .WhereIf(startTime.HasValue, a => a.ExecutionTime >= startTime)
+        .WhereIf(endTime.HasValue, a => a.ExecutionTime <= endTime)
+        .WhereIf(hasException.HasValue && hasException.Value,
+                 a => a.Exceptions != null && a.Exceptions != "")
+        .WhereIf(hasException.HasValue && !hasException.Value,
+                 a => a.Exceptions == null || a.Exceptions == "")
+        .WhereIf(!httpMethod.IsNullOrEmpty(), a => a.HttpMethod == httpMethod)
+        .WhereIf(!url.IsNullOrEmpty(),
+                 a => a.Url != null && a.Url.Contains(url))
+        .WhereIf(!clientId.IsNullOrEmpty(), a => a.ClientId == clientId)
+        .WhereIf(userId != null, a => a.UserId == userId)
+        .WhereIf(!userName.IsNullOrEmpty(), a => a.UserName == userName)
+        .WhereIf(!applicationName.IsNullOrEmpty(),
+                 a => a.ApplicationName == applicationName)
+        .WhereIf(!clientIpAddress.IsNullOrEmpty(),
+                 a => a.ClientIpAddress != null && a.ClientIpAddress == clientIpAddress)
+        .WhereIf(!correlationId.IsNullOrEmpty(),
+                 a => a.CorrelationId == correlationId)
+        .WhereIf(httpStatusCode != null && httpStatusCode > 0,
+                 a => a.HttpStatusCode == nHttpStatusCode)
+        .WhereIf(maxExecutionDuration != null && maxExecutionDuration.Value > 0,
+                 a => a.ExecutionDuration <= maxExecutionDuration)
+        .WhereIf(minExecutionDuration != null && minExecutionDuration.Value > 0,
+                 a => a.ExecutionDuration >= minExecutionDuration);
+}
+```
+
+Key details:
+
+- **`AsNoTracking()`** — list queries never need change tracking; also keeps audit-log entities out of any ambient `SaveChangesAsync`.
+- **`IncludeDetails(bool)`** — wraps the `Include(Actions).Include(EntityChanges.ThenInclude(PropertyChanges))` chain. Pass `false` for paged lists, `true` for detail views.
+- **`Url.Contains`** is a `LIKE '%url%'` and is the only non-equality filter. Everything else is an equality / range check, so the indexes above are usable. `Exceptions != null && Exceptions != ""` is the literal predicate for `hasException == true` — there is no full-text search on the JSON content.
+
+#### `GetAverageExecutionDurationPerDayAsync` — analytics
+
+```csharp
+public virtual async Task<Dictionary<DateTime, double>> GetAverageExecutionDurationPerDayAsync(
+    DateTime startDate,
+    DateTime endDate,
+    CancellationToken cancellationToken = default)
+{
+    var result = await (await GetDbSetAsync()).AsNoTracking()
+        .Where(a => a.ExecutionTime < endDate.AddDays(1) && a.ExecutionTime > startDate)
+        .OrderBy(t => t.ExecutionTime)
+        .GroupBy(t => new { t.ExecutionTime.Date })
+        .Select(g => new {
+            Day = g.Min(t => t.ExecutionTime),
+            avgExecutionTime = g.Average(t => t.ExecutionDuration)
+        })
+        .ToListAsync(GetCancellationToken(cancellationToken));
+
+    return result.ToDictionary(
+        element => element.Day.ClearTime(),
+        element => element.avgExecutionTime);
+}
+```
+
+`endDate.AddDays(1)` ensures the upper bound is half-open and includes any rows recorded late on `endDate`. `ClearTime()` is the ABP `DateTime` extension that normalises every key to midnight so the dictionary key compares cleanly.
+
+#### `GetEntityChange` / `GetEntityChangeListAsync` / `GetEntityChangeCountAsync`
+
+The entity-history queries hit a separate `DbSet<EntityChange>` directly. This avoids loading the parent `AuditLog` aggregate when you only need the change rows:
+
+```csharp
+public virtual async Task<EntityChange> GetEntityChange(
+    Guid entityChangeId,
+    CancellationToken cancellationToken = default)
+{
+    var entityChange = await (await GetDbContextAsync()).Set<EntityChange>()
+        .AsNoTracking()
+        .IncludeDetails()
+        .Where(x => x.Id == entityChangeId)
+        .OrderBy(x => x.Id)
+        .FirstOrDefaultAsync(GetCancellationToken(cancellationToken));
+
+    if (entityChange == null)
+    {
+        throw new EntityNotFoundException(typeof(EntityChange));
+    }
+
+    return entityChange;
+}
+
+protected virtual async Task<IQueryable<EntityChange>> GetEntityChangeListQueryAsync(
+    Guid? auditLogId = null,
+    DateTime? startTime = null,
+    DateTime? endTime = null,
+    EntityChangeType? changeType = null,
+    string entityId = null,
+    string entityTypeFullName = null,
+    bool includeDetails = false)
+{
+    return (await GetDbContextAsync())
+        .Set<EntityChange>()
+        .AsNoTracking()
+        .IncludeDetails(includeDetails)
+        .WhereIf(auditLogId.HasValue, e => e.AuditLogId == auditLogId)
+        .WhereIf(startTime.HasValue, e => e.ChangeTime >= startTime)
+        .WhereIf(endTime.HasValue, e => e.ChangeTime <= endTime)
+        .WhereIf(changeType.HasValue, e => e.ChangeType == changeType)
+        .WhereIf(!string.IsNullOrWhiteSpace(entityId), e => e.EntityId == entityId)
+        .WhereIf(!string.IsNullOrWhiteSpace(entityTypeFullName),
+            e => e.EntityTypeFullName.Contains(entityTypeFullName));
+}
+```
+
+Note that on `entityTypeFullName`, the EF Core implementation does a `Contains` so callers can match partial namespaces (`"Volo.MyApp"`), whereas equality is used on `entityId`.
+
+#### `GetEntityChangesWithUsernameAsync` — joining with the parent
+
+```csharp
+public virtual async Task<List<EntityChangeWithUsername>> GetEntityChangesWithUsernameAsync(
+    string entityId,
+    string entityTypeFullName,
+    CancellationToken cancellationToken = default)
+{
+    var dbContext = await GetDbContextAsync();
+
+    var query = dbContext.Set<EntityChange>()
+                        .AsNoTracking()
+                        .IncludeDetails()
+                        .Where(x => x.EntityId == entityId
+                                 && x.EntityTypeFullName == entityTypeFullName);
+
+    return await (from e in query
+                  join auditLog in dbContext.AuditLogs on e.AuditLogId equals auditLog.Id
+                  select new EntityChangeWithUsername
+                  {
+                      EntityChange = e,
+                      UserName = auditLog.UserName
+                  })
+        .OrderByDescending(x => x.EntityChange.ChangeTime)
+        .ToListAsync(GetCancellationToken(cancellationToken));
+}
+```
+
+This is the "who changed this record" pattern called from custom entity-history pages.
+
+#### `WithDetailsAsync`
+
+```csharp
+[Obsolete("Use WithDetailsAsync method.")]
+public override IQueryable<AuditLog> WithDetails()
+{
+    return GetQueryable().IncludeDetails();
+}
+
+public async override Task<IQueryable<AuditLog>> WithDetailsAsync()
+{
+    return (await GetQueryableAsync()).IncludeDetails();
+}
+```
+
+`IncludeDetails()` is the EF Core extension that adds the full `Include` chain. Use this when you've called `GetAsync(id)` and need the child collections populated.
+
+## MongoDB provider
+
+### `IAuditLoggingMongoDbContext`
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.MongoDB/Volo/Abp/AuditLogging/MongoDB/IAuditLoggingMongoDbContext.cs
+[ConnectionStringName(AbpAuditLoggingDbProperties.ConnectionStringName)]
+public interface IAuditLoggingMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<AuditLog> AuditLogs { get; }
+    IMongoCollection<AuditLogExcelFile> AuditLogExcelFiles { get; }
+}
+```
+
+The contract is the MongoDB equivalent of `IAuditLoggingDbContext`. The same connection-string-name attribute applies.
+
+### `AuditLoggingMongoDbContext`
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.MongoDB/Volo/Abp/AuditLogging/MongoDB/AuditLoggingMongoDbContext.cs
+[ConnectionStringName(AbpAuditLoggingDbProperties.ConnectionStringName)]
+public class AuditLoggingMongoDbContext :
+    AbpMongoDbContext,
+    IAuditLoggingMongoDbContext
+{
+    public IMongoCollection<AuditLog> AuditLogs => Collection<AuditLog>();
+    public IMongoCollection<AuditLogExcelFile> AuditLogExcelFiles => Collection<AuditLogExcelFile>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureAuditLogging();
+    }
+}
+```
+
+`Collection<T>()` is the `AbpMongoDbContext` helper that resolves the collection name from the `IMongoModelBuilder` registration.
+
+### Mongo collection mapping
+
+The mapping is far smaller than EF Core because MongoDB embeds children inside the parent document — there are no separate collections for actions, changes, and property changes:
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.MongoDB/Volo/Abp/AuditLogging/MongoDB/AbpAuditLoggingMongoDbContextExtensions.cs
+public static class AbpAuditLoggingMongoDbContextExtensions
+{
+    public static void ConfigureAuditLogging(this IMongoModelBuilder builder)
+    {
+        Check.NotNull(builder, nameof(builder));
+
+        builder.Entity<AuditLog>(b =>
+        {
+            b.CollectionName = AbpAuditLoggingDbProperties.DbTablePrefix + "AuditLogs";
+        });
+
+        builder.Entity<AuditLogExcelFile>(b =>
+        {
+            b.CollectionName = AbpAuditLoggingDbProperties.DbTablePrefix + "AuditLogExcelFiles";
+        });
+    }
+}
+```
+
+That's it — `AuditLogAction`, `EntityChange`, and `EntityPropertyChange` are not registered as separate collections; they live as embedded sub-documents.
+
+### `MongoAuditLogRepository`
+
+```csharp
+// modules/audit-logging/src/Volo.Abp.AuditLogging.MongoDB/Volo/Abp/AuditLogging/MongoDB/MongoAuditLogRepository.cs
+public class MongoAuditLogRepository
+    : MongoDbRepository<IAuditLoggingMongoDbContext, AuditLog, Guid>, IAuditLogRepository
+{
+    public MongoAuditLogRepository(IMongoDbContextProvider<IAuditLoggingMongoDbContext> dbContextProvider)
+        : base(dbContextProvider)
+    {
+    }
+    // ...
+}
+```
+
+#### `GetListAsync` / `GetCountAsync`
+
+Same shape as the EF Core version — both methods route through `GetListQueryAsync`, then `GetListAsync` adds the dynamic `OrderBy` + `PageBy`, and `GetCountAsync` calls `LongCountAsync`. There is no `IncludeDetails(bool)` call inside the Mongo `GetListQueryAsync` — the children are already embedded in the same document. The `includeDetails` parameter still exists for contract compatibility but is effectively a no-op.
+
+#### `GetListQueryAsync`
+
+```csharp
+protected virtual async Task<IQueryable<AuditLog>> GetListQueryAsync(
+    DateTime? startTime = null,
+    DateTime? endTime = null,
+    string httpMethod = null,
+    string url = null,
+    string clientId = null,
+    Guid? userId = null,
+    string userName = null,
+    string applicationName = null,
+    string clientIpAddress = null,
+    string correlationId = null,
+    int? maxDuration = null,
+    int? minDuration = null,
+    bool? hasException = null,
+    HttpStatusCode? httpStatusCode = null,
+    bool includeDetails = false,
+    CancellationToken cancellationToken = default)
+{
+    return (await GetQueryableAsync(cancellationToken))
+        .WhereIf(startTime.HasValue, a => a.ExecutionTime >= startTime)
+        .WhereIf(endTime.HasValue, a => a.ExecutionTime <= endTime)
+        .WhereIf(hasException.HasValue && hasException.Value,
+                 a => a.Exceptions != null && a.Exceptions != "")
+        .WhereIf(hasException.HasValue && !hasException.Value,
+                 a => a.Exceptions == null || a.Exceptions == "")
+        .WhereIf(!httpMethod.IsNullOrEmpty(), a => a.HttpMethod == httpMethod)
+        .WhereIf(!url.IsNullOrEmpty(), a => a.Url != null && a.Url.Contains(url))
+        .WhereIf(!clientId.IsNullOrEmpty(), a => a.ClientId == clientId)
+        .WhereIf(userId != null, a => a.UserId == userId)
+        .WhereIf(!userName.IsNullOrEmpty(), a => a.UserName == userName)
+        .WhereIf(!applicationName.IsNullOrEmpty(),
+                 a => a.ApplicationName == applicationName)
+        .WhereIf(!clientIpAddress.IsNullOrEmpty(),
+                 a => a.ClientIpAddress == clientIpAddress)
+        .WhereIf(!correlationId.IsNullOrEmpty(),
+                 a => a.CorrelationId == correlationId)
+        .WhereIf(httpStatusCode != null && httpStatusCode > 0,
+                 a => a.HttpStatusCode == (int?)httpStatusCode)
+        .WhereIf(maxDuration != null && maxDuration > 0,
+                 a => a.ExecutionDuration <= maxDuration)
+        .WhereIf(minDuration != null && minDuration > 0,
+                 a => a.ExecutionDuration >= minDuration);
+}
+```
+
+This is character-for-character almost the same as the EF Core builder — that's deliberate. Both run against an `IQueryable<AuditLog>`; the MongoDB LINQ provider translates the same expression tree into a MongoDB aggregation pipeline.
+
+The two micro-differences to note:
+
+1. **No `AsNoTracking()` / `IncludeDetails()`** — MongoDB documents are immutable inside the query path and the children are already embedded.
+2. **`maxDuration` / `minDuration`** are the parameter names (EF Core uses `maxExecutionDuration` / `minExecutionDuration`). The public contract still uses the EF Core names; the Mongo version aliases them locally.
+
+#### `GetAverageExecutionDurationPerDayAsync`
+
+```csharp
+public virtual async Task<Dictionary<DateTime, double>> GetAverageExecutionDurationPerDayAsync(
+    DateTime startDate,
+    DateTime endDate,
+    CancellationToken cancellationToken = default)
+{
+    var result = await (await GetQueryableAsync(cancellationToken))
+        .Where(a => a.ExecutionTime < endDate.AddDays(1) && a.ExecutionTime > startDate)
+        .OrderBy(t => t.ExecutionTime)
+        .GroupBy(t => new {
+            t.ExecutionTime.Year,
+            t.ExecutionTime.Month,
+            t.ExecutionTime.Day
+        })
+        .Select(g => new {
+            Day = g.Min(t => t.ExecutionTime),
+            avgExecutionTime = g.Average(t => t.ExecutionDuration)
+        })
+        .ToListAsync(GetCancellationToken(cancellationToken));
+
+    return result.ToDictionary(
+        element => element.Day.ClearTime(),
+        element => element.avgExecutionTime);
+}
+```
+
+The grouping key is decomposed into `Year` / `Month` / `Day` instead of `Date` because the MongoDB LINQ provider doesn't translate `DateTime.Date` as a group key; expanding the three components produces an equivalent aggregation pipeline.
+
+#### Entity-change queries: embedded sub-document gymnastics
+
+This is where the Mongo provider diverges most. `EntityChange` is *not* a top-level collection, so the queries reach into the embedded array:
+
+```csharp
+public virtual async Task<EntityChange> GetEntityChange(
+    Guid entityChangeId,
+    CancellationToken cancellationToken = default)
+{
+    var entityChange = (await (await GetQueryableAsync(cancellationToken))
+        .Where(x => x.EntityChanges.Any(y => y.Id == entityChangeId))
+        .OrderBy(x => x.Id)
+        .FirstAsync(GetCancellationToken(cancellationToken)))
+        .EntityChanges
+        .FirstOrDefault(x => x.Id == entityChangeId);
+
+    if (entityChange == null)
+    {
+        throw new EntityNotFoundException(typeof(EntityChange));
+    }
+
+    return entityChange;
+}
+
+protected virtual async Task<IQueryable<EntityChange>> GetEntityChangeListQueryAsync(
+    Guid? auditLogId = null,
+    DateTime? startTime = null,
+    DateTime? endTime = null,
+    EntityChangeType? changeType = null,
+    string entityId = null,
+    string entityTypeFullName = null,
+    CancellationToken cancellationToken = default)
+{
+    return (await GetQueryableAsync(cancellationToken))
+            .SelectMany(x => x.EntityChanges)
+            .WhereIf(auditLogId.HasValue, e => e.Id == auditLogId)
+            .WhereIf(startTime.HasValue, e => e.ChangeTime >= startTime)
+            .WhereIf(endTime.HasValue, e => e.ChangeTime <= endTime)
+            .WhereIf(changeType.HasValue, e => e.ChangeType == changeType.Value)
+            .WhereIf(!string.IsNullOrWhiteSpace(entityId), e => e.EntityId == entityId)
+            .WhereIf(!string.IsNullOrWhiteSpace(entityTypeFullName),
+                     e => e.EntityTypeFullName.Contains(entityTypeFullName));
+}
+```
+
+`SelectMany(x => x.EntityChanges)` is the equivalent of an `$unwind` stage in a MongoDB aggregation. The downstream `WhereIf` chain then filters the unwound stream by the same criteria as the EF Core variant.
+
+#### `GetEntityChangesWithUsernameAsync` (Mongo)
+
+Because the username lives on the *parent* document, the Mongo implementation has to fetch the parents and then post-process in memory rather than join in the database:
+
+```csharp
+public virtual async Task<List<EntityChangeWithUsername>> GetEntityChangesWithUsernameAsync(
+    string entityId,
+    string entityTypeFullName,
+    CancellationToken cancellationToken = default)
+{
+    var auditLogs = await (await GetQueryableAsync(cancellationToken))
+        .Where(x => x.EntityChanges.Any(
+            y => y.EntityId == entityId && y.EntityTypeFullName == entityTypeFullName))
+        .OrderByDescending(x => x.ExecutionTime)
+        .ToListAsync(GetCancellationToken(cancellationToken));
+
+    var entityChanges = auditLogs.SelectMany(x => x.EntityChanges).ToList();
+
+    entityChanges.RemoveAll(
+        x => x.EntityId != entityId || x.EntityTypeFullName != entityTypeFullName);
+
+    return entityChanges
+        .Select(x => new EntityChangeWithUsername
+        {
+            EntityChange = x,
+            UserName = auditLogs.First(y => y.Id == x.AuditLogId).UserName
+        })
+        .ToList();
+}
+```
+
+The `RemoveAll` step is needed because pulling back all parent `AuditLog`s returns *all* of their embedded `EntityChange`s, not just the ones matching the predicate. The in-memory filter discards the unrelated changes that came along for the ride.
+
+## When to pick which provider
+
+EF Core is best when you need SQL-shaped indexes or want to join audit data with other relational tables — the index design matches the management-UI filters. MongoDB is best when the host is already on MongoDB; embedded children make per-`AuditLog` reads cheap, though the entity-change history fan-out is in-memory.
+
+The consumer code is identical:
+
+```csharp
+public class AuditLogQuery
+{
+    private readonly IAuditLogRepository _auditLogs;
+
+    public AuditLogQuery(IAuditLogRepository auditLogs)
+    {
+        _auditLogs = auditLogs;
+    }
+
+    public Task<long> CountErrorsAsync(DateTime since)
+        => _auditLogs.GetCountAsync(startTime: since, hasException: true);
+}
+```
+
+`AuditingStore` is wired against `IAuditLogRepository` so swapping providers is a one-line change in the host module's `DependsOn` list.
+
+<CardGroup cols={2}>
+  <Card title="Domain layer" icon="cube" href="/modules/audit-logging/domain">
+    Entities, repository contract, `AuditingStore`, `AuditLogInfoToAuditLogConverter`.
+  </Card>
+  <Card title="Module overview" icon="circle-info" href="/modules/audit-logging/overview">
+    How the module fits with `AbpAuditingModule`, the producer / consumer split.
+  </Card>
+  <Card title="EF Core docs" icon="book" href="/data/entityframeworkcore">
+    `AbpDbContext<T>`, `EfCoreRepository`, `IDbContextProvider`, `IncludeDetails`.
+  </Card>
+  <Card title="MongoDB docs" icon="book" href="/data/mongodb">
+    `AbpMongoDbContext`, `MongoDbRepository`, `IMongoDbContextProvider`.
+  </Card>
+</CardGroup>

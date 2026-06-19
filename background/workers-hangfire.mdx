@@ -1,0 +1,305 @@
+---
+title: "Hangfire Background Workers — Recurring Jobs Adapter"
+sidebarTitle: "Hangfire Workers"
+description: "Run Abp background workers as Hangfire recurring jobs: HangfireBackgroundWorkerBase, HangfireBackgroundWorkerManager, periodic to cron translation."
+---
+
+`Volo.Abp.BackgroundWorkers.Hangfire` replaces `IBackgroundWorkerManager` with `HangfireBackgroundWorkerManager`. Instead of running `IBackgroundWorker.StartAsync` on a singleton with an `AbpAsyncTimer`, the manager translates each registered worker into a **Hangfire recurring job** stored in Hangfire's `JobStorage`. A single Hangfire server then runs them according to the cron schedule — including across multiple host instances (only one will execute each tick, thanks to Hangfire's distributed locks).
+
+This module is the "workers" half of the pair with [`/background/jobs-hangfire`](/background/jobs-hangfire). The two can be used independently, but combining them gives you one Hangfire deployment that handles ad‑hoc jobs *and* recurring workers, observable on the same dashboard.
+
+<Info>
+Source: `framework/src/Volo.Abp.BackgroundWorkers.Hangfire/Volo/Abp/BackgroundWorkers/Hangfire/`. Depends on `Volo.Abp.HangFire` (the integration module) and `AbpBackgroundWorkersModule`.
+</Info>
+
+## How a worker becomes a recurring job
+
+The manager handles three distinct shapes of worker:
+
+1. **`IHangfireBackgroundWorker`** — a worker that *natively* exposes `RecurringJobId`, `CronExpression`, `Queue`, `TimeZone`. Registered as a Hangfire recurring job that calls `worker.DoWorkAsync(cancellationToken)`.
+2. **`AsyncPeriodicBackgroundWorkerBase` or `PeriodicBackgroundWorkerBase`** — a standard periodic worker. Wrapped by `HangfirePeriodicBackgroundWorkerAdapter<TWorker>`, with `Period` translated to a cron expression.
+3. **Anything else** — falls through to `base.AddAsync` (the in‑process `BackgroundWorkerManager`), so a custom non‑periodic worker still runs as a singleton.
+
+## HangfireBackgroundWorkerBase
+
+```csharp
+// framework/src/Volo.Abp.BackgroundWorkers.Hangfire/Volo/Abp/BackgroundWorkers/Hangfire/HangfireBackgroundWorkerBase.cs
+public abstract class HangfireBackgroundWorkerBase : BackgroundWorkerBase, IHangfireBackgroundWorker
+{
+    public string? RecurringJobId { get; set; }
+    public string CronExpression { get; set; } = default!;
+    public TimeZoneInfo? TimeZone { get; set; } = TimeZoneInfo.Utc;
+    public string Queue { get; set; } = default!;
+
+    public abstract Task DoWorkAsync(CancellationToken cancellationToken = default);
+}
+
+public interface IHangfireBackgroundWorker : IBackgroundWorker
+{
+    string? RecurringJobId { get; set; }
+    string CronExpression { get; set; }
+    TimeZoneInfo? TimeZone  { get; set; }
+    string Queue  { get; set; }
+    Task DoWorkAsync(CancellationToken cancellationToken = default);
+}
+```
+
+Implementing the base class gives you full control over the recurring job:
+
+```csharp
+public class NightlyReportingWorker : HangfireBackgroundWorkerBase
+{
+    public NightlyReportingWorker()
+    {
+        RecurringJobId = "nightly-reporting";
+        CronExpression = Cron.Daily(2, 30);           // 02:30 every day
+        TimeZone       = TimeZoneInfo.Utc;
+        Queue          = "reports";
+    }
+
+    public override async Task DoWorkAsync(CancellationToken cancellationToken = default)
+    {
+        // ...
+    }
+}
+```
+
+## HangfireBackgroundWorkerManager
+
+```csharp
+// HangfireBackgroundWorkerManager.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IBackgroundWorkerManager), typeof(HangfireBackgroundWorkerManager))]
+public class HangfireBackgroundWorkerManager : BackgroundWorkerManager, ISingletonDependency
+{
+    protected AbpHangfireBackgroundJobServer BackgroundJobServer { get; set; } = default!;
+    protected IServiceProvider ServiceProvider { get; }
+
+    public void Initialize()
+    {
+        BackgroundJobServer = ServiceProvider.GetRequiredService<AbpHangfireBackgroundJobServer>();
+    }
+
+    public override async Task AddAsync(IBackgroundWorker worker, CancellationToken cancellationToken = default)
+    {
+        var abpHangfireOptions = ServiceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+        var defaultQueuePrefix = abpHangfireOptions.DefaultQueuePrefix;
+        var defaultQueue = abpHangfireOptions.DefaultQueue;
+
+        switch (worker)
+        {
+            case IHangfireBackgroundWorker hangfireBackgroundWorker:
+            {
+                var unProxyWorker = ProxyHelper.UnProxy(hangfireBackgroundWorker);
+
+                RecurringJob.AddOrUpdate(
+                    hangfireBackgroundWorker.RecurringJobId,
+                    hangfireBackgroundWorker.Queue.IsNullOrWhiteSpace()
+                        ? defaultQueue
+                        : defaultQueuePrefix + hangfireBackgroundWorker.Queue,
+                    () => ((IHangfireBackgroundWorker)unProxyWorker).DoWorkAsync(cancellationToken),
+                    hangfireBackgroundWorker.CronExpression,
+                    new RecurringJobOptions { TimeZone = hangfireBackgroundWorker.TimeZone });
+                break;
+            }
+
+            case AsyncPeriodicBackgroundWorkerBase or PeriodicBackgroundWorkerBase:
+            {
+                int? period = null;
+                string? CronExpression = null;
+
+                if (worker is AsyncPeriodicBackgroundWorkerBase asyncBase)
+                {
+                    period = asyncBase.Period;
+                    CronExpression = asyncBase.CronExpression;
+                }
+                else if (worker is PeriodicBackgroundWorkerBase periodicBase)
+                {
+                    period = periodicBase.Period;
+                    CronExpression = periodicBase.CronExpression;
+                }
+
+                if (period == null && CronExpression.IsNullOrWhiteSpace()) return;
+
+                var adapterType = typeof(HangfirePeriodicBackgroundWorkerAdapter<>)
+                    .MakeGenericType(ProxyHelper.GetUnProxiedType(worker));
+                var workerAdapter = (Activator.CreateInstance(adapterType) as IHangfireBackgroundWorker)!;
+
+                Expression<Func<Task>> methodCall = () => workerAdapter.DoWorkAsync(cancellationToken);
+                var recurringJobId = !workerAdapter.RecurringJobId.IsNullOrWhiteSpace()
+                    ? workerAdapter.RecurringJobId
+                    : GetRecurringJobId(worker, methodCall);
+
+                RecurringJob.AddOrUpdate(
+                    recurringJobId,
+                    workerAdapter.Queue.IsNullOrWhiteSpace()
+                        ? defaultQueue
+                        : defaultQueuePrefix + workerAdapter.Queue,
+                    methodCall,
+                    CronExpression ?? GetCron(period!.Value),
+                    new RecurringJobOptions { TimeZone = workerAdapter.TimeZone });
+                break;
+            }
+
+            default:
+                await base.AddAsync(worker, cancellationToken);
+                break;
+        }
+    }
+
+    // ...
+}
+```
+
+The key insight: the manager inherits from the in‑process `BackgroundWorkerManager`. For anything it does *not* recognise as a Hangfire/periodic worker, it falls back to the base list‑and‑start behaviour. Mixing manually‑managed workers with Hangfire‑managed workers is fully supported.
+
+## Period to cron translation
+
+Because Hangfire's recurring scheduler is cron‑based, `Period` (milliseconds) must be converted:
+
+```csharp
+protected virtual string GetCron(int period)
+{
+    var time = TimeSpan.FromMilliseconds(period);
+    string cron;
+
+    if (time.TotalSeconds <= 59)      cron = $"*/{time.TotalSeconds} * * * * *";
+    else if (time.TotalMinutes <= 59) cron = $"*/{time.TotalMinutes} * * * *";
+    else if (time.TotalHours <= 23)   cron = $"0 */{time.TotalHours} * * *";
+    else if (time.TotalDays <= 31)    cron = $"0 0 0 1/{time.TotalDays} * *";
+    else
+        throw new AbpException(
+            $"Cannot convert period: {period} to cron expression, " +
+            "use HangfireBackgroundWorkerBase to define worker");
+
+    return cron;
+}
+```
+
+If your period is longer than 31 days or has weird fractional values, the cron representation is misleading. Subclass `HangfireBackgroundWorkerBase` and set `CronExpression` directly for full precision.
+
+<Note>
+A `Period` of 30000 ms (30 seconds) becomes `*/30 * * * * *`. A `Period` of one hour becomes `0 */1 * * *`. The 5‑field (no seconds) format is used when the period crosses the minute boundary.
+</Note>
+
+## HangfirePeriodicBackgroundWorkerAdapter
+
+```csharp
+// HangfirePeriodicBackgroundWorkerAdapter.cs
+public class HangfirePeriodicBackgroundWorkerAdapter<TWorker> : HangfireBackgroundWorkerBase
+    where TWorker : IBackgroundWorker
+{
+    private readonly MethodInfo _doWorkAsyncMethod;
+    private readonly MethodInfo _doWorkMethod;
+
+    public HangfirePeriodicBackgroundWorkerAdapter()
+    {
+        _doWorkAsyncMethod = typeof(TWorker).GetMethod("DoWorkAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        _doWorkMethod = typeof(TWorker).GetMethod("DoWork",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        RecurringJobId = BackgroundWorkerNameAttribute.GetNameOrNull<TWorker>();
+    }
+
+    public override async Task DoWorkAsync(CancellationToken cancellationToken = default)
+    {
+        var workerContext = new PeriodicBackgroundWorkerContext(ServiceProvider, cancellationToken);
+        var worker = ServiceProvider.GetRequiredService<TWorker>();
+
+        switch (worker)
+        {
+            case AsyncPeriodicBackgroundWorkerBase asyncPeriodicBackgroundWorker:
+                await (Task)(_doWorkAsyncMethod.Invoke(asyncPeriodicBackgroundWorker, new object[] { workerContext })!);
+                break;
+            case PeriodicBackgroundWorkerBase periodicBackgroundWorker:
+                _doWorkMethod.Invoke(periodicBackgroundWorker, new object[] { workerContext });
+                break;
+        }
+    }
+}
+```
+
+The adapter is *not* a singleton — Hangfire's `JobActivator` constructs it fresh per execution. The worker singleton it dispatches to *is* a singleton (resolved from DI), which preserves the "shared in‑memory state across ticks" behaviour you may have on a regular periodic worker.
+
+It reflects into the *non‑public* `DoWorkAsync` / `DoWork` methods so it can dispatch even though those methods are `protected abstract` on the periodic bases.
+
+## Module wiring
+
+```csharp
+// AbpBackgroundWorkersHangfireModule.cs
+[DependsOn(
+    typeof(AbpBackgroundWorkersModule),
+    typeof(AbpHangfireModule))]
+public class AbpBackgroundWorkersHangfireModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton(typeof(HangfirePeriodicBackgroundWorkerAdapter<>));
+    }
+
+    public override void OnPreApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider
+            .GetRequiredService<IOptions<AbpBackgroundWorkerOptions>>().Value;
+        if (!options.IsEnabled)
+        {
+            var hangfireOptions = context.ServiceProvider
+                .GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+            context.ServiceProvider.GetRequiredService<JobStorage>();
+            hangfireOptions.BackgroundJobServerFactory = _ => null;
+        }
+
+        context.ServiceProvider
+            .GetRequiredService<HangfireBackgroundWorkerManager>()
+            .Initialize();
+    }
+}
+```
+
+The `Initialize()` call resolves `AbpHangfireBackgroundJobServer` early, which forces the singleton Hangfire `BackgroundJobServer` to start during `OnPreApplicationInitialization`. After that point `RecurringJob.AddOrUpdate` calls land in storage and are picked up by the server immediately.
+
+`IsEnabled = false` flips the Hangfire `BackgroundJobServerFactory` to return `null`, so recurring jobs are *registered* but no node starts a server — same producer/consumer split pattern as the jobs Hangfire module.
+
+## Queue prefixes
+
+Just like the jobs Hangfire provider, the worker manager honours `AbpHangfireOptions.DefaultQueuePrefix` when a `Queue` is specified on the worker:
+
+- `Queue = ""` → uses `AbpHangfireOptions.DefaultQueue` (`"default"` plus any active prefix).
+- `Queue = "reports"` and `DefaultQueuePrefix = "myapp."` → effective queue is `"myapp_reports"` (after the lowercase + underscore normalization performed by `AbpHangfireOptionsConfiguration`).
+
+See [`/background/hangfire-module`](/background/hangfire-module) for the full prefix rules and queue name validation.
+
+## Registration
+
+```csharp
+public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    await context.AddBackgroundWorkerAsync<NightlyReportingWorker>();
+    await context.AddBackgroundWorkerAsync<CleanupExpiredTokensWorker>();
+}
+```
+
+`AddBackgroundWorkerAsync<T>` is the same helper as the in‑process flow — it routes through the worker manager, which (because of the `[Dependency(ReplaceServices = true)]` on `HangfireBackgroundWorkerManager`) is now the Hangfire one.
+
+## When to choose Hangfire for workers
+
+<CardGroup cols={2}>
+  <Card title="You want a dashboard" icon="display">
+    Hangfire's recurring‑job dashboard lists every worker, its next execution, last result, and lets you trigger it manually. Operationally invaluable.
+  </Card>
+  <Card title="You already have Hangfire" icon="link">
+    If `Volo.Abp.BackgroundJobs.HangFire` is in use for ad‑hoc jobs, this module reuses the same `JobStorage` and `BackgroundJobServer` for recurring workers — no new infrastructure.
+  </Card>
+  <Card title="Cron expressions natively" icon="calendar-days">
+    Workers that derive from `HangfireBackgroundWorkerBase` set `CronExpression` directly. No translation needed.
+  </Card>
+  <Card title="You need cluster safety" icon="shield">
+    Hangfire's storage takes a distributed lock around each recurring job firing — only one node executes per tick, automatically.
+  </Card>
+</CardGroup>
+
+## Cross‑links
+
+- [`/background/workers`](/background/workers) — `IBackgroundWorker`, base classes, the in‑process manager that this module replaces.
+- [`/background/jobs-hangfire`](/background/jobs-hangfire) — Hangfire‑backed `IBackgroundJobManager`.
+- [`/background/hangfire-module`](/background/hangfire-module) — shared Hangfire configuration: server factory, queue prefixing, authorization.

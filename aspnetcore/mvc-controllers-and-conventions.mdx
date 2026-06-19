@@ -1,0 +1,282 @@
+---
+title: "MVC Controllers, Conventions And Auto API Generation"
+sidebarTitle: "Controllers & Conventions"
+description: "AbpController, AbpControllerBase, AbpServiceConvention, [RemoteService] attribute and the conventional registrar that turns app services into REST."
+---
+
+ABP gives MVC controllers a common base, and — more importantly — generates MVC controllers automatically from application services. This page documents the three moving parts: the base classes (`AbpController`, `AbpControllerBase`), the convention (`AbpServiceConvention`) that rewrites the application model, and the configuration surface (`AbpConventionalControllerOptions`, `ConventionalControllerSetting`, `[RemoteService]`) that selects which services participate.
+
+All paths in this page are under `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/`.
+
+## `AbpController` and `AbpControllerBase`
+
+Two near‑identical base classes exist because MVC distinguishes view‑returning controllers (inherit from `Controller`) from API‑only controllers (inherit from `ControllerBase`). ABP mirrors that distinction:
+
+```csharp
+// AbpController.cs — for Razor view controllers
+public abstract class AbpController : Controller, IAvoidDuplicateCrossCuttingConcerns
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    protected IUnitOfWorkManager UnitOfWorkManager =>
+        LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();
+
+    protected Type? ObjectMapperContext { get; set; }
+    protected IObjectMapper ObjectMapper => LazyServiceProvider.LazyGetService<IObjectMapper>(provider =>
+        ObjectMapperContext == null
+            ? provider.GetRequiredService<IObjectMapper>()
+            : (IObjectMapper)provider.GetRequiredService(
+                typeof(IObjectMapper<>).MakeGenericType(ObjectMapperContext)));
+
+    protected IGuidGenerator GuidGenerator =>
+        LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
+
+    protected ILogger Logger => LazyServiceProvider.LazyGetService<ILogger>(
+        provider => LoggerFactory?.CreateLogger(GetType().FullName!) ?? NullLogger.Instance);
+
+    protected ICurrentUser CurrentUser =>
+        LazyServiceProvider.LazyGetRequiredService<ICurrentUser>();
+    protected ICurrentTenant CurrentTenant =>
+        LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    protected IAuthorizationService AuthorizationService =>
+        LazyServiceProvider.LazyGetRequiredService<IAuthorizationService>();
+    protected IUnitOfWork? CurrentUnitOfWork => UnitOfWorkManager?.Current;
+    protected IClock Clock =>
+        LazyServiceProvider.LazyGetRequiredService<IClock>();
+    protected IModelStateValidator ModelValidator =>
+        LazyServiceProvider.LazyGetRequiredService<IModelStateValidator>();
+    protected IFeatureChecker FeatureChecker =>
+        LazyServiceProvider.LazyGetRequiredService<IFeatureChecker>();
+    protected IAppUrlProvider AppUrlProvider =>
+        LazyServiceProvider.LazyGetRequiredService<IAppUrlProvider>();
+    protected IStringLocalizerFactory StringLocalizerFactory =>
+        LazyServiceProvider.LazyGetRequiredService<IStringLocalizerFactory>();
+
+    protected IStringLocalizer L
+    {
+        get
+        {
+            if (_localizer == null) _localizer = CreateLocalizer();
+            return _localizer;
+        }
+    }
+    private IStringLocalizer? _localizer;
+
+    protected Type? LocalizationResource
+    {
+        get => _localizationResource;
+        set { _localizationResource = value; _localizer = null; }
+    }
+    private Type? _localizationResource = typeof(DefaultResource);
+}
+```
+
+`AbpControllerBase` (file `AbpControllerBase.cs`) is identical except it derives from `ControllerBase` and drops `IAppUrlProvider`. Both expose the same set of cross‑cutting helpers (`L`, `Logger`, `CurrentUser`, `CurrentTenant`, `ObjectMapper`, `UnitOfWorkManager`, `GuidGenerator`, `Clock`, `FeatureChecker`) through the lazy provider so deriving controllers don't have to declare them in their own constructors.
+
+### `IAvoidDuplicateCrossCuttingConcerns`
+
+Both base classes implement `IAvoidDuplicateCrossCuttingConcerns` and expose `List<string> AppliedCrossCuttingConcerns`. ABP's `AbpAuditActionFilter` / `AbpUowActionFilter` consult this list before applying their behavior — if an interceptor already wrapped the call once, the filter steps aside. This is how ABP avoids double‑auditing or double‑unit‑of‑work when an application service is called from a controller that itself is intercepted.
+
+### `CreateLocalizer`
+
+```csharp
+protected virtual IStringLocalizer CreateLocalizer()
+{
+    if (LocalizationResource != null)
+        return StringLocalizerFactory.Create(LocalizationResource);
+
+    var localizer = StringLocalizerFactory.CreateDefaultOrNull();
+    if (localizer == null)
+        throw new AbpException(
+            $"Set {nameof(LocalizationResource)} or define the default localization resource type " +
+            $"(by configuring the {nameof(AbpLocalizationOptions)}.{nameof(AbpLocalizationOptions.DefaultResourceType)}) " +
+            $"to be able to use the {nameof(L)} object!");
+
+    return localizer;
+}
+```
+
+Setting `LocalizationResource = typeof(MyModuleResource);` in a controller's constructor changes which localization JSON file `L["KeyName"]` reads from.
+
+### `ValidateModel`
+
+```csharp
+protected virtual void ValidateModel()
+{
+    ModelValidator?.Validate(ModelState);
+}
+```
+
+Action authors call this only if they disabled the global `AbpValidationActionFilter` for some action and still want a manual check.
+
+## Conventional controllers — application services as REST
+
+ABP's signature feature is exposing `IApplicationService` implementations as REST endpoints without writing controller classes. The pieces are:
+
+| File | Role |
+| --- | --- |
+| `Conventions/AbpServiceConvention.cs` | The `IApplicationModelConvention` that rewrites the application model — picks up application services, sets controller names, route templates, HTTP verbs and parameter binding. |
+| `Conventions/AbpServiceConventionWrapper.cs` | A thin wrapper invoked from `MvcOptions.Conventions.Add(...)`. |
+| `Conventions/AbpConventionalControllerOptions.cs` | The configuration surface (`Configure<AbpAspNetCoreMvcOptions>(o => o.ConventionalControllers.Create(...))`). |
+| `Conventions/ConventionalControllerSetting.cs` | One entry per registered assembly. |
+| `Conventions/AbpConventionalControllerFeatureProvider.cs` | An `IApplicationFeatureProvider<ControllerFeature>` that surfaces application service types to MVC's controller discovery. |
+| `Conventions/AbpConventionalApiControllerSpecification.cs` | The predicate that decides "is this type an auto‑controller?". |
+| `Conventions/ConventionalRouteBuilder.cs` / `IConventionalRouteBuilder.cs` | Builds route templates like `api/app/identity-users/{id}` from a service name + method name. |
+
+### `[RemoteService]`
+
+The opt‑in attribute lives in the framework core at `framework/src/Volo.Abp.Core/Volo/Abp/RemoteServiceAttribute.cs`:
+
+```csharp
+[AttributeUsage(AttributeTargets.Interface | AttributeTargets.Class | AttributeTargets.Method)]
+public class RemoteServiceAttribute : Attribute
+{
+    public bool IsEnabled { get; set; }
+    public bool IsMetadataEnabled { get; set; }
+    public string Name { get; set; } = default!;
+
+    public RemoteServiceAttribute(bool isEnabled = true)
+    {
+        IsEnabled = isEnabled;
+        IsMetadataEnabled = true;
+    }
+}
+```
+
+Place `[RemoteService(false)]` on an `IApplicationService` to keep it from being published. Place `[RemoteService(Name = "MyGroup")]` on its interface to override the API group name used by Swagger.
+
+### `AbpConventionalControllerOptions`
+
+`Conventions/AbpConventionalControllerOptions.cs`:
+
+```csharp
+public class AbpConventionalControllerOptions
+{
+    public ConventionalControllerSettingList ConventionalControllerSettings { get; }
+    public List<Type> FormBodyBindingIgnoredTypes { get; }
+
+    public bool UseV3UrlStyle { get; set; }
+
+    public string[] IgnoredUrlSuffixesInControllerNames { get; set; } = new[] { "Integration" };
+
+    public AbpConventionalControllerOptions()
+    {
+        ConventionalControllerSettings = new ConventionalControllerSettingList();
+        FormBodyBindingIgnoredTypes = new List<Type>
+        {
+            typeof(IFormFile),
+            typeof(IRemoteStreamContent)
+        };
+    }
+
+    public AbpConventionalControllerOptions Create(
+        Assembly assembly,
+        Action<ConventionalControllerSetting>? optionsAction = null)
+    {
+        // ... creates a ConventionalControllerSetting for the assembly and adds it
+    }
+}
+```
+
+`FormBodyBindingIgnoredTypes` is consulted when `AbpServiceConvention` decides whether to bind a method parameter from form body (`[FromBody]` vs `[FromForm]`). `IFormFile` and `IRemoteStreamContent` must stay out of `[FromBody]` so MVC can multipart‑bind them.
+
+### `ConventionalControllerSetting`
+
+`Conventions/ConventionalControllerSetting.cs`:
+
+```csharp
+public class ConventionalControllerSetting
+{
+    public Assembly Assembly { get; }
+    internal HashSet<Type> ControllerTypes { get; }
+
+    public bool? UseV3UrlStyle { get; set; }
+    public string RootPath { get; set; }              // e.g. "identity"
+    public string RemoteServiceName { get; set; }     // e.g. "abp"
+    public Func<Type, bool>? TypePredicate { get; set; }
+    public ApplicationServiceTypes ApplicationServiceTypes { get; set; } = ApplicationServiceTypes.All;
+    public Action<ControllerModel>? ControllerModelConfigurer { get; set; }
+    public Func<UrlControllerNameNormalizerContext, string>? UrlControllerNameNormalizer { get; set; }
+    public Func<UrlActionNameNormalizerContext, string>? UrlActionNameNormalizer { get; set; }
+    public List<ApiVersion> ApiVersions { get; }
+    // ...
+}
+```
+
+Typical wire‑up inside a module:
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers.Create(typeof(MyModule).Assembly, opts =>
+    {
+        opts.RootPath = "identity";
+        opts.RemoteServiceName = "Identity";
+        opts.UrlActionNameNormalizer = ctx =>
+            ctx.ActionName.RemovePostFix("Async");
+    });
+});
+```
+
+This declares: every application service in `MyModule`'s assembly should be exposed under `/api/identity/...`, grouped as `Identity` in Swagger, with `Async` stripped from action names.
+
+### How `AbpServiceConvention.Apply` rewrites the model
+
+`Conventions/AbpServiceConvention.cs` implements `IApplicationModelConvention.Apply(ApplicationModel)`. For every controller model whose type matches the predicate (auto‑controller from an app service):
+
+1. Sets the `ControllerType` to the application service implementation.
+2. Strips `AppService` / `ApplicationService` / `Integration` suffixes from the controller name via `IgnoredUrlSuffixesInControllerNames`.
+3. Walks each `ActionModel`: figures out HTTP verb from the method name (`Get*`, `Create*`/`Add*` → POST, `Update*` → PUT, `Delete*` / `Remove*` → DELETE), builds a route template via `IConventionalRouteBuilder`, sets `BindingInfo` on each parameter (route vs body vs form), and sets `ActionName` after normalization.
+4. Configures `ApiExplorer` group/name so Swagger groups endpoints by `RemoteServiceName`.
+
+The legacy `ConventionalControllerRegistrar` term referred to the union of `AbpConventionalControllerFeatureProvider` + the registrar that hands assemblies to MVC's `ApplicationPartManager`. Recent code paths use `AbpAspNetCoreMvcConventionalRegistrar` (in `DependencyInjection/`) to register controllers as DI services, and `AbpConventionalControllerFeatureProvider` to feed them to MVC.
+
+## Practical examples
+
+### Exposing a service group
+
+```csharp
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAspNetCoreMvcOptions>(options =>
+        {
+            options.ConventionalControllers.Create(typeof(MyAppApplicationModule).Assembly);
+        });
+    }
+}
+```
+
+Every `IApplicationService` (or `IRemoteService`) in `MyAppApplicationModule` becomes an MVC controller. No `*Controller` classes required.
+
+### Suppressing a service
+
+```csharp
+[RemoteService(false)]
+public class InternalReportingAppService : ApplicationService, IInternalReportingAppService
+{
+    // not exposed as HTTP even though MyAppApplicationModule was passed to Create(...)
+}
+```
+
+### Overriding the route
+
+Combine `[Area]`, `[Route]`, `[HttpGet]`, `[HttpPost]` on the application service method — the convention respects pre‑existing MVC attributes and only fills in what's missing.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    The `AbpAspNetCoreMvcModule` that registers `AbpServiceConventionWrapper` via `AbpMvcOptionsExtensions.AddAbp(...)`.
+  </Card>
+  <Card title="Host module" icon="server" href="/aspnetcore/host-module">
+    The `IUnitOfWorkManager`, `ICurrentUser`, `ICurrentTenant` accessors that `AbpController` reaches for.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    End‑to‑end trace of a request that lands on a convention‑generated controller.
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/security/overview">
+    `ICurrentUser` used by `AbpController.CurrentUser`.
+  </Card>
+</CardGroup>

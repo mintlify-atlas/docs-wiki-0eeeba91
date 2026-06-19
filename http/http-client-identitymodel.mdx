@@ -1,0 +1,305 @@
+---
+title: "Http.Client.IdentityModel — Bearer Tokens For Proxies"
+sidebarTitle: "Client IdentityModel"
+description: "IdentityModelRemoteServiceHttpClientAuthenticator plus Web cookie, Blazor WebAssembly, and MAUI Blazor IAbpAccessTokenProvider implementations."
+---
+
+`Volo.Abp.Http.Client.IdentityModel` is the glue between the [`Volo.Abp.IdentityModel`](/http/identitymodel) package (which knows how to acquire tokens from any OpenID Connect authority) and the [`Volo.Abp.Http.Client`](/http/http-client) pipeline (which makes outbound calls). It replaces the default no-op `NullRemoteServiceHttpClientAuthenticator` with `IdentityModelRemoteServiceHttpClientAuthenticator`, which obtains a token via `IIdentityModelAuthenticationService` and attaches it as `Authorization: Bearer <token>` on each outgoing request.
+
+The three sibling packages — `.Web`, `.WebAssembly`, `.MauiBlazor` — keep the authenticator the same but swap *where the current user's access token comes from*: an MVC sign-in cookie, the Blazor WebAssembly OIDC store, or the MAUI secure storage container.
+
+## Source layout
+
+```text
+framework/src/
+├── Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/IdentityModel/
+│   ├── AbpHttpClientIdentityModelModule.cs
+│   └── IdentityModelRemoteServiceHttpClientAuthenticator.cs
+├── Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/
+│   └── RemoteServiceConfigurationExtensions.cs
+├── Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/
+│   ├── AbpHttpClientIdentityModelWebModule.cs
+│   ├── HttpContextAbpAccessTokenProvider.cs
+│   └── HttpContextIdentityModelRemoteServiceHttpClientAuthenticator.cs
+├── Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/
+│   ├── AbpHttpClientIdentityModelWebAssemblyModule.cs
+│   ├── WebAssemblyAbpAccessTokenProvider.cs
+│   └── AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator.cs
+└── Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/
+    ├── AbpHttpClientIdentityModelMauiBlazorModule.cs
+    ├── MauiBlazorAbpAccessTokenProvider.cs
+    └── MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator.cs
+```
+
+## `AbpHttpClientIdentityModelModule`
+
+The base module — just a `DependsOn`:
+
+```csharp
+[DependsOn(
+    typeof(AbpHttpClientModule),
+    typeof(AbpIdentityModelModule)
+)]
+public class AbpHttpClientIdentityModelModule : AbpModule
+{
+}
+```
+
+Loading it (transitively, by referencing the matching `.Web` / `.WebAssembly` / `.MauiBlazor` variant) replaces `IRemoteServiceHttpClientAuthenticator` with the implementation below.
+
+## `IdentityModelRemoteServiceHttpClientAuthenticator`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class IdentityModelRemoteServiceHttpClientAuthenticator
+    : IRemoteServiceHttpClientAuthenticator, ITransientDependency
+{
+    protected IIdentityModelAuthenticationService IdentityModelAuthenticationService { get; }
+
+    public IdentityModelRemoteServiceHttpClientAuthenticator(
+        IIdentityModelAuthenticationService identityModelAuthenticationService)
+    {
+        IdentityModelAuthenticationService = identityModelAuthenticationService;
+    }
+
+    public virtual async Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        await IdentityModelAuthenticationService.TryAuthenticateAsync(
+            context.Client,
+            context.RemoteService.GetIdentityClient() ?? context.RemoteServiceName
+        );
+    }
+}
+```
+
+Two important things:
+
+- The "identity client name" used to look up `IdentityClientConfiguration` in `AbpIdentityClientOptions.IdentityClients` is **`RemoteServiceConfiguration.GetIdentityClient()` first, falling back to the remote service name**. So you can either name your `IdentityClient` to match the remote service ("Default" / "Saas" / "Identity"), or override it explicitly:
+
+  ```json
+  "RemoteServices": {
+    "Default":  { "BaseUrl": "https://saas-svc/", "IdentityClient": "Saas" },
+    "Identity": { "BaseUrl": "https://id-svc/",   "IdentityClient": "Saas" }
+  }
+  ```
+
+- `TryAuthenticateAsync` returns `false` when no matching `IdentityClientConfiguration` exists — the request still goes out, anonymously. Useful for public endpoints; surprising when you forgot to add a configuration.
+
+### `RemoteServiceConfigurationExtensions`
+
+```csharp
+public static class RemoteServiceConfigurationExtensions
+{
+    public const string IdentityClientName       = "IdentityClient";
+    public const string UseCurrentAccessTokenName = "UseCurrentAccessToken";
+
+    public static string? GetIdentityClient(this RemoteServiceConfiguration configuration)
+        => configuration.GetOrDefault(IdentityClientName);
+
+    public static RemoteServiceConfiguration SetIdentityClient(
+        this RemoteServiceConfiguration configuration, string? value)
+    {
+        configuration[IdentityClientName] = value;
+        return configuration;
+    }
+
+    public static bool? GetUseCurrentAccessToken(this RemoteServiceConfiguration configuration)
+    {
+        var value = configuration.GetOrDefault(UseCurrentAccessTokenName);
+        return value == null ? null : bool.Parse(value);
+    }
+
+    public static RemoteServiceConfiguration SetUseCurrentAccessToken(
+        this RemoteServiceConfiguration configuration, bool? value)
+    {
+        if (value == null) configuration.Remove(UseCurrentAccessTokenName);
+        else configuration[UseCurrentAccessTokenName] = value.Value.ToString().ToLowerInvariant();
+        return configuration;
+    }
+}
+```
+
+`UseCurrentAccessToken` is the per-remote-service switch read by the Web / WASM / Maui derivations: when it is **not** `false`, the authenticator tries to forward the currently signed-in user's token; otherwise (or when the current user is anonymous) it falls back to the client-credentials/password machine token from `IIdentityModelAuthenticationService`.
+
+## `IdentityModelHttpRequestMessageOptions`
+
+The options bag used for both *token requests* and *current-user forwarding* — declared in `Volo.Abp.IdentityModel` but documented here because it is the only place to mutate outbound headers for the OpenID Connect calls:
+
+```csharp
+public class IdentityModelHttpRequestMessageOptions
+{
+    public Action<HttpRequestMessage>? ConfigureHttpRequestMessage { get; set; }
+}
+```
+
+```csharp
+Configure<IdentityModelHttpRequestMessageOptions>(o =>
+{
+    o.ConfigureHttpRequestMessage = req =>
+        req.Headers.Add("X-Tenant-Id", currentTenant.Id?.ToString());
+});
+```
+
+## `.Web` — server-rendered MVC frontends
+
+The web variant adds an `IAbpAccessTokenProvider` that reads from `HttpContext.GetTokenAsync("access_token")` — i.e., the OIDC token kept in the sign-in cookie by `Microsoft.AspNetCore.Authentication.Cookies` after a successful OpenID Connect flow.
+
+### `AbpHttpClientIdentityModelWebModule`
+
+```csharp
+[DependsOn(typeof(AbpHttpClientIdentityModelModule))]
+public class AbpHttpClientIdentityModelWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpContextAccessor();
+    }
+}
+```
+
+### `HttpContextAbpAccessTokenProvider`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class HttpContextAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    protected IHttpContextAccessor HttpContextAccessor { get; }
+
+    public HttpContextAbpAccessTokenProvider(IHttpContextAccessor httpContextAccessor)
+    {
+        HttpContextAccessor = httpContextAccessor;
+    }
+
+    public virtual async Task<string?> GetTokenAsync()
+    {
+        var httpContext = HttpContextAccessor?.HttpContext;
+        if (httpContext == null) return null;
+
+        if (!httpContext.RequestServices.GetRequiredService<ICurrentUser>().IsAuthenticated)
+            return null;
+
+        return await httpContext.GetTokenAsync("access_token");
+    }
+}
+```
+
+It returns `null` for anonymous requests (so the authenticator falls back to client_credentials) and otherwise hands over the user's access token.
+
+### `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class HttpContextIdentityModelRemoteServiceHttpClientAuthenticator
+    : IdentityModelRemoteServiceHttpClientAuthenticator
+{
+    protected IAbpAccessTokenProvider AccessTokenProvider { get; }
+
+    public HttpContextIdentityModelRemoteServiceHttpClientAuthenticator(
+        IIdentityModelAuthenticationService identityModelAuthenticationService,
+        IAbpAccessTokenProvider accessTokenProvider)
+        : base(identityModelAuthenticationService)
+    {
+        AccessTokenProvider = accessTokenProvider;
+    }
+
+    public async override Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        if (context.RemoteService.GetUseCurrentAccessToken() != false)
+        {
+            var accessToken = await AccessTokenProvider.GetTokenAsync();
+            if (accessToken != null)
+            {
+                context.Request.SetBearerToken(accessToken);
+                return;
+            }
+        }
+        await base.Authenticate(context);
+    }
+}
+```
+
+That is the *user-token-forwarding* pattern: the MVC site uses the same access token the user already has, so a microservice can validate audit fields like `sub` and `tenantid` against the real signed-in identity.
+
+<Info>
+Pair this module with the OpenID Connect setup described in [Auth — OpenID Connect](/aspnetcore/auth-openidconnect) so the cookie actually contains an `access_token` claim — `options.SaveTokens = true;` plus `options.GetClaimsFromUserInfoEndpoint = true;`.
+</Info>
+
+## `.WebAssembly` — Blazor WebAssembly
+
+Browser apps cannot store an OIDC token in a cookie — they use `IAccessTokenProvider` from `Microsoft.AspNetCore.Components.WebAssembly.Authentication`, which stores the token in `sessionStorage` keyed by a Blazor session id.
+
+### `WebAssemblyAbpAccessTokenProvider`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class WebAssemblyAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    protected IAccessTokenProvider? AccessTokenProvider { get; }
+
+    public WebAssemblyAbpAccessTokenProvider(IAccessTokenProvider accessTokenProvider)
+    {
+        AccessTokenProvider = accessTokenProvider;
+    }
+
+    public virtual async Task<string?> GetTokenAsync()
+    {
+        if (AccessTokenProvider == null) return null;
+
+        var result = await AccessTokenProvider.RequestAccessToken();
+        if (result.Status != AccessTokenResultStatus.Success) return null;
+
+        result.TryGetToken(out var token);
+        return token?.Value;
+    }
+}
+```
+
+`RequestAccessToken()` does its own silent refresh — if the user's tokens have expired the call returns `Status = RedirectRequired` and the provider hands back `null`. The Web Assembly authenticator (`AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator`) handles that by skipping bearer attachment so the resource server returns 401, and your `RemoteAuthenticatorView` page kicks off a silent OIDC redirect.
+
+## `.MauiBlazor` — MAUI Blazor hybrid apps
+
+The MAUI Blazor variant is intentionally minimal — token storage is *application-specific* and lives in `Microsoft.Maui.Storage.SecureStorage`. The shipped implementation returns `null` so you can replace it with your own that actually reads from secure storage:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MauiBlazorAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    public virtual Task<string?> GetTokenAsync()
+    {
+        return Task.FromResult(null as string);
+    }
+}
+```
+
+The corresponding `MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator` follows the same pattern as the Web variant — `if (token != null) request.SetBearerToken(token); else fall back to base.Authenticate(context);`.
+
+A typical replacement that fits the ABP Commercial MAUI app:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class SecureStorageAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    public async Task<string?> GetTokenAsync()
+    {
+        return await SecureStorage.GetAsync("access_token");
+    }
+}
+```
+
+## Decision matrix
+
+| Host | Module to depend on | Token source | Falls back to |
+| --- | --- | --- | --- |
+| MVC / Razor Pages | `AbpHttpClientIdentityModelWebModule` | sign-in cookie (`access_token`) | machine token via client_credentials |
+| Blazor Server | `AbpHttpClientIdentityModelWebModule` | sign-in cookie (`access_token`) | machine token via client_credentials |
+| Blazor WebAssembly | `AbpHttpClientIdentityModelWebAssemblyModule` | `IAccessTokenProvider.RequestAccessToken()` | none — 401 triggers silent OIDC redirect |
+| MAUI Blazor | `AbpHttpClientIdentityModelMauiBlazorModule` | your `SecureStorage`-backed provider | machine token via client_credentials |
+| Backend daemon | `AbpHttpClientIdentityModelModule` (base) | none (no user) | machine token via client_credentials |
+
+## Related
+
+- [IdentityModel](/http/identitymodel) — the service that actually performs the token request.
+- [Http.Client](/http/http-client) — the proxy that consumes the authenticator.
+- [Http.Client.Web](/http/http-client-web) — additional convention features for MVC front-ends that *also* expose proxy controllers.
+- [Auth — JWT Bearer](/aspnetcore/auth-jwt-bearer) — the resource-server side that validates the bearer tokens.
+- [Auth — OpenID Connect](/aspnetcore/auth-openidconnect) — the interactive flow that produces the cookie used by `HttpContextAbpAccessTokenProvider`.

@@ -1,0 +1,319 @@
+---
+title: "Bootstrap tag helpers"
+sidebarTitle: "Bootstrap"
+description: "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap — Bootstrap 5 distributed as ABP tag helpers (<abp-button>, <abp-card>, <abp-input>, <abp-modal>, <abp-table>, navs, dropdowns, …)."
+---
+
+`Volo.Abp.AspNetCore.Mvc.UI.Bootstrap` ships Bootstrap 5 as a typed, server-rendered HTML library. Instead of writing the markup by hand —
+
+```html
+<button type="button" class="btn btn-primary">Save</button>
+```
+
+— you write
+
+```html
+<abp-button button-type="Primary" text="Save" icon="save" />
+```
+
+and the tag helper outputs the correct Bootstrap classes, ARIA attributes, icon span, busy-state markup, and so on. The package contains **no JavaScript and no CSS of its own** — it is a thin, opinionated tag-helper layer on top of Bootstrap that every ABP theme (Basic, LeptonX, custom) uses to render its views. The actual Bootstrap CSS/JS is delivered through the bundling/contributor pipeline (see [/aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages)).
+
+## Source layout
+
+```
+framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/
+├── AbpAspNetCoreMvcUiBootstrapModule.cs
+└── TagHelpers/
+    ├── AbpTagHelper.cs              # generic base
+    ├── AbpTagHelperService.cs
+    ├── AbpTagHelperLocalizer.cs
+    ├── FontIconType.cs              # FontAwesome | BootstrapIcon
+    ├── Alert/                       # <abp-alert>, header, link
+    ├── Badge/                       # <abp-badge>
+    ├── Blockquote/
+    ├── Border/                      # <abp-border>, <abp-rounded>
+    ├── Breadcrumb/                  # <abp-breadcrumb>, <abp-breadcrumb-item>
+    ├── Button/                      # <abp-button>, <abp-button-group>,
+    │                                # <abp-link-button>, <abp-button-toolbar>
+    ├── Card/                        # <abp-card>, header/body/footer, images
+    ├── Carousel/
+    ├── Collapse/                    # <abp-collapse-body>, <abp-collapse-button>
+    ├── Dropdown/                    # <abp-dropdown>, items, dividers, headers
+    ├── Figure/
+    ├── Form/                        # <abp-input>, <abp-select>, <abp-radio>,
+    │                                # <abp-dynamic-form>, validators
+    ├── Grid/                        # <abp-row>, <abp-column>
+    ├── ListGroup/
+    ├── Modal/                       # <abp-modal>, header/body/footer
+    ├── Nav/                         # <abp-nav>, navbar, brand, link
+    ├── Pagination/
+    ├── Popover/
+    ├── ProgressBar/
+    ├── Tab/                         # <abp-tabs>, <abp-tab>, dropdown tabs
+    ├── Table/                       # <abp-table>, headers, scopes
+    └── Tooltip/
+```
+
+## Module
+
+The Bootstrap module is small — it depends on `AbpAspNetCoreMvcUiModule` and only registers its embedded views (each tag helper's `*.cshtml` partial lives in the assembly):
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcUiModule))]
+public class AbpAspNetCoreMvcUiBootstrapModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiBootstrapModule>(
+                "Volo.Abp.AspNetCore.Mvc.UI.Bootstrap");
+        });
+    }
+}
+```
+
+It is automatically included by `AbpAspNetCoreMvcUiThemeSharedModule` (see [/ui/theme-shared](/ui/theme-shared)), so every theme has Bootstrap available without any extra wiring.
+
+## The tag helper base class
+
+Every Bootstrap tag helper is a thin POCO that exposes properties; the actual HTML generation lives in a companion `*TagHelperService`. Both inherit from common bases:
+
+```csharp
+// TagHelpers/AbpTagHelper.cs (shape)
+public abstract class AbpTagHelper<TTagHelper, TService> : TagHelper
+    where TTagHelper : AbpTagHelper<TTagHelper, TService>
+    where TService : AbpTagHelperService<TTagHelper>
+{
+    protected TService TagHelperService { get; }
+
+    protected AbpTagHelper(TService tagHelperService)
+    {
+        TagHelperService = tagHelperService;
+        TagHelperService.SetTagHelper((TTagHelper)this);
+    }
+
+    public override Task ProcessAsync(TagHelperContext context, TagHelperOutput output)
+        => TagHelperService.ProcessAsync(context, output);
+}
+```
+
+This split exists so that **localization** (`IAbpTagHelperLocalizer`) and DI services (icon types, model binders) can be injected on the service side without polluting the tag-helper signature.
+
+## Examples
+
+### Button
+
+```csharp
+[HtmlTargetElement("abp-button", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpButtonTagHelper
+    : AbpTagHelper<AbpButtonTagHelper, AbpButtonTagHelperService>, IButtonTagHelperBase
+{
+    public AbpButtonType ButtonType { get; set; } = AbpButtonType.Default;
+    public AbpButtonSize Size { get; set; } = AbpButtonSize.Default;
+    public string? BusyText { get; set; }
+    public string? Text { get; set; }
+    public string? Icon { get; set; }
+    public bool? Disabled { get; set; }
+    public FontIconType IconType { get; set; } = FontIconType.FontAwesome;
+    public bool BusyTextIsHtml { get; set; }
+}
+```
+
+```html
+<abp-button button-type="Primary"
+            icon="save"
+            text="@L["Save"]"
+            busy-text="@L["SavingWithThreeDot"]" />
+```
+
+`AbpButtonType` lives in the same folder — `Default`, `Primary`, `Secondary`, `Success`, `Danger`, `Warning`, `Info`, `Light`, `Dark`, `Link`, `Outline_*`. `FontIconType` lets you flip between `FontAwesome` (default) and `BootstrapIcon`.
+
+### Card
+
+```csharp
+public class AbpCardTagHelper : AbpTagHelper<AbpCardTagHelper, AbpCardTagHelperService>
+{
+    public AbpCardBorderColorType Border { get; set; } = AbpCardBorderColorType.Default;
+    public bool AddMarginBottomClass { get; set; } = true;
+}
+```
+
+```html
+<abp-card border="Primary">
+    <abp-card-header><abp-card-title>Books</abp-card-title></abp-card-header>
+    <abp-card-body>
+        @* ... *@
+    </abp-card-body>
+    <abp-card-footer>
+        <abp-button button-type="Primary" text="New" />
+    </abp-card-footer>
+</abp-card>
+```
+
+### Input
+
+```csharp
+public class AbpInputTagHelper : AbpTagHelper<AbpInputTagHelper, AbpInputTagHelperService>
+{
+    public ModelExpression AspFor { get; set; } = default!;
+    public string? Label { get; set; }
+    public string? LabelTooltip { get; set; }
+    [HtmlAttributeName("info")]      public string? InfoText { get; set; }
+    [HtmlAttributeName("disabled")]  public bool IsDisabled { get; set; }
+    [HtmlAttributeName("readonly")]  public bool? IsReadonly { get; set; }
+    public bool AutoFocus { get; set; }
+    [HtmlAttributeName("type")]      public string? InputTypeName { get; set; }
+    public AbpFormControlSize Size { get; set; } = AbpFormControlSize.Default;
+    [HtmlAttributeName("required-symbol")] public bool DisplayRequiredSymbol { get; set; } = true;
+    [HtmlAttributeName("asp-format")]      public string? Format { get; set; }
+    public string? Name { get; set; }
+    public string? Value { get; set; }
+    public bool SuppressLabel { get; set; }
+    [HtmlAttributeName("floating-label")]  public bool FloatingLabel { get; set; }
+    public CheckBoxHiddenInputRenderMode? CheckBoxHiddenInputRenderMode { get; set; }
+    [HtmlAttributeName("use-switch-checkbox")] public bool UseSwitchCheckBox { get; set; }
+    public bool AddMarginBottomClass { get; set; } = true;
+}
+```
+
+```html
+<abp-input asp-for="Title" auto-focus="true" />
+<abp-input asp-for="PublishDate" type="date" />
+<abp-input asp-for="IsPublished" use-switch-checkbox="true" />
+<abp-input asp-for="Email" floating-label="true" info="Used for password recovery." />
+```
+
+`AbpInputTagHelperService` inspects the bound `ModelExpression` to drive the rendered `<input type="...">`, the validation attributes, the floating-label markup, and the label text (pulled from `DisplayAttribute` / `DisplayName` / the resource).
+
+### Modal
+
+```csharp
+public class AbpModalTagHelper : AbpTagHelper<AbpModalTagHelper, AbpModalTagHelperService>
+{
+    public AbpModalSize Size { get; set; } = AbpModalSize.Default;
+    public bool? Centered { get; set; } = false;
+    public bool? Scrollable { get; set; } = false;
+    public bool? Static { get; set; } = false;
+}
+```
+
+```html
+<abp-modal size="Large" centered="true">
+    <abp-modal-header title="Edit Book" />
+    <abp-modal-body>
+        <form>
+            <abp-input asp-for="Title" />
+            <abp-input asp-for="Price" />
+        </form>
+    </abp-modal-body>
+    <abp-modal-footer buttons="Save,Cancel" />
+</abp-modal>
+```
+
+### Table, Tabs, Nav, Dropdown
+
+The other folders follow the same pattern:
+
+- `Table/` — `<abp-table>` plus header-scope helpers (`AbpTableHeadScopeTagHelper`) that handle `scope="col"` / `scope="row"` accessibility.
+- `Tab/` — `<abp-tabs>` wraps `<abp-tab>` and `<abp-tab-link>` children. Supports `<abp-tab-dropdown>` for nested menus.
+- `Nav/` — building blocks for the top navbar (`AbpNavbarBrandTagHelper`, `AbpNavLinkTagHelper`).
+- `Dropdown/` — split buttons, header items, dividers, sub-items.
+
+### Table
+
+```html
+<abp-table striped-rows="true" hoverable-rows="true">
+    <thead>
+        <tr>
+            <abp-table-header-scope>Title</abp-table-header-scope>
+            <abp-table-header-scope>Author</abp-table-header-scope>
+            <abp-table-header-scope>Price</abp-table-header-scope>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var book in Model.Books)
+        {
+            <tr>
+                <td>@book.Title</td>
+                <td>@book.Author</td>
+                <td>@book.Price.ToString("C")</td>
+            </tr>
+        }
+    </tbody>
+</abp-table>
+```
+
+`AbpTableHeadScopeTagHelper` renders `<th scope="col">` / `<th scope="row">` automatically — a small accessibility win you get for free across every ABP module's admin UI.
+
+### Tabs and nav
+
+```html
+<abp-tabs tab-style="Tabs">
+    <abp-tab title="Details" active="true">
+        @* tab content *@
+    </abp-tab>
+    <abp-tab title="Permissions">
+        @* tab content *@
+    </abp-tab>
+    <abp-tab-dropdown title="More">
+        <abp-tab title="History">@* ... *@</abp-tab>
+        <abp-tab title="Audit Log">@* ... *@</abp-tab>
+    </abp-tab-dropdown>
+</abp-tabs>
+
+<abp-nav nav-style="Pills">
+    <abp-nav-link href="/" text="Home" active="true" />
+    <abp-nav-link href="/about" text="About" />
+</abp-nav>
+```
+
+### Dropdown
+
+```html
+<abp-dropdown>
+    <abp-dropdown-button button-type="Primary" text="Actions" />
+    <abp-dropdown-menu>
+        <abp-dropdown-header text="Records" />
+        <abp-dropdown-item href="/new" text="New" />
+        <abp-dropdown-item href="/import" text="Import" />
+        <abp-dropdown-divider />
+        <abp-dropdown-item href="/delete-all" text="Delete all" />
+    </abp-dropdown-menu>
+</abp-dropdown>
+```
+
+The dropdown helpers also support split buttons (`<abp-dropdown-button>` with `split="true"`) and nested sub-menus (`<abp-dropdown-sub-menu>`).
+
+### Pagination, badges, alerts, breadcrumbs
+
+```html
+<abp-pagination model="@Model.PagerModel" />
+
+<abp-badge background-color="Success">@count</abp-badge>
+
+<abp-alert alert-type="Warning" dismissible="true">
+    <abp-alert-header>Heads up</abp-alert-header>
+    Your free trial ends in 3 days.
+</abp-alert>
+
+<abp-breadcrumb>
+    <abp-breadcrumb-item href="/" title="Home" />
+    <abp-breadcrumb-item href="/books" title="Books" />
+    <abp-breadcrumb-item title="@Model.Book.Title" active="true" />
+</abp-breadcrumb>
+```
+
+## How themes use it
+
+Every theme's layout is a composition of these tag helpers. Look at [`modules/basic-theme`](/ui/basic-theme) `Themes/Basic/Layouts/Application.cshtml`, the main navbar component, or `Themes/Basic/Components/Toolbar/UserMenu/*.cshtml` — they are entirely written in `<abp-nav-*>`, `<abp-dropdown-*>`, and `<abp-button>` markup.
+
+The same is true of every ABP module's admin UI (Identity, Tenant Management, OpenIddict, Feature Management, CMS Kit, …): the entire CRUD UI is `<abp-card>` + `<abp-table>` + `<abp-modal>` + `<abp-input>`.
+
+## Cross-references
+
+- The shared theme that ships these tag helpers and the global bundles: [/ui/theme-shared](/ui/theme-shared).
+- The basic theme that consumes them in its `~/Themes/Basic/Layouts/Application.cshtml`: [/ui/basic-theme](/ui/basic-theme).
+- The bundling/minification pipeline that delivers `bootstrap.css` / `bootstrap.bundle.js`: [/ui/minify-and-bundling](/ui/minify-and-bundling), [/aspnetcore/mvc-ui-bundling](/aspnetcore/mvc-ui-bundling).
+- The `libs/` mechanism that installs Bootstrap to `wwwroot`: [/aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages).
+- The Blazor counterpart (which has its own component library): [/blazor/theming](/blazor/theming).

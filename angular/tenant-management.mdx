@@ -1,0 +1,325 @@
+---
+title: "@abp/ng.tenant-management"
+description: "Tenant CRUD, connection-string editor and per-tenant feature management — built on the extensible CRUD primitives."
+---
+
+`@abp/ng.tenant-management` (source: `npm/ng-packs/packages/tenant-management/`) ships the **/tenant-management/tenants** page of every multi‑tenant ABP application: list, search, create, edit, delete and assign features and connection strings to tenants.
+
+```text
+npm/ng-packs/packages/tenant-management/src/lib/
+├── components/
+│   ├── tenants/tenants.component.{ts,html}
+│   └── index.ts
+├── defaults/                        default props/actions/toolbar actions/form props
+├── enums/                           eTenantManagementComponents
+├── guards/
+├── models/                          TenantManagementConfigOptions
+├── resolvers/                       tenantManagementExtensionsResolver
+├── tokens/                          TENANT_MANAGEMENT_ENTITY_*_CONTRIBUTORS
+├── tenant-management-routing.module.ts
+├── tenant-management.routes.ts
+└── tenant-management.module.ts
+```
+
+Generated proxies (`TenantService`, `TenantDto`, `GetTenantsInput`, …) live in the secondary entry point `@abp/ng.tenant-management/proxy` and target ABP's `TenantAppService`.
+
+## Route definition
+
+```ts tenant-management/src/lib/tenant-management.routes.ts
+export const createRoutes = (options: TenantManagementConfigOptions = {}): Routes => [
+  {
+    path: '',
+    component: RouterOutletComponent,
+    canActivate: [authGuard, permissionGuard],
+    resolve: [tenantManagementExtensionsResolver],
+    providers: provideTenantManagement(options),
+    children: [
+      { path: '', redirectTo: 'tenants', pathMatch: 'full' },
+      {
+        path: 'tenants',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpTenantManagement.Tenants',
+          replaceableComponent: {
+            key: eTenantManagementComponents.Tenants,
+            defaultComponent: TenantsComponent,
+          } as ReplaceableComponents.RouteData<TenantsComponent>,
+        },
+        title: 'AbpTenantManagement::Tenants',
+      },
+    ],
+  },
+];
+```
+
+Mount it in your app routes:
+
+```ts app.routes.ts
+{
+  path: 'tenant-management',
+  loadChildren: () =>
+    import('@abp/ng.tenant-management').then(m => m.createRoutes()),
+}
+```
+
+The `permissionGuard` ensures the route only activates if the user has `AbpTenantManagement.Tenants`. The same policy keys the side menu entry and the toolbar create button — keeping authorization consistent across UI surfaces.
+
+## `provideTenantManagement(options)`
+
+```ts tenant-management.routes.ts
+export function provideTenantManagement(options: TenantManagementConfigOptions = {}) {
+  return [
+    { provide: TENANT_MANAGEMENT_ENTITY_ACTION_CONTRIBUTORS,
+      useValue: options.entityActionContributors },
+    { provide: TENANT_MANAGEMENT_TOOLBAR_ACTION_CONTRIBUTORS,
+      useValue: options.toolbarActionContributors },
+    { provide: TENANT_MANAGEMENT_ENTITY_PROP_CONTRIBUTORS,
+      useValue: options.entityPropContributors },
+    { provide: TENANT_MANAGEMENT_CREATE_FORM_PROP_CONTRIBUTORS,
+      useValue: options.createFormPropContributors },
+    { provide: TENANT_MANAGEMENT_EDIT_FORM_PROP_CONTRIBUTORS,
+      useValue: options.editFormPropContributors },
+  ];
+}
+```
+
+All five token names mirror the identity module — see [`/angular/identity`](/angular/identity) for the contributor pattern.
+
+## `TenantsComponent`
+
+```ts tenant-management/src/lib/components/tenants/tenants.component.ts
+import {
+  ListService, LocalizationPipe, PagedResultDto, ReplaceableTemplateDirective,
+} from '@abp/ng.core';
+import {
+  eFeatureManagementComponents, FeatureManagementComponent,
+} from '@abp/ng.feature-management';
+import { GetTenantsInput, TenantDto, TenantService } from '@abp/ng.tenant-management/proxy';
+import {
+  ButtonComponent, Confirmation, ConfirmationService,
+  ModalCloseDirective, ModalComponent, ToasterService,
+} from '@abp/ng.theme.shared';
+import {
+  ExtensibleFormComponent, ExtensibleTableComponent, EXTENSIONS_IDENTIFIER,
+  FormPropData, generateFormFromProps,
+} from '@abp/ng.components/extensible';
+import { PageComponent } from '@abp/ng.components/page';
+```
+
+The component is the most "demo‑complete" of the management modules: it shows extensibility, feature management integration, permission management integration and a custom connection‑strings editor in a single screen.
+
+### Default entity actions
+
+Defined in `defaults/`:
+
+- **Edit** — opens the tenant edit modal (`AbpTenantManagement.Tenants.Update`).
+- **Manage Connection Strings** — opens a modal that posts to `TenantAppService.getDefaultConnectionString` / `updateDefaultConnectionString` / `deleteDefaultConnectionString` / `getApiConnectionStrings` / `updateConnectionString` / `deleteConnectionString`. The matching backend permission is `AbpTenantManagement.Tenants.ManageConnectionStrings`.
+- **Manage Features** — opens `FeatureManagementComponent` (`providerName='T'`, `providerKey=tenant.id`). Required policy `AbpTenantManagement.Tenants.ManageFeatures`.
+- **Manage Host Features** — opens the feature modal with `providerName='D'` (default provider).
+- **Delete** — opens the confirmation dialog and calls `TenantService.delete(id)`.
+
+You can append a "Switch to tenant" action through `entityActionContributors`:
+
+```ts
+import { EntityAction } from '@abp/ng.components/extensible';
+import { eTenantManagementComponents, TenantManagementConfigOptions } from '@abp/ng.tenant-management';
+import { TenantDto } from '@abp/ng.tenant-management/proxy';
+
+export const tenantConfig: TenantManagementConfigOptions = {
+  entityActionContributors: {
+    [eTenantManagementComponents.Tenants]: [
+      list => list.addTail(new EntityAction<TenantDto>({
+        text: 'MyProject::SwitchToTenant',
+        action: data => switchTenant(data.record.id),
+        visible: data => data.record.isActive,
+        permission: 'AbpTenantManagement.Tenants.Update',
+      })),
+    ],
+  },
+};
+```
+
+### Connection strings editor
+
+Tenant management is the only place in ABP where editing a per‑tenant connection string is exposed in the UI. The connection strings modal:
+
+1. Calls `TenantService.getDefaultConnectionString(id)` for the default connection.
+2. Calls `TenantService.getApiConnectionStrings(id)` to list module‑specific connection strings (e.g. one per audit log / identity / blob store database).
+3. Submits changes through `updateDefaultConnectionString`, `updateConnectionString`, `deleteDefaultConnectionString` or `deleteConnectionString`.
+
+The backend persists them via `ITenantStore` and `IConnectionStringResolver`. See [Connection Strings](/data/connection-strings) for the .NET concept and how the override resolution chain works.
+
+### Feature management hook‑up
+
+```ts tenants.component.ts
+import {
+  eFeatureManagementComponents, FeatureManagementComponent,
+} from '@abp/ng.feature-management';
+
+isFeatureManagementVisible = false;
+providerKey: string;
+providerTitle: string;
+
+manageFeatures(tenant: TenantDto) {
+  this.providerKey = tenant.id;
+  this.providerTitle = tenant.name;
+  this.isFeatureManagementVisible = true;
+}
+```
+
+```html
+<abp-feature-management
+  *abpReplaceableTemplate="{
+    inputs: { providerName: 'T', providerKey, providerTitle },
+    outputs: { visibleChange: onFeatureManagementClosed.bind(this) },
+    componentKey: eFeatureManagementComponents.FeatureManagement
+  }"
+  [(visible)]="isFeatureManagementVisible"
+  [providerName]="'T'"
+  [providerKey]="providerKey"
+  [providerTitle]="providerTitle">
+</abp-feature-management>
+```
+
+The `*abpReplaceableTemplate` directive lets applications swap the modal for a custom one through `ReplaceableComponentsService` while still passing the same inputs and outputs.
+
+## Extension props
+
+The default editor exposes the tenant's `name` and `adminEmailAddress` + `adminPassword` (on create). Applications usually append organisation‑specific props through `createFormPropContributors` / `editFormPropContributors`. Example:
+
+```ts
+import { ePropType, FormProp } from '@abp/ng.components/extensible';
+import { TenantCreateDto } from '@abp/ng.tenant-management/proxy';
+
+export const tenantConfig: TenantManagementConfigOptions = {
+  createFormPropContributors: {
+    [eTenantManagementComponents.Tenants]: [
+      list => list.addTail(new FormProp<TenantCreateDto>({
+        type: ePropType.String,
+        name: 'salesContact',
+        displayName: 'MyProject::SalesContact',
+      })),
+    ],
+  },
+};
+```
+
+## Side‑menu registration
+
+Tenant management does not auto‑register a side‑menu entry. Applications declare it explicitly through `RoutesService` so the menu order is under their control:
+
+```ts
+this.routes.add([
+  {
+    name: 'AbpTenantManagement::Menu:TenantManagement',
+    iconClass: 'fas fa-users',
+    path: '/tenant-management',
+    parentName: 'AbpUiNavigation::Menu:Administration',
+    requiredPolicy: 'AbpTenantManagement.Tenants',
+    order: 1,
+  },
+  {
+    name: 'AbpTenantManagement::Tenants',
+    parentName: 'AbpTenantManagement::Menu:TenantManagement',
+    path: '/tenant-management/tenants',
+    requiredPolicy: 'AbpTenantManagement.Tenants',
+  },
+]);
+```
+
+## `TenantService` proxy
+
+Generated under `@abp/ng.tenant-management/proxy`:
+
+```ts tenant-management/proxy/.../tenant.service.ts (generated)
+@Injectable({ providedIn: 'root' })
+export class TenantService {
+  apiName = 'AbpTenantManagement';
+  protected restService = inject(RestService);
+
+  get = (id, config?) => this.restService.request<void, TenantDto>(
+    { method: 'GET', url: `/api/multi-tenancy/tenants/${id}` },
+    { apiName: this.apiName, ...config });
+
+  getList = (input, config?) => this.restService.request<void, PagedResultDto<TenantDto>>(
+    { method: 'GET', url: '/api/multi-tenancy/tenants', params: input as any },
+    { apiName: this.apiName, ...config });
+
+  create = (input, config?) => this.restService.request<TenantCreateDto, TenantDto>(
+    { method: 'POST', url: '/api/multi-tenancy/tenants', body: input },
+    { apiName: this.apiName, ...config });
+
+  update = (id, input, config?) => this.restService.request<TenantUpdateDto, TenantDto>(
+    { method: 'PUT', url: `/api/multi-tenancy/tenants/${id}`, body: input },
+    { apiName: this.apiName, ...config });
+
+  delete = (id, config?) => this.restService.request<void, void>(
+    { method: 'DELETE', url: `/api/multi-tenancy/tenants/${id}` },
+    { apiName: this.apiName, ...config });
+
+  getDefaultConnectionString = (id, config?) =>
+    this.restService.request<void, string>(
+      { method: 'GET', url: `/api/multi-tenancy/tenants/${id}/default-connection-string` },
+      { apiName: this.apiName, ...config });
+
+  updateDefaultConnectionString = (id, defaultConnectionString, config?) =>
+    this.restService.request<void, void>(
+      {
+        method: 'PUT',
+        url: `/api/multi-tenancy/tenants/${id}/default-connection-string`,
+        params: { defaultConnectionString },
+      },
+      { apiName: this.apiName, ...config });
+
+  deleteDefaultConnectionString = (id, config?) =>
+    this.restService.request<void, void>(
+      { method: 'DELETE', url: `/api/multi-tenancy/tenants/${id}/default-connection-string` },
+      { apiName: this.apiName, ...config });
+}
+```
+
+`apiName = 'AbpTenantManagement'` lets you point requests at a different host than the application (typical in microservice deployments where TenantManagement and Identity share an AuthServer host).
+
+## `eTenantManagementComponents`
+
+```ts tenant-management/src/lib/enums/components.ts
+export enum eTenantManagementComponents {
+  Tenants = 'TenantManagement.TenantsComponent',
+}
+```
+
+## `tenantManagementExtensionsResolver`
+
+```ts tenant-management/src/lib/resolvers/extensions.resolver.ts
+export const tenantManagementExtensionsResolver: ResolveFn<void> = () => {
+  const extensions = inject(ExtensionsService);
+  extensions.init({
+    [eTenantManagementComponents.Tenants]: {
+      entityActions: inject(TENANT_MANAGEMENT_ENTITY_ACTION_CONTRIBUTORS, { optional: true }) ?? [],
+      entityProps:   inject(TENANT_MANAGEMENT_ENTITY_PROP_CONTRIBUTORS,   { optional: true }) ?? [],
+      toolbarActions:inject(TENANT_MANAGEMENT_TOOLBAR_ACTION_CONTRIBUTORS,{ optional: true }) ?? [],
+      createFormProps: inject(TENANT_MANAGEMENT_CREATE_FORM_PROP_CONTRIBUTORS, { optional: true }) ?? [],
+      editFormProps:   inject(TENANT_MANAGEMENT_EDIT_FORM_PROP_CONTRIBUTORS,   { optional: true }) ?? [],
+    },
+  });
+};
+```
+
+Identical pattern to identity, account and any other extensible module.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.feature-management" href="/angular/feature-management" icon="toggle-on">
+    Provides the modal used by the "Manage Features" entity action.
+  </Card>
+  <Card title="@abp/ng.permission-management" href="/angular/permission-management" icon="shield-check">
+    Provides the modal used to assign tenant‑wide permissions (`providerName='T'`).
+  </Card>
+  <Card title="Connection Strings" href="/data/connection-strings" icon="database">
+    The backend concept — how ABP resolves per‑tenant connection strings.
+  </Card>
+  <Card title="@abp/ng.components" href="/angular/components" icon="grid-2">
+    `ExtensibleTableComponent`, `ExtensibleFormComponent` and `PageComponent` reused here.
+  </Card>
+</CardGroup>

@@ -1,0 +1,304 @@
+---
+title: "Dapper Integration: Sharing the EF Core Unit of Work"
+sidebarTitle: "Dapper"
+description: "Volo.Abp.Dapper exposes IDapperRepository<TDbContext> that borrows the EF Core DbConnection and DbTransaction, so raw SQL stays inside the same UoW."
+---
+
+`Volo.Abp.Dapper` is the framework's escape hatch for raw‑SQL queries when LINQ‑to‑Entities isn't a good fit (heavy reporting, complex grouping, vendor‑specific hints). Instead of opening its own connection pool, ABP's Dapper integration **borrows the existing EF Core DbContext's `DbConnection` and `DbTransaction`** — so Dapper writes participate in the same Unit of Work, the same connection string and the same transaction.
+
+Source: `framework/src/Volo.Abp.Dapper/`. The package is tiny — module, repository base, interface — because EF Core does the heavy lifting.
+
+## Package contents
+
+```
+framework/src/Volo.Abp.Dapper/
+└── Volo/Abp/
+    ├── Dapper/AbpDapperModule.cs
+    └── Domain/Repositories/Dapper/
+        ├── IDapperRepository.cs
+        └── DapperRepository.cs
+```
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Dapper/Volo/Abp/Dapper/AbpDapperModule.cs
+[DependsOn(
+    typeof(AbpDddDomainModule),
+    typeof(AbpEntityFrameworkCoreModule))]
+public class AbpDapperModule : AbpModule
+{
+}
+```
+
+Two `DependsOn` declarations only — the empty `ConfigureServices` is correct. There's nothing to register globally; consumers derive their own `IDapperRepository<TDbContext>`‑shaped classes.
+
+The crucial dependency is `AbpEntityFrameworkCoreModule`. Dapper here doesn't manage connections; it **rides** the EF Core integration's `IDbContextProvider<TDbContext>` to discover the active `DbConnection`.
+
+## The contract
+
+```csharp
+// framework/src/Volo.Abp.Dapper/Volo/Abp/Domain/Repositories/Dapper/IDapperRepository.cs
+public interface IDapperRepository
+{
+    [Obsolete("Use GetDbConnectionAsync method.")]
+    IDbConnection DbConnection { get; }
+
+    Task<IDbConnection> GetDbConnectionAsync();
+
+    [Obsolete("Use GetDbTransactionAsync method.")]
+    IDbTransaction? DbTransaction { get; }
+
+    Task<IDbTransaction?> GetDbTransactionAsync();
+}
+```
+
+Two members: the live `IDbConnection` and (optionally) the live `IDbTransaction`. Both are obtained from the EF Core `DbContext`, so they are exactly the connection/transaction your `EfCoreRepository` is also using.
+
+## The base implementation
+
+```csharp
+// framework/src/Volo.Abp.Dapper/Volo/Abp/Domain/Repositories/Dapper/DapperRepository.cs
+public class DapperRepository<TDbContext> : IDapperRepository, IUnitOfWorkEnabled
+    where TDbContext : IEfCoreDbContext
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    public IDataFilter        DataFilter        => LazyServiceProvider.LazyGetRequiredService<IDataFilter>();
+    public ICurrentTenant     CurrentTenant     => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    public IUnitOfWorkManager UnitOfWorkManager => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();
+
+    public ICancellationTokenProvider CancellationTokenProvider =>
+        LazyServiceProvider.LazyGetService<ICancellationTokenProvider>(NullCancellationTokenProvider.Instance);
+
+    private readonly IDbContextProvider<TDbContext> _dbContextProvider;
+
+    public DapperRepository(IDbContextProvider<TDbContext> dbContextProvider)
+    {
+        _dbContextProvider = dbContextProvider;
+    }
+
+    public virtual async Task<IDbConnection> GetDbConnectionAsync()
+        => (await _dbContextProvider.GetDbContextAsync()).Database.GetDbConnection();
+
+    public virtual async Task<IDbTransaction?> GetDbTransactionAsync()
+        => (await _dbContextProvider.GetDbContextAsync()).Database.CurrentTransaction?.GetDbTransaction();
+
+    protected virtual CancellationToken GetCancellationToken(CancellationToken preferredValue = default)
+        => CancellationTokenProvider.FallbackToProvider(preferredValue);
+}
+```
+
+Three things to notice:
+
+- **`IUnitOfWorkEnabled`** — every method of `DapperRepository<TDbContext>` opts into ABP's UoW interceptor pipeline. Call a Dapper method outside a UoW and you'll get the same `"A DbContext can only be created inside a unit of work!"` exception the EF Core path throws.
+- **`GetDbConnectionAsync`** delegates to `DbContext.Database.GetDbConnection()`. EF Core opens the connection lazily; ABP's `UnitOfWorkDbContextProvider` had already created the `DbContext` and bound it to the UoW (see [`/data/entityframeworkcore`](/data/entityframeworkcore)).
+- **`GetDbTransactionAsync`** returns the EF Core transaction's underlying `IDbTransaction` if one is active (`Database.CurrentTransaction?.GetDbTransaction()`). When the UoW is non‑transactional or the provider doesn't support transactions, this returns `null` — pass `null` to Dapper and writes apply without a transaction.
+
+## Writing a real Dapper repository
+
+```csharp
+public interface IReportingDapperRepository : IDapperRepository
+{
+    Task<IReadOnlyList<BookSalesRow>> GetBookSalesAsync(DateTime from, DateTime to);
+}
+
+public class ReportingDapperRepository :
+    DapperRepository<MyAppDbContext>,
+    IReportingDapperRepository,
+    ITransientDependency
+{
+    public async Task<IReadOnlyList<BookSalesRow>> GetBookSalesAsync(DateTime from, DateTime to)
+    {
+        var conn = await GetDbConnectionAsync();
+        var tx   = await GetDbTransactionAsync();
+
+        const string sql = @"
+            SELECT b.Name AS BookName, COUNT(s.Id) AS Sold, SUM(s.Price) AS Revenue
+            FROM   Books b
+            JOIN   Sales s ON s.BookId = b.Id
+            WHERE  s.CreationTime BETWEEN @from AND @to
+            AND    b.IsDeleted = 0
+            GROUP BY b.Name
+            ORDER BY Revenue DESC;";
+
+        var rows = await conn.QueryAsync<BookSalesRow>(
+            new CommandDefinition(
+                sql,
+                new { from, to },
+                transaction: tx,                            // <-- shares the UoW transaction!
+                cancellationToken: GetCancellationToken()
+            ));
+
+        return rows.AsList();
+    }
+}
+```
+
+<Tip>
+Always pass `tx` to Dapper's `CommandDefinition`. If you skip it, your SQL runs outside the EF Core transaction — meaning a subsequent UoW rollback won't undo your Dapper writes, and reads see uncommitted rows from other UoWs in the same connection. Both are dangerous.
+</Tip>
+
+The application service stays normal — no special UoW wiring:
+
+```csharp
+public class ReportingAppService : ApplicationService, IReportingAppService
+{
+    private readonly IReportingDapperRepository _reports;
+
+    public ReportingAppService(IReportingDapperRepository reports) { _reports = reports; }
+
+    public Task<IReadOnlyList<BookSalesRow>> GetBookSalesAsync(BookSalesInput input)
+        => _reports.GetBookSalesAsync(input.From, input.To);
+}
+```
+
+The MVC `AbpUnitOfWorkMiddleware` (see [`/data/unit-of-work`](/data/unit-of-work)) reserves a UoW; `[UnitOfWork]` activates it; the Dapper call runs against the same connection that the EF Core `BookRepository` uses; everything commits together.
+
+## Soft delete and data filters
+
+The Dapper repository inherits `IDataFilter` (lazily resolved), `ICurrentTenant`, and `IUnitOfWorkManager`. That's the framework's way of saying "you can opt in, but it's your SQL". `ApplyDataFilters` is **not** automatic for Dapper queries — you wrote the SQL, you decide whether to add `AND IsDeleted = 0`.
+
+The recommended pattern: read the current state and inject it as a parameter.
+
+```csharp
+var includeDeleted = !DataFilter.IsEnabled<ISoftDelete>();
+var sql = @"
+    SELECT *
+    FROM   Books
+    WHERE  AuthorId = @authorId
+    AND   (@includeDeleted = 1 OR IsDeleted = 0)";
+
+return await conn.QueryAsync<Book>(sql, new { authorId, includeDeleted = includeDeleted ? 1 : 0 });
+```
+
+Same story for tenancy:
+
+```csharp
+var tenantId = CurrentTenant.Id;     // null for host
+var sql = @"
+    SELECT *
+    FROM   Books
+    WHERE  (@tenantId IS NULL AND TenantId IS NULL)
+        OR ( TenantId = @tenantId );";
+```
+
+## What about Dapper-only databases?
+
+The base class is hard‑bound to `IEfCoreDbContext`. If you want Dapper against a **separate** database where you have no EF Core model, you have two options:
+
+<AccordionGroup>
+  <Accordion title="Create an empty AbpDbContext for connection routing">
+    Define a `ReportingDbContext : AbpDbContext<ReportingDbContext>` with **no entities**. Annotate it `[ConnectionStringName("Reporting")]`. EF Core will only open the connection (no model migrations). Your Dapper repository inherits from `DapperRepository<ReportingDbContext>`. This way you still get UoW participation and `[ConnectionStringName]` resolution.
+  </Accordion>
+  <Accordion title="Skip ABP's wrapper">
+    Inject `IConnectionStringResolver` and `IUnitOfWorkManager` directly, open your own `SqlConnection`, manage the transaction yourself. You lose UoW integration but you have full control. Only do this for truly isolated reporting databases.
+  </Accordion>
+</AccordionGroup>
+
+## Caveats and tips
+
+<AccordionGroup>
+  <Accordion title="Don't open a new connection">
+    `new SqlConnection(...)` inside an ABP app sidesteps the UoW. Always go through `GetDbConnectionAsync`.
+  </Accordion>
+  <Accordion title="Mind the EF Core connection lifecycle">
+    EF Core opens the connection on demand and may close it after a query. `GetDbConnectionAsync()` returns the same object every time within the UoW, but the connection state can flip from Open to Closed between calls. Dapper handles this — it opens if closed — but be aware when debugging connection state.
+  </Accordion>
+  <Accordion title="Cancellation tokens">
+    Use `GetCancellationToken()` to pick up the ambient `ICancellationTokenProvider` token. Passing `CancellationToken.None` to long‑running Dapper queries breaks request cancellation.
+  </Accordion>
+  <Accordion title="Don't bypass the [ConnectionStringName]">
+    The connection string is resolved by the EF Core provider chain; `DapperRepository<TDbContext>` doesn't talk to `IConnectionStringResolver` directly. Putting `[ConnectionStringName("Audit")]` on `AuditDbContext` is what routes Dapper to the audit DB.
+  </Accordion>
+</AccordionGroup>
+
+## End-to-end example: report inside a transactional UoW
+
+Imagine an app service that takes a snapshot row in a Dapper query and then writes a derived value through the EF Core repository — both must commit together.
+
+```csharp
+public class SalesSnapshotAppService : ApplicationService, ISalesSnapshotAppService
+{
+    private readonly IReportingDapperRepository _reports;
+    private readonly IRepository<SalesSnapshot, Guid> _snapshots;
+
+    public SalesSnapshotAppService(
+        IReportingDapperRepository reports,
+        IRepository<SalesSnapshot, Guid> snapshots)
+    {
+        _reports   = reports;
+        _snapshots = snapshots;
+    }
+
+    [UnitOfWork(isTransactional: true, IsolationLevel.Serializable)]
+    public virtual async Task<Guid> TakeSnapshotAsync(DateTime from, DateTime to)
+    {
+        var rows = await _reports.GetBookSalesAsync(from, to);     // Dapper read inside the txn
+
+        var snapshot = new SalesSnapshot(GuidGenerator.Create(), from, to)
+        {
+            BookCount = rows.Count,
+            Revenue   = rows.Sum(r => r.Revenue),
+        };
+
+        await _snapshots.InsertAsync(snapshot);                    // EF Core write inside the txn
+        return snapshot.Id;
+    }
+}
+```
+
+Both calls go through the *same* `DbConnection` because `DapperRepository<MyAppDbContext>` and `EfCoreRepository<MyAppDbContext, SalesSnapshot>` resolve the same `IDbContextProvider<MyAppDbContext>` from the ambient UoW. The `[UnitOfWork(isTransactional: true)]` attribute promotes the UoW to `SERIALIZABLE`; the Dapper SELECT sees a snapshot consistent with the eventual INSERT.
+
+## Comparison with raw EF Core
+
+When should you reach for Dapper vs `IRepository<T>.GetQueryableAsync()`?
+
+<AccordionGroup>
+  <Accordion title="Use IRepository / EF Core LINQ when...">
+    - Querying the domain model (`IQueryable<Book>` projections).
+    - Writes: Dapper bypasses change tracking, events, and audit. Use the repository.
+    - Cross‑provider portability matters.
+  </Accordion>
+  <Accordion title="Use Dapper when...">
+    - Heavy reports with `GROUP BY ROLLUP`, window functions, or CTEs that EF Core translates poorly.
+    - Vendor‑specific hints (`OPTION (RECOMPILE)`, `WITH (NOLOCK)`, `MATERIALIZED CTE`).
+    - You already have hand‑tuned SQL from a DBA.
+  </Accordion>
+  <Accordion title="Mix both">
+    Common pattern: EF Core writes inside an `[UnitOfWork(true)]` boundary, Dapper reads for the response DTO. Both honor the same transaction; the EF Core write is visible to Dapper because both share the connection.
+  </Accordion>
+</AccordionGroup>
+
+## File index
+
+| File                                                             | Role                                          |
+| ---------------------------------------------------------------- | --------------------------------------------- |
+| `Volo/Abp/Dapper/AbpDapperModule.cs`                              | Module wiring (depends on EF Core module).    |
+| `Volo/Abp/Domain/Repositories/Dapper/IDapperRepository.cs`        | Public connection/transaction contract.       |
+| `Volo/Abp/Domain/Repositories/Dapper/DapperRepository.cs`         | Base implementation tied to `TDbContext`.     |
+
+Three files, no surprises. The module's emptiness is a feature: by inheriting `AbpEntityFrameworkCoreModule` the package promises "no parallel infrastructure — share the EF Core one".
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    Where `IDbContextProvider<TDbContext>` lives.
+  </Card>
+  <Card title="Unit of Work" icon="rotate" href="/data/unit-of-work">
+    The ambient boundary Dapper participates in.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    `[ConnectionStringName]` routing applies to Dapper too.
+  </Card>
+  <Card title="Data filtering" icon="filter" href="/data/data-filtering">
+    Why Dapper queries must apply filters manually.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The domain abstraction Dapper complements (not replaces).
+  </Card>
+  <Card title="UoW transaction flow" icon="diagram-project" href="/flows/unit-of-work-lifecycle">
+    End-to-end transaction story Dapper writes share.
+  </Card>
+</CardGroup>

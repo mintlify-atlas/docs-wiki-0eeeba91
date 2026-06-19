@@ -1,0 +1,340 @@
+---
+title: "Hangfire Module — Server, Options, Dashboard Filter"
+sidebarTitle: "Hangfire Module"
+description: "Volo.Abp.HangFire integrates Hangfire with Abp: BackgroundJobServer wiring, queue prefixing, AbpHangfireOptions, and a permission‑aware dashboard filter."
+---
+
+`Volo.Abp.HangFire` is the foundation module that both the [Hangfire jobs](/background/jobs-hangfire) and the [Hangfire workers](/background/workers-hangfire) packages depend on. It registers Hangfire's services with DI (`services.AddHangfire`), owns the singleton `AbpHangfireBackgroundJobServer` wrapper, exposes `AbpHangfireOptions` for queue and server configuration, and ships `AbpHangfireAuthorizationFilter` so the dashboard is gated by ABP authorization.
+
+You add this module directly when you want Hangfire's primitives (the `IGlobalConfiguration` pre‑configure pipeline, the dashboard) without committing to the Abp jobs or workers abstractions — for example, when migrating an existing Hangfire codebase onto ABP.
+
+<Info>
+Source: `framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/`. Depends on `AbpAuthorizationAbstractionsModule`. Brings `Hangfire.AspNetCore` in transitively.
+</Info>
+
+## AbpHangfireModule
+
+```csharp
+// framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/AbpHangfireModule.cs
+[DependsOn(typeof(AbpAuthorizationAbstractionsModule))]
+public class AbpHangfireModule : AbpModule
+{
+    private AbpHangfireBackgroundJobServer? _backgroundJobServer;
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var preActions = context.Services.GetPreConfigureActions<IGlobalConfiguration>();
+        context.Services.AddHangfire(configuration =>
+        {
+            preActions.Configure(configuration);
+        });
+
+        context.Services.AddSingleton(serviceProvider =>
+        {
+            var options = serviceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+            return new AbpHangfireBackgroundJobServer(options.BackgroundJobServerFactory.Invoke(serviceProvider));
+        });
+
+        context.Services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IPostConfigureOptions<AbpHangfireOptions>, AbpHangfireOptionsConfiguration>());
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        _backgroundJobServer = context.ServiceProvider.GetRequiredService<AbpHangfireBackgroundJobServer>();
+    }
+
+    public override void OnApplicationShutdown(ApplicationShutdownContext context)
+    {
+        if (_backgroundJobServer == null) return;
+
+        _backgroundJobServer.HangfireJobServer?.SendStop();
+        _backgroundJobServer.HangfireJobServer?.Dispose();
+    }
+}
+```
+
+Three things happen here:
+
+1. **Pre‑configure actions for `IGlobalConfiguration`** are collected and replayed inside `services.AddHangfire`. This is the ABP pattern that lets any depending module participate in Hangfire configuration:
+
+   ```csharp
+   PreConfigure<IGlobalConfiguration>(config =>
+   {
+       config.UseSqlServerStorage(connString);
+       config.UseFilter(new AutomaticRetryAttribute { Attempts = 5 });
+   });
+   ```
+
+2. **`AbpHangfireBackgroundJobServer` is registered as a singleton** with a factory that calls `options.BackgroundJobServerFactory.Invoke(serviceProvider)`. Resolving it is what *actually starts* the Hangfire server. `OnApplicationInitialization` resolves it eagerly so the server is running before requests are served.
+
+3. **`AbpHangfireOptionsConfiguration`** is added as a post‑configure step. It is responsible for the queue‑prefixing rules (see below).
+
+## AbpHangfireOptions
+
+```csharp
+// AbpHangfireOptions.cs
+public class AbpHangfireOptions
+{
+    /// <summary>
+    /// This value is used to add prefix to all of the queues. Default is empty.
+    /// </summary>
+    public string DefaultQueuePrefix { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Hangfire queue name max length, default is 50.
+    /// </summary>
+    public int MaxQueueNameLength { get; set; } = 50;
+
+    public string DefaultQueue { get; set; } = EnqueuedState.DefaultQueue;
+
+    public BackgroundJobServerOptions? ServerOptions { get; set; }
+    public IEnumerable<IBackgroundProcess>? AdditionalProcesses { get; set; }
+    public JobStorage? Storage { get; set; }
+
+    [NotNull]
+    public Func<IServiceProvider, BackgroundJobServer?> BackgroundJobServerFactory { get; set; }
+
+    public AbpHangfireOptions()
+    {
+        _backgroundJobServerFactory = CreateJobServer;
+    }
+
+    private BackgroundJobServer CreateJobServer(IServiceProvider serviceProvider)
+    {
+        Storage = Storage ?? serviceProvider.GetRequiredService<JobStorage>();
+        ServerOptions = ServerOptions ??
+                        serviceProvider.GetService<BackgroundJobServerOptions>() ??
+                        new BackgroundJobServerOptions();
+        AdditionalProcesses = AdditionalProcesses ?? serviceProvider.GetServices<IBackgroundProcess>();
+
+        return new BackgroundJobServer(
+            ServerOptions,
+            Storage,
+            AdditionalProcesses,
+            ServerOptions.FilterProvider ?? serviceProvider.GetRequiredService<IJobFilterProvider>(),
+            ServerOptions.Activator ?? serviceProvider.GetRequiredService<JobActivator>(),
+            serviceProvider.GetService<IBackgroundJobFactory>(),
+            serviceProvider.GetService<IBackgroundJobPerformer>(),
+            serviceProvider.GetService<IBackgroundJobStateChanger>()
+        );
+    }
+}
+```
+
+Highlights:
+
+- `BackgroundJobServerFactory` is the *kill switch*. The jobs‑Hangfire and workers‑Hangfire modules replace it with `_ => null` when their respective features are disabled, so resolving `AbpHangfireBackgroundJobServer` produces a wrapper around `null` — no server is started on this host, but Hangfire's *client* APIs (`BackgroundJob.Enqueue`, `RecurringJob.AddOrUpdate`) still work, because they only need `JobStorage`.
+- `DefaultQueuePrefix` lets multiple ABP applications share one Hangfire database without queue collisions. The prefix is normalized to lowercase, with dots converted to underscores, by `AbpHangfireOptionsConfiguration`.
+
+## Queue prefixing — AbpHangfireOptionsConfiguration
+
+```csharp
+// AbpHangfireOptionsConfiguration.cs
+public class AbpHangfireOptionsConfiguration : IPostConfigureOptions<AbpHangfireOptions>
+{
+    public void PostConfigure(string? name, AbpHangfireOptions options)
+    {
+        if (options.DefaultQueuePrefix.IsNullOrWhiteSpace()) return;
+
+        // The Queue name argument must consist of lowercase letters, digits,
+        // underscore, and dash characters only.
+        var queuesPrefix = Regex.Replace(
+            options.DefaultQueuePrefix.ToLower().Replace(".", "_"),
+            "[^a-z0-9_-]",
+            "");
+        if (queuesPrefix.IsNullOrWhiteSpace())
+        {
+            throw new AbpException(
+                $"The QueuesPrefix({options.DefaultQueuePrefix}) is not valid, " +
+                "it must consist of lowercase letters, digits, underscore, " +
+                "and dash characters only.");
+        }
+
+        options.DefaultQueuePrefix = queuesPrefix.EnsureEndsWith('_');
+
+        if (options.ServerOptions == null)
+        {
+            var queue = $"{options.DefaultQueuePrefix}{EnqueuedState.DefaultQueue}";
+            if (queue.Length > options.MaxQueueNameLength)
+            {
+                throw new AbpException(
+                    $"The maximum length of the Hangfire queue name({queue}) is " +
+                    $"{options.MaxQueueNameLength}, Please configure the " +
+                    "AbpHangfireOptions.DefaultQueuePrefix manually.");
+            }
+            options.ServerOptions = new BackgroundJobServerOptions { Queues = new[] { queue } };
+            options.DefaultQueue = queue;
+        }
+        else
+        {
+            var queues = options.ServerOptions.Queues;
+            for (var i = 0; i < queues.Length; i++)
+            {
+                var queue = $"{options.DefaultQueuePrefix}{queues[i]}";
+                if (queue.Length > options.MaxQueueNameLength)
+                {
+                    throw new AbpException(
+                        $"The maximum length of the Hangfire queue name({queue}) is " +
+                        $"{options.MaxQueueNameLength}, Please configure the " +
+                        "AbpHangfireOptions.DefaultQueuePrefix manually.");
+                }
+                queues[i] = queue;
+            }
+            var defaultQueue = queues.FirstOrDefault(q => q.EndsWith(EnqueuedState.DefaultQueue));
+            if (defaultQueue.IsNullOrWhiteSpace())
+            {
+                defaultQueue = queues.FirstOrDefault();
+                if (defaultQueue.IsNullOrWhiteSpace())
+                {
+                    throw new AbpException("There is no queue defined in the Hangfire configuration!");
+                }
+            }
+            options.DefaultQueue = defaultQueue;
+        }
+    }
+}
+```
+
+What this implements:
+
+- A prefix like `"MyApp."` becomes `"myapp_"`. Hangfire's queue regex is restrictive (lowercase alphanumerics, underscore, dash), and this normalization makes a friendly app name work.
+- Either *no* explicit `ServerOptions` (build one with `["myapp_default"]`) or *given* `ServerOptions` (rewrite every queue to be prefixed).
+- A hard cap of `MaxQueueNameLength` (default 50) — exceeded names throw at startup with a clear message.
+
+### Why this matters
+
+Without prefixing, two apps sharing one Hangfire SQL database see each other's jobs in the dashboard, race for the same queue names, and may dequeue jobs they cannot deserialize. `DefaultQueuePrefix` is the single setting that fixes all of that:
+
+```csharp
+Configure<AbpHangfireOptions>(options =>
+{
+    options.DefaultQueuePrefix = "myapp.";
+});
+```
+
+After post‑configuration, the effective default queue is `"myapp_default"`, jobs from `[Queue("reports")]` land on `"myapp_reports"`, and the server only watches queues starting with `"myapp_"`.
+
+## AbpHangfireBackgroundJobServer
+
+```csharp
+// AbpHangfireBackgroundJobServer.cs
+public class AbpHangfireBackgroundJobServer
+{
+    public BackgroundJobServer? HangfireJobServer { get; }
+
+    public AbpHangfireBackgroundJobServer(BackgroundJobServer? hangfireJobServer)
+    {
+        HangfireJobServer = hangfireJobServer;
+    }
+}
+```
+
+A trivial wrapper, but with a purpose: `BackgroundJobServer` is non‑nullable by Hangfire's design. ABP needs a *singleton* that may legitimately be `null` (for producer‑only hosts), and `IServiceProvider.GetRequiredService<AbpHangfireBackgroundJobServer>()` is the indirection that achieves it.
+
+The module's `OnApplicationShutdown` calls `SendStop` followed by `Dispose` on the inner server, which is Hangfire's graceful shutdown sequence.
+
+## Dashboard authorization
+
+```csharp
+// AbpHangfireAuthorizationFilter.cs
+public class AbpHangfireAuthorizationFilter : IDashboardAsyncAuthorizationFilter
+{
+    private readonly bool _enableTenant;
+    private readonly AuthorizationPolicyBuilder _policyBuilder;
+
+    public virtual AuthorizationPolicyBuilder PolicyBuilder => _policyBuilder;
+
+    public AbpHangfireAuthorizationFilter(
+        bool enableTenant = false,
+        string? requiredPermissionName = null,
+        params string[]? requiredRoleNames)
+    {
+        _enableTenant = enableTenant;
+        _policyBuilder = new AuthorizationPolicyBuilder().RequireAuthenticatedUser();
+
+        if (!requiredPermissionName.IsNullOrWhiteSpace())
+        {
+            _policyBuilder.Requirements.Add(new PermissionRequirement(requiredPermissionName));
+        }
+
+        if (!requiredRoleNames.IsNullOrEmpty())
+        {
+            foreach (var roleName in requiredRoleNames!)
+            {
+                _policyBuilder.RequireRole(roleName);
+            }
+        }
+    }
+
+    public virtual async Task<bool> AuthorizeAsync(DashboardContext context)
+    {
+        var currentTenant = context.GetHttpContext().RequestServices.GetRequiredService<ICurrentTenant>();
+        if (currentTenant.IsAvailable && !_enableTenant)
+        {
+            return false;
+        }
+
+        var authorizationService = context.GetHttpContext().RequestServices
+            .GetRequiredService<IAuthorizationService>();
+        var authorizationPolicy = _policyBuilder.Build();
+        return (await authorizationService.AuthorizeAsync(
+            context.GetHttpContext().User, authorizationPolicy)).Succeeded;
+    }
+}
+```
+
+The filter has three responsibilities, all important:
+
+1. **Authenticated by default.** `RequireAuthenticatedUser()` is added unconditionally — no anonymous dashboard access.
+2. **Permission and roles are additive.** Pass `requiredPermissionName` and/or one or more `requiredRoleNames` to layer requirements on top of the authenticated check.
+3. **Tenant isolation.** If `_enableTenant == false` (the default) and the current request is running under a tenant context, access is denied — the dashboard is host‑only unless you explicitly opt in.
+
+Use it via the dashboard registration helper from the jobs Hangfire package:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    app.UseAbpHangfireDashboard(
+        "/hangfire",
+        configure: options =>
+        {
+            options.Authorization = new[]
+            {
+                new AbpHangfireAuthorizationFilter(
+                    enableTenant: false,
+                    requiredPermissionName: "MyApp.Hangfire.Dashboard")
+            };
+        });
+}
+```
+
+`UseAbpHangfireDashboard` (from `Volo.Abp.BackgroundJobs.HangFire`) injects an `AbpDashboardOptionsProvider` that *already* installs an authorization filter, so opting out of authorization requires explicit work — a safer default than Hangfire's "everyone in production" behaviour out of the box.
+
+## Pre‑configuring Hangfire itself
+
+Any module can contribute to Hangfire's global configuration through the standard `PreConfigure<IGlobalConfiguration>` extension:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<IGlobalConfiguration>(config =>
+    {
+        config.UseSqlServerStorage(connString, new SqlServerStorageOptions
+        {
+            QueuePollInterval = TimeSpan.FromSeconds(15),
+            SlidingInvisibilityTimeout = TimeSpan.FromMinutes(5),
+        });
+        config.UseRecurringJob(typeof(MyRecurringJobs));
+    });
+}
+```
+
+These actions run inside `AddHangfire` *before* any ABP‑specific wiring, so storage and filters are in place when the singleton `JobStorage` is resolved.
+
+## Cross‑links
+
+- [`/background/jobs-hangfire`](/background/jobs-hangfire) — `HangfireBackgroundJobManager`, queue routing, dashboard helper.
+- [`/background/workers-hangfire`](/background/workers-hangfire) — `HangfireBackgroundWorkerManager`, recurring jobs.
+- [`/background/overview`](/background/overview) — choosing between providers.

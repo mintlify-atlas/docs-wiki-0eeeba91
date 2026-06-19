@@ -1,0 +1,311 @@
+---
+title: "@abp/ng.feature-management"
+description: "FeatureManagementComponent — modal for toggling features per provider (edition, tenant, system)."
+---
+
+`@abp/ng.feature-management` (source: `npm/ng-packs/packages/feature-management/`) ships the **feature management** modal — the UI counterpart to ABP's [Feature Management module](/modules/feature-management/overview). Like the permission management package, it doesn't contribute routes; it exposes a single component that other UIs open with a `providerName` / `providerKey` pair.
+
+```text
+npm/ng-packs/packages/feature-management/src/lib/
+├── components/
+│   ├── feature-management/         FeatureManagementComponent (modal)
+│   ├── feature-management-tab/     FeatureManagementTabComponent (settings page)
+│   └── index.ts
+├── directives/                     FreeTextInputDirective
+├── enums/                          ValueTypes, eFeatureManagementComponents
+├── models/                         FeatureManagement.*
+├── providers/                      tab provider for setting-management
+└── feature-management.module.ts
+```
+
+The generated proxies (`FeaturesService`, `FeatureDto`, `FeatureGroupDto`, `UpdateFeatureDto`) come from the secondary entry point `@abp/ng.feature-management/proxy` and target `/api/feature-management/features`.
+
+## Architectural overview
+
+```mermaid
+flowchart LR
+  Host[Tenant management /<br/>setting page] -->|opens| Modal[FeatureManagementComponent]
+  Modal --> Svc[FeaturesService proxy]
+  Svc --> Rest[RestService<br/>'@abp/ng.core']
+  Rest --> Be[Backend<br/>FeatureManagement module]
+  Be --> Provider[(EditionFeatureProvider<br/>TenantFeatureProvider<br/>DefaultFeatureProvider)]
+```
+
+The modal is **provider‑agnostic** — it never assumes whether the features it edits belong to a tenant, an edition or the global default. That's the whole point of the `providerName` / `providerKey` indirection.
+
+## `FeatureManagementComponent`
+
+```ts feature-management/src/lib/components/feature-management/feature-management.component.ts
+@Component({
+  selector: 'abp-feature-management',
+  templateUrl: './feature-management.component.html',
+  exportAs: 'abpFeatureManagement',
+  imports: [
+    NgTemplateOutlet, ButtonComponent, ModalComponent, LocalizationPipe,
+    FormsModule, NgbNavModule, FreeTextInputDirective, ModalCloseDirective,
+  ],
+})
+export class FeatureManagementComponent
+  implements
+    FeatureManagement.FeatureManagementComponentInputs,
+    FeatureManagement.FeatureManagementComponentOutputs
+{
+  protected readonly track = inject(TrackByService);
+  protected readonly toasterService = inject(ToasterService);
+  protected readonly service = inject(FeaturesService);
+  protected readonly configState = inject(ConfigStateService);
+  protected readonly confirmationService = inject(ConfirmationService);
+  private document = inject(DOCUMENT);
+
+  @Input() providerKey: string;
+  @Input() providerName: string;
+  @Input({ required: false }) providerTitle: string;
+
+  @Output() readonly visibleChange = new EventEmitter<boolean>();
+}
+```
+
+### Inputs and outputs
+
+| Member | Purpose |
+| --- | --- |
+| `providerName` (required) | `'E'` for edition, `'T'` for tenant, `'D'` for default/global. |
+| `providerKey` | Identifier inside the provider (edition id, tenant id, …). Empty for the global provider. |
+| `providerTitle` | Title shown in the modal header. |
+| `visible` (two‑way) | Toggle the modal open/closed. |
+| `visibleChange` | Emits when `visible` changes. |
+
+### Fetching features
+
+When the modal opens, `getFeatures()` populates the groups and tracks each feature's initial value so the diff can be sent on save:
+
+```ts feature-management.component.ts
+openModal() {
+  if (!this.providerName) {
+    throw new Error('providerName is required.');
+  }
+  this.getFeatures();
+}
+
+getFeatures() {
+  this.service.get(this.providerName, this.providerKey).subscribe(res => {
+    if (!res.groups?.length) return;
+    this.groups = res.groups.map(({ name, displayName }) => ({ name, displayName }));
+    this.selectedGroupDisplayName = this.groups[0].displayName;
+    this.features = res.groups.reduce(
+      (acc, val) => ({
+        ...acc,
+        [val.name]: mapFeatures(val.features, this.document.body?.dir as LocaleDirection),
+      }),
+      {},
+    );
+  });
+}
+```
+
+`mapFeatures` (declared in the same component) tracks `initialValue` so the save diff is minimal.
+
+### Saving changes
+
+```ts
+save() {
+  if (this.modalBusy) return;
+
+  const changedFeatures = [] as UpdateFeatureDto[];
+
+  Object.keys(this.features).forEach(key => {
+    this.features[key].forEach(feature => {
+      if (feature.value !== feature.initialValue)
+        changedFeatures.push({ name: feature.name, value: `${feature.value}` });
+    });
+  });
+  // …  PUT /api/feature-management/features?providerName=…&providerKey=…
+}
+```
+
+Only features whose value differs from the initial one are sent to the server. The endpoint matches ABP's feature management contracts (see [Features](/security/features)).
+
+### Value types
+
+The component supports the three value types declared in the backend module:
+
+```ts
+enum ValueTypes {
+  ToggleStringValueType = 'ToggleStringValueType',
+  FreeTextStringValueType = 'FreeTextStringValueType',
+  SelectionStringValueType = 'SelectionStringValueType',
+}
+```
+
+- **Toggle** — boolean switch rendered as a checkbox.
+- **Free text** — text input with optional numeric validation through `FreeTextInputDirective` (`directives/free-text-input.directive.ts`).
+- **Selection** — radio buttons / dropdown for an enumerated set of choices.
+
+`DEFAULT_PROVIDER_NAME = 'D'` is the global provider that holds the application‑wide defaults.
+
+## Opening the modal from another module
+
+Tenant management's entity action contributor pattern is the typical usage:
+
+```ts
+import { FeatureManagementComponent } from '@abp/ng.feature-management';
+
+// inside a host component
+isFeatureManagementVisible = false;
+providerName = 'T';
+providerKey: string;
+
+manageFeatures(tenant: TenantDto) {
+  this.providerKey = tenant.id;
+  this.providerTitle = tenant.name;
+  this.isFeatureManagementVisible = true;
+}
+```
+
+```html
+<abp-feature-management
+  [(visible)]="isFeatureManagementVisible"
+  [providerName]="providerName"
+  [providerKey]="providerKey"
+  [providerTitle]="providerTitle">
+</abp-feature-management>
+```
+
+## Feature management tab for the settings page
+
+`components/feature-management-tab/feature-management-tab.component.ts` is the variant rendered as a tab inside `@abp/ng.setting-management`. The package's `providers/` folder registers a tab contributor so when the setting management page is loaded, a "Feature Management" tab appears for users that have the `FeatureManagement.ManageHostFeatures` permission.
+
+```ts feature-management/src/lib/providers/...
+{
+  provide: SETTING_MANAGEMENT_CONTRIBUTORS,
+  useFactory: () => [
+    { tabName: 'FeatureManagement::Features',
+      component: FeatureManagementTabComponent,
+      requiredPolicy: 'FeatureManagement.ManageHostFeatures' },
+  ],
+  multi: true,
+}
+```
+
+## Wiring the module
+
+The package exports a `FeatureManagementModule` (legacy NgModule API) but the standalone component can be imported directly:
+
+```ts
+import { FeatureManagementComponent } from '@abp/ng.feature-management';
+
+@Component({
+  standalone: true,
+  imports: [FeatureManagementComponent],
+})
+export class MyHostComponent {}
+```
+
+If you only want the settings‑page tab, add `provideAbpFeatureManagementConfig()` from the module's `config` entry point inside your `app.config.ts`. That registers the tab contributor and ensures the proxy services are tree‑shake‑friendly.
+
+## `FeaturesService` proxy
+
+Generated under `@abp/ng.feature-management/proxy`:
+
+```ts feature-management/proxy/.../features.service.ts (generated)
+@Injectable({ providedIn: 'root' })
+export class FeaturesService {
+  apiName = 'AbpFeatureManagement';
+  protected restService = inject(RestService);
+
+  get = (providerName: string, providerKey: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<void, GetFeatureListResultDto>(
+      {
+        method: 'GET',
+        url: '/api/feature-management/features',
+        params: { providerName, providerKey },
+      },
+      { apiName: this.apiName, ...config },
+    );
+
+  update = (
+    providerName: string,
+    providerKey: string,
+    input: UpdateFeaturesDto,
+    config?: Partial<Rest.Config>,
+  ) =>
+    this.restService.request<UpdateFeaturesDto, void>(
+      {
+        method: 'PUT',
+        url: '/api/feature-management/features',
+        params: { providerName, providerKey },
+        body: input,
+      },
+      { apiName: this.apiName, ...config },
+    );
+
+  delete = (providerName: string, providerKey: string, config?: Partial<Rest.Config>) =>
+    this.restService.request<void, void>(
+      {
+        method: 'DELETE',
+        url: '/api/feature-management/features',
+        params: { providerName, providerKey },
+      },
+      { apiName: this.apiName, ...config },
+    );
+}
+```
+
+The DTO shapes:
+
+```ts
+interface GetFeatureListResultDto {
+  groups: FeatureGroupDto[];
+}
+
+interface FeatureGroupDto {
+  name: string;
+  displayName: string;
+  features: FeatureDto[];
+}
+
+interface FeatureDto {
+  name: string;
+  displayName: string;
+  value: string;
+  provider: { name: string; key: string };
+  description?: string;
+  valueType?: { name: 'ToggleStringValueType' | 'FreeTextStringValueType' | 'SelectionStringValueType';
+                validator?: { name: string; properties?: Record<string, unknown> } };
+  depth: number;
+  parentName?: string;
+}
+
+interface UpdateFeatureDto { name: string; value: string }
+interface UpdateFeaturesDto { features: UpdateFeatureDto[] }
+```
+
+`FreeTextInputDirective` (`directives/free-text-input.directive.ts`) uses `valueType.validator.properties` to enforce min/max length, regex or numeric range constraints declared on the backend feature definition.
+
+## `eFeatureManagementComponents`
+
+```ts feature-management/src/lib/enums/components.ts
+export enum eFeatureManagementComponents {
+  FeatureManagement = 'FeatureManagement.FeatureManagementComponent',
+  FeatureManagementTab = 'FeatureManagement.FeatureManagementTabComponent',
+}
+```
+
+`FeatureManagement` is the modal key consumed by tenant management; `FeatureManagementTab` is the settings‑page tab key consumed by the setting management tab service.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Features" href="/security/features" icon="toggle-on">
+    The backend concept — feature definitions, providers, value types, dependencies.
+  </Card>
+  <Card title="@abp/ng.tenant-management" href="/angular/tenant-management" icon="building">
+    Opens this modal from the tenant entity actions.
+  </Card>
+  <Card title="@abp/ng.setting-management" href="/angular/setting-management" icon="gear">
+    Hosts the feature management tab via the tab contributor.
+  </Card>
+  <Card title="@abp/ng.theme.shared" href="/angular/theme-shared" icon="palette">
+    `ModalComponent`, `ButtonComponent`, `ToasterService`, `ConfirmationService` — all used inside the modal template.
+  </Card>
+</CardGroup>

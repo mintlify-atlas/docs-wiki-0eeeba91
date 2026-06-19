@@ -1,0 +1,690 @@
+---
+title: "Domain Layer"
+description: "The Setting aggregate, ISettingRepository, ISettingManagementStore, the five SettingManagementProvider implementations, ISettingManager, dynamic store, and ISettingEncryptionService."
+---
+
+The domain layer is what makes setting *overrides* persistable. Everything on this page lives in [`modules/setting-management/src/Volo.Abp.SettingManagement.Domain/Volo/Abp/SettingManagement/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Domain/Volo/Abp/SettingManagement) plus the read-only constants under `.Domain.Shared/Volo/Abp/SettingManagement/`.
+
+It is consumed by:
+
+- The **framework's** value-provider chain ([Settings](/security/settings)) — each `ISettingValueProvider` delegates its `GetOrNullAsync` to one of the `ISettingManagementProvider`s defined here.
+- The **application layer** ([EmailSettingsAppService](/modules/setting-management/application)) — uses `ISettingManager` to write values.
+- The **EF Core / MongoDB** stores ([efcore-mongodb](/modules/setting-management/efcore-mongodb)) — supply the `ISettingRepository` and `ISettingDefinitionRecordRepository` implementations.
+
+## The Setting aggregate
+
+`Setting` is the only aggregate root in the module. One row per `(Name, ProviderName, ProviderKey)` triple — that triple is also the unique index on the table.
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/Setting.cs
+public class Setting : Entity<Guid>, IAggregateRoot<Guid>
+{
+    [NotNull]
+    public virtual string Name { get; protected set; }
+
+    [NotNull]
+    public virtual string Value { get; internal set; }
+
+    [CanBeNull]
+    public virtual string ProviderName { get; protected set; }
+
+    [CanBeNull]
+    public virtual string ProviderKey { get; protected set; }
+
+    public Setting(
+        Guid id,
+        [NotNull] string name,
+        [NotNull] string value,
+        [CanBeNull] string providerName = null,
+        [CanBeNull] string providerKey = null)
+    {
+        Check.NotNull(name, nameof(name));
+        Check.NotNull(value, nameof(value));
+
+        Id = id;
+        Name = name;
+        Value = value;
+        ProviderName = providerName;
+        ProviderKey = providerKey;
+    }
+}
+```
+
+A few things to note:
+
+- `Value` has an `internal set` — only `SettingManagementStore` (in the same assembly) can mutate it. External code must go through `ISettingManager`.
+- There is **no `TenantId`** on the aggregate; multi-tenant scoping is done by `ProviderName = "T"` and `ProviderKey = tenantId.ToString()`. The aggregate itself is marked `[IgnoreMultiTenancy]` on its EF Core / Mongo mapping ([efcore-mongodb](/modules/setting-management/efcore-mongodb#multitenancy-and-shared-table)).
+- `ProviderName` is at most 64 chars, `ProviderKey` is at most 64 chars, `Name` is at most 128, `Value` is at most 2048 (see `SettingConsts`).
+
+### SettingConsts
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain.Shared/
+//   Volo/Abp/SettingManagement/SettingConsts.cs
+public static class SettingConsts
+{
+    public static int MaxNameLength { get; set; } = 128;
+    public static int MaxValueLength { get; set; } = 2048;
+    public static int MaxValueLengthValue { get; set; } = MaxValueLength;
+    public static int MaxProviderNameLength { get; set; } = 64;
+    public static int MaxProviderKeyLength { get; set; } = 64;
+}
+```
+
+These are **settable statics** — change them in your module's `PreConfigureServices` before `OnModelCreating` runs if you have settings whose serialised JSON exceeds 2 KB.
+
+## ISettingRepository
+
+A narrow contract: lookup by composite key and bulk-by-provider.
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/ISettingRepository.cs
+public interface ISettingRepository : IBasicRepository<Setting, Guid>
+{
+    Task<Setting> FindAsync(
+        string name,
+        string providerName,
+        string providerKey,
+        CancellationToken cancellationToken = default);
+
+    Task<List<Setting>> GetListAsync(
+        string providerName,
+        string providerKey,
+        CancellationToken cancellationToken = default);
+
+    Task<List<Setting>> GetListAsync(
+        string[] names,
+        string providerName,
+        string providerKey,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Implementations: `EfCoreSettingRepository` and `MongoSettingRepository`, both detailed on [EF Core & MongoDB](/modules/setting-management/efcore-mongodb#efcoresettingrepository). The third overload (by `string[] names`) is what powers the bulk-cache-fill in `SettingManagementStore.GetListAsync`.
+
+## SettingManagementStore (ISettingStore impl)
+
+`SettingManagementStore` is the cached, transactional gateway between the management providers and `ISettingRepository`. It implements `ISettingManagementStore`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/ISettingManagementStore.cs
+public interface ISettingManagementStore
+{
+    Task<string> GetOrNullAsync(string name, string providerName, string providerKey);
+    Task<List<SettingValue>> GetListAsync(string providerName, string providerKey);
+    Task<List<SettingValue>> GetListAsync(string[] names, string providerName, string providerKey);
+    Task SetAsync(string name, string value, string providerName, string providerKey);
+    Task DeleteAsync(string name, string providerName, string providerKey);
+}
+```
+
+The implementation wraps every method in `[UnitOfWork]` and uses `IDistributedCache<SettingCacheItem>`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/SettingManagementStore.cs
+public class SettingManagementStore : ISettingManagementStore, ITransientDependency
+{
+    protected IDistributedCache<SettingCacheItem> Cache { get; }
+    protected ISettingDefinitionManager SettingDefinitionManager { get; }
+    protected ISettingRepository SettingRepository { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+
+    [UnitOfWork]
+    public virtual async Task<string> GetOrNullAsync(string name, string providerName, string providerKey)
+    {
+        return (await GetCacheItemAsync(name, providerName, providerKey)).Value;
+    }
+
+    [UnitOfWork]
+    public virtual async Task SetAsync(string name, string value, string providerName, string providerKey)
+    {
+        var setting = await SettingRepository.FindAsync(name, providerName, providerKey);
+        if (setting == null)
+        {
+            setting = new Setting(GuidGenerator.Create(), name, value, providerName, providerKey);
+            await SettingRepository.InsertAsync(setting, true);
+        }
+        else
+        {
+            setting.Value = value;
+            await SettingRepository.UpdateAsync(setting, true);
+        }
+
+        await Cache.SetAsync(
+            CalculateCacheKey(name, providerName, providerKey),
+            new SettingCacheItem(setting?.Value),
+            considerUow: true);
+    }
+}
+```
+
+### Bulk read with cache prefill
+
+When `GetCacheItemAsync` misses for a single setting, `SettingManagementStore` **prefills the cache for every setting defined for that scope** in one repository round-trip, on the assumption that the next call will probably be for another setting in the same scope. The internal `SetCacheItemsAsync` calls `SettingDefinitionManager.GetAllAsync()`, materialises the scope through `SettingRepository.GetListAsync(providerName, providerKey)`, and `Cache.SetManyAsync(...)` the lot. Reading 10 user settings during one request is essentially as cheap as reading one.
+
+### SettingCacheItem and the cache key
+
+`SettingCacheItem` is a tiny wrapper. The cache key encodes the triple as `pn:{providerName},pk:{providerKey},n:{name}`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/SettingCacheItem.cs
+[Serializable]
+[IgnoreMultiTenancy]
+public class SettingCacheItem
+{
+    private const string CacheKeyFormat = "pn:{0},pk:{1},n:{2}";
+
+    public string Value { get; set; }
+
+    public SettingCacheItem(string value)
+    {
+        Value = value;
+    }
+
+    public static string CalculateCacheKey(string name, string providerName, string providerKey)
+    {
+        return string.Format(CacheKeyFormat, providerName, providerKey, name);
+    }
+
+    public static string GetSettingNameFormCacheKeyOrNull(string cacheKey)
+    {
+        var result = FormattedStringValueExtracter.Extract(cacheKey, CacheKeyFormat, true);
+        return result.IsMatch ? result.Matches.Last().Value : null;
+    }
+}
+```
+
+`[IgnoreMultiTenancy]` is critical: a tenant override is keyed by `pk=<tenantId>`, so the cache item itself does **not** need an `ITenantCacheStorage` partition.
+
+### SettingCacheItemInvalidator
+
+Writes from any source — `SettingManagementStore.SetAsync`, EF migrations, dapper, an external job — must clear the cache. `SettingCacheItemInvalidator` listens for `EntityChangedEventData<Setting>`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/SettingCacheItemInvalidator.cs
+public class SettingCacheItemInvalidator :
+    ILocalEventHandler<EntityChangedEventData<Setting>>,
+    ITransientDependency
+{
+    protected IDistributedCache<SettingCacheItem> Cache { get; }
+
+    public virtual async Task HandleEventAsync(EntityChangedEventData<Setting> eventData)
+    {
+        await Cache.RemoveAsync(
+            SettingCacheItem.CalculateCacheKey(
+                eventData.Entity.Name,
+                eventData.Entity.ProviderName,
+                eventData.Entity.ProviderKey));
+    }
+}
+```
+
+## ISettingManagementProvider hierarchy
+
+`ISettingManagementProvider` mirrors `ISettingValueProvider` but with a write half:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/ISettingManagementProvider.cs
+public interface ISettingManagementProvider
+{
+    string Name { get; }
+
+    Task<string> GetOrNullAsync([NotNull] SettingDefinition setting, [CanBeNull] string providerKey);
+
+    Task SetAsync([NotNull] SettingDefinition setting, [NotNull] string value, [CanBeNull] string providerKey);
+
+    Task ClearAsync([NotNull] SettingDefinition setting, [CanBeNull] string providerKey);
+}
+```
+
+Three of the five implementations share an abstract base, `SettingManagementProvider`, that delegates to `ISettingManagementStore`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/SettingManagementProvider.cs
+public abstract class SettingManagementProvider : ISettingManagementProvider
+{
+    public abstract string Name { get; }
+
+    protected ISettingManagementStore SettingManagementStore { get; }
+
+    protected SettingManagementProvider(ISettingManagementStore settingManagementStore)
+    {
+        SettingManagementStore = settingManagementStore;
+    }
+
+    public virtual async Task<string> GetOrNullAsync(SettingDefinition setting, string providerKey)
+    {
+        return await SettingManagementStore.GetOrNullAsync(
+            setting.Name, Name, NormalizeProviderKey(providerKey));
+    }
+
+    public virtual async Task SetAsync(SettingDefinition setting, string value, string providerKey)
+    {
+        await SettingManagementStore.SetAsync(
+            setting.Name, value, Name, NormalizeProviderKey(providerKey));
+    }
+
+    public virtual async Task ClearAsync(SettingDefinition setting, string providerKey)
+    {
+        await SettingManagementStore.DeleteAsync(
+            setting.Name, Name, NormalizeProviderKey(providerKey));
+    }
+
+    protected virtual string NormalizeProviderKey(string providerKey) => providerKey;
+}
+```
+
+The pattern: `Name` is the short string that becomes `Setting.ProviderName`; `NormalizeProviderKey` is the only thing each concrete provider customises.
+
+### DefaultValueSettingManagementProvider
+
+The bottom of the chain — reads `SettingDefinition.DefaultValue` and refuses to write:
+
+```csharp
+// DefaultValueSettingManagementProvider.cs
+public class DefaultValueSettingManagementProvider : ISettingManagementProvider, ISingletonDependency
+{
+    public string Name => DefaultValueSettingValueProvider.ProviderName;  // "D"
+
+    public virtual Task<string> GetOrNullAsync(SettingDefinition setting, string providerKey)
+    {
+        return Task.FromResult(setting.DefaultValue);
+    }
+
+    public virtual Task SetAsync(SettingDefinition setting, string value, string providerKey)
+    {
+        throw new AbpException(
+            $"Can not set default value of a setting. " +
+            $"It is only possible while defining the setting in a {typeof(ISettingDefinitionProvider)} implementation.");
+    }
+
+    public virtual Task ClearAsync(SettingDefinition setting, string providerKey)
+    {
+        throw new AbpException($"Can not clear default value of a setting. ...");
+    }
+}
+```
+
+Defaults are immutable at runtime — you can only change them by editing the `SettingDefinitionProvider` and redeploying.
+
+### ConfigurationSettingManagementProvider
+
+Reads from `IConfiguration` (typically `appsettings.json`) using a `"Settings:"` prefix:
+
+```csharp
+// ConfigurationSettingManagementProvider.cs
+public class ConfigurationSettingManagementProvider : ISettingManagementProvider, ITransientDependency
+{
+    public string Name => ConfigurationSettingValueProvider.ProviderName;  // "C"
+
+    protected IConfiguration Configuration { get; }
+
+    public ConfigurationSettingManagementProvider(IConfiguration configuration)
+    {
+        Configuration = configuration;
+    }
+
+    public virtual Task<string> GetOrNullAsync(SettingDefinition setting, string providerKey)
+    {
+        return Task.FromResult(
+            Configuration[ConfigurationSettingValueProvider.ConfigurationNamePrefix + setting.Name]);
+    }
+
+    public virtual Task SetAsync(SettingDefinition setting, string value, string providerKey)
+    {
+        throw new AbpException($"Can not set a setting value to the application configuration.");
+    }
+}
+```
+
+So `"Settings:Abp.Mailing.Smtp.Host": "smtp.acme.com"` in `appsettings.json` becomes a globally-visible read-only value. This is the fastest way to seed an environment-specific override at deploy time.
+
+### GlobalSettingManagementProvider
+
+Single global value per setting, `ProviderKey` is always null:
+
+```csharp
+// GlobalSettingManagementProvider.cs
+public class GlobalSettingManagementProvider : SettingManagementProvider, ITransientDependency
+{
+    public override string Name => GlobalSettingValueProvider.ProviderName;  // "G"
+
+    public GlobalSettingManagementProvider(ISettingManagementStore settingManagementStore)
+        : base(settingManagementStore) { }
+
+    protected override string NormalizeProviderKey(string providerKey)
+    {
+        return null;  // global → no key
+    }
+}
+```
+
+### TenantSettingManagementProvider
+
+Per-tenant overrides; `ProviderKey` defaults to the current tenant when not supplied:
+
+```csharp
+// TenantSettingManagementProvider.cs
+public class TenantSettingManagementProvider : SettingManagementProvider, ITransientDependency
+{
+    public override string Name => TenantSettingValueProvider.ProviderName;  // "T"
+
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public TenantSettingManagementProvider(
+        ISettingManagementStore settingManagementStore,
+        ICurrentTenant currentTenant)
+        : base(settingManagementStore)
+    {
+        CurrentTenant = currentTenant;
+    }
+
+    protected override string NormalizeProviderKey(string providerKey)
+    {
+        if (providerKey != null)
+        {
+            return providerKey;
+        }
+
+        return CurrentTenant.Id?.ToString();
+    }
+}
+```
+
+This is the integration seam with the [Tenant Management module](/modules/tenant-management/overview) — switching tenants via `ICurrentTenant.Change(...)` automatically scopes settings to the new tenant.
+
+### UserSettingManagementProvider
+
+Per-user overrides; defaults to `ICurrentUser.Id`:
+
+```csharp
+// UserSettingManagementProvider.cs
+public class UserSettingManagementProvider : SettingManagementProvider, ITransientDependency
+{
+    public override string Name => UserSettingValueProvider.ProviderName;  // "U"
+
+    protected ICurrentUser CurrentUser { get; }
+
+    public UserSettingManagementProvider(
+        ISettingManagementStore settingManagementStore,
+        ICurrentUser currentUser)
+        : base(settingManagementStore)
+    {
+        CurrentUser = currentUser;
+    }
+
+    protected override string NormalizeProviderKey(string providerKey)
+    {
+        if (providerKey != null)
+        {
+            return providerKey;
+        }
+
+        return CurrentUser.Id?.ToString();
+    }
+}
+```
+
+## Putting the chain together
+
+```mermaid
+flowchart TB
+    Caller["ISettingManager.GetOrNullAsync<br/>(name, providerName, providerKey, fallback=true)"]
+    Caller --> SM[SettingManager]
+    SM --> Loop{Reverse(Providers)<br/>SkipWhile != providerName}
+    Loop --> UPM[UserSettingManagementProvider<br/>Name=U]
+    Loop --> TPM[TenantSettingManagementProvider<br/>Name=T]
+    Loop --> GPM[GlobalSettingManagementProvider<br/>Name=G]
+    Loop --> CPM[ConfigurationSettingManagementProvider<br/>Name=C]
+    Loop --> DPM[DefaultValueSettingManagementProvider<br/>Name=D]
+    UPM --> Store[(SettingManagementStore)]
+    TPM --> Store
+    GPM --> Store
+    CPM --> Cfg[(IConfiguration)]
+    DPM --> Def[(SettingDefinition.DefaultValue)]
+    Store --> Cache[(IDistributedCache<br/>SettingCacheItem)]
+    Cache -. miss .-> Repo[(ISettingRepository<br/>AbpSettings table)]
+
+    SM --> Enc[ISettingEncryptionService.Decrypt<br/>if SettingDefinition.IsEncrypted]
+    Enc --> Return[return string value]
+```
+
+### Module registration
+
+The order is set up in the domain module:
+
+```csharp
+// AbpSettingManagementDomainModule.cs
+Configure<SettingManagementOptions>(options =>
+{
+    options.Providers.Add<DefaultValueSettingManagementProvider>();
+    options.Providers.Add<ConfigurationSettingManagementProvider>();
+    options.Providers.Add<GlobalSettingManagementProvider>();
+    options.Providers.Add<TenantSettingManagementProvider>();
+    options.Providers.Add<UserSettingManagementProvider>();
+});
+```
+
+When `SettingManager` reads, it `Enumerable.Reverse(Providers)` and `SkipWhile(c => c.Name != providerName)` — so a call with `providerName = "T"` walks T → G → C → D.
+
+## ISettingManager and SettingManager
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/ISettingManager.cs
+public interface ISettingManager
+{
+    Task<string> GetOrNullAsync(
+        [NotNull] string name, [NotNull] string providerName, [CanBeNull] string providerKey,
+        bool fallback = true);
+
+    Task<List<SettingValue>> GetAllAsync(
+        [NotNull] string providerName, [CanBeNull] string providerKey,
+        bool fallback = true);
+
+    Task SetAsync(
+        [NotNull] string name, [CanBeNull] string value,
+        [NotNull] string providerName, [CanBeNull] string providerKey,
+        bool forceToSet = false);
+
+    Task DeleteAsync(string providerName, string providerKey);
+}
+```
+
+You almost never call `SetAsync(..., providerName, providerKey, ...)` directly — instead use the extension methods in `GlobalSettingManagerExtensions`, `TenantSettingManagerExtensions`, and `UserSettingManagerExtensions`, which encode the provider name for you:
+
+```csharp
+// GlobalSettingManagerExtensions.cs (excerpt)
+public static Task SetGlobalAsync(this ISettingManager manager, string name, string value)
+    => manager.SetAsync(name, value, GlobalSettingValueProvider.ProviderName, null);
+
+// TenantSettingManagerExtensions.cs (excerpt)
+public static Task SetForCurrentTenantAsync(this ISettingManager manager, string name, string value, bool forceToSet = false)
+    => manager.SetAsync(name, value, TenantSettingValueProvider.ProviderName, null, forceToSet);
+
+public static Task SetForTenantAsync(this ISettingManager manager, Guid tenantId, string name, string value, bool forceToSet = false)
+    => manager.SetAsync(name, value, TenantSettingValueProvider.ProviderName, tenantId.ToString(), forceToSet);
+
+// UserSettingManagerExtensions.cs (excerpt)
+public static Task SetForUserAsync(this ISettingManager manager, Guid userId, string name, string value, bool forceToSet = false)
+    => manager.SetAsync(name, value, UserSettingValueProvider.ProviderName, userId.ToString(), forceToSet);
+```
+
+### Inheritance-aware writes
+
+The key trick inside `SettingManager.SetAsync` is that it **does not** store a redundant override:
+
+```csharp
+// SettingManager.cs (write path)
+public virtual async Task SetAsync(string name, string value, string providerName, string providerKey, bool forceToSet = false)
+{
+    var setting = await SettingDefinitionManager.GetAsync(name);
+
+    var providers = Enumerable
+        .Reverse(Providers)
+        .SkipWhile(p => p.Name != providerName)
+        .ToList();
+
+    if (setting.IsEncrypted)
+    {
+        value = SettingEncryptionService.Encrypt(setting, value);
+    }
+
+    if (providers.Count > 1 && !forceToSet && setting.IsInherited && value != null)
+    {
+        var fallbackValue = await GetOrNullInternalAsync(name, providers[1].Name, null);
+        if (string.Equals(fallbackValue, value, StringComparison.OrdinalIgnoreCase))
+        {
+            //Clear the value if it's same as it's fallback value
+            value = null;
+        }
+    }
+
+    providers = providers.TakeWhile(p => p.Name == providerName).ToList();
+
+    if (value == null)
+    {
+        foreach (var provider in providers) await provider.ClearAsync(setting, providerKey);
+    }
+    else
+    {
+        foreach (var provider in providers) await provider.SetAsync(setting, value, providerKey);
+    }
+}
+```
+
+The first read at the next-lower provider tests whether the user is just re-saving the inherited value. If so, the row is cleared instead of inserted — the override stays implicit. Pass `forceToSet: true` to defeat this and store the value verbatim.
+
+### Inheritance-aware reads
+
+The read side has the matching logic in `GetOrNullInternalAsync`. For `setting.IsInherited == true` the loop **breaks on the first non-null value** found while walking the provider chain (after `SkipWhile(c => c.Name != providerName)`); for `IsInherited == false` only the exact provider is consulted (`TakeWhile(c => c.Name == providerName)`). When the resolved value is non-null and `setting.IsEncrypted == true`, the value is decrypted by `SettingEncryptionService.Decrypt(setting, value)` before returning.
+
+## IStaticSettingSaver
+
+`SettingManagementOptions.SaveStaticSettingsToDatabase` (default `true`) tells the module to mirror every code-defined `SettingDefinition` into the `AbpSettingDefinitions` table at startup. The implementation is `StaticSettingSaver` which compares the in-memory definitions against `ISettingDefinitionRecordRepository` and inserts / updates / deletes rows. The actual call is wrapped in a Polly retry policy so a temporary DB outage on startup does not crash the host:
+
+```csharp
+// AbpSettingManagementDomainModule.cs
+await Policy
+    .Handle<Exception>()
+    .WaitAndRetryAsync(8, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt) * 10))
+    .ExecuteAsync(async _ =>
+    {
+        await scope.ServiceProvider.GetRequiredService<IStaticSettingSaver>().SaveAsync();
+    }, cancellationTokenProvider.Token);
+```
+
+Why mirror them? Because the optional **dynamic** store (`IDynamicSettingDefinitionStore`, enabled via `SettingManagementOptions.IsDynamicSettingStoreEnabled = true`) reads definitions from the DB at runtime — useful when one microservice publishes a new setting that another service should immediately know about without a redeploy. The cache layer here is `DynamicSettingDefinitionStoreInMemoryCache` / `IDynamicSettingDefinitionStoreInMemoryCache`.
+
+## ISettingEncryptionService
+
+Marking `SettingDefinition.IsEncrypted = true` flips on transparent encryption — the value lands in the database already encrypted and `SettingManager` decrypts it on read. The contract lives in the framework:
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/ISettingEncryptionService.cs
+public interface ISettingEncryptionService
+{
+    string? Encrypt([NotNull] SettingDefinition settingDefinition, string? plainValue);
+    string? Decrypt([NotNull] SettingDefinition settingDefinition, string? encryptedValue);
+}
+```
+
+The default implementation wraps `IStringEncryptionService` from the [String Encryption](/security/string-encryption) primitive:
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/SettingEncryptionService.cs
+public class SettingEncryptionService : ISettingEncryptionService, ITransientDependency
+{
+    protected IStringEncryptionService StringEncryptionService { get; }
+    public ILogger<SettingEncryptionService> Logger { get; set; }
+    protected IOptions<AbpSettingOptions> Options { get; }
+
+    public SettingEncryptionService(IStringEncryptionService stringEncryptionService, IOptions<AbpSettingOptions> options)
+    {
+        StringEncryptionService = stringEncryptionService;
+        Options = options;
+        Logger = NullLogger<SettingEncryptionService>.Instance;
+    }
+
+    public virtual string? Encrypt(SettingDefinition settingDefinition, string? plainValue)
+    {
+        if (plainValue.IsNullOrEmpty()) return plainValue;
+        return StringEncryptionService.Encrypt(plainValue);
+    }
+
+    public virtual string? Decrypt(SettingDefinition settingDefinition, string? encryptedValue)
+    {
+        if (encryptedValue.IsNullOrEmpty()) return encryptedValue;
+
+        try
+        {
+            return StringEncryptionService.Decrypt(encryptedValue);
+        }
+        catch (Exception e)
+        {
+            if (Options.Value.ReturnOriginalValueIfDecryptFailed)
+            {
+                Logger.LogWarning(e, "Failed to decrypt the setting: {0}. Returning the original value...", settingDefinition.Name);
+                return encryptedValue;
+            }
+
+            Logger.LogException(e);
+            return string.Empty;
+        }
+    }
+}
+```
+
+Three things worth knowing:
+
+1. **`ReturnOriginalValueIfDecryptFailed`** is the recovery hatch when you change the AES key in `appsettings.json` and need encrypted values back. Set it on `AbpSettingOptions`.
+2. The `SettingDefinition` parameter is passed in but **not consulted** by the default implementation — you can replace `ISettingEncryptionService` with one that picks a different key per setting (e.g. per-tenant KMS).
+3. SMTP password is the canonical encrypted setting. Its definition (in `AbpMailingModule`) sets `IsEncrypted = true`; the [EmailSettingsAppService](/modules/setting-management/application#emailsettingsappservice) never has to think about it.
+
+## SettingManagementOptions
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain/
+//   Volo/Abp/SettingManagement/SettingManagementOptions.cs
+public class SettingManagementOptions
+{
+    public ITypeList<ISettingManagementProvider> Providers { get; }
+
+    /// <summary>Default: true.</summary>
+    public bool SaveStaticSettingsToDatabase { get; set; } = true;
+
+    /// <summary>Default: false.</summary>
+    public bool IsDynamicSettingStoreEnabled { get; set; }
+}
+```
+
+| Option | Effect |
+| --- | --- |
+| `Providers` | The ordered chain. Replace, insert, or remove entries to alter the resolution order (e.g. drop `UserSettingManagementProvider` in a service-only deployment). |
+| `SaveStaticSettingsToDatabase` | Forces `IStaticSettingSaver.SaveAsync()` on startup. Disabled automatically when `IsDataMigrationEnvironment()` is true so migrations don't touch the table. |
+| `IsDynamicSettingStoreEnabled` | Opt in to `IDynamicSettingDefinitionStore`. Pre-caches all dynamic definitions during `OnApplicationInitializationAsync`. |
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Application layer" icon="layer-group" href="/modules/setting-management/application">
+    `EmailSettingsAppService`, `TimeZoneSettingsAppService`, feature checks.
+  </Card>
+  <Card title="EF Core & MongoDB" icon="server" href="/modules/setting-management/efcore-mongodb">
+    Where `ISettingRepository` and `ISettingDefinitionRecordRepository` get their implementations.
+  </Card>
+  <Card title="Settings (framework)" icon="book" href="/security/settings">
+    `SettingDefinition`, `SettingDefinitionProvider`, `ISettingProvider`, the read chain.
+  </Card>
+  <Card title="Tenant Management" icon="building" href="/modules/tenant-management/overview">
+    The source of `ICurrentTenant.Id` that `TenantSettingManagementProvider` keys on.
+  </Card>
+</CardGroup>

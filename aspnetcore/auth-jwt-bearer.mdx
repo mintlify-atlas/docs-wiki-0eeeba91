@@ -1,0 +1,196 @@
+---
+title: "JWT Bearer Authentication — Dynamic Claims For APIs"
+sidebarTitle: "JWT Bearer"
+description: "Volo.Abp.AspNetCore.Authentication.JwtBearer — adds WebRemoteDynamicClaimsPrincipalContributor so resource APIs refresh dynamic claims out-of-band."
+---
+
+`Volo.Abp.AspNetCore.Authentication.JwtBearer` is a tiny module — three files in `DynamicClaims/` plus the module class — but it is the bridge that makes ABP's dynamic claims work for stateless JWT‑secured APIs. Without it, a JWT issued an hour ago would still carry the user's hour‑old roles/permissions even after an admin revoked them. With it, the API revalidates dynamic claims on each request and refreshes them from the auth server when stale.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer/Volo/Abp/AspNetCore/Authentication/JwtBearer/`.
+
+## `AbpAspNetCoreAuthenticationJwtBearerModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpSecurityModule),
+    typeof(AbpCachingModule),
+    typeof(AbpAspNetCoreAbstractionsModule))]
+public class AbpAspNetCoreAuthenticationJwtBearerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+        context.Services.AddHttpContextAccessor();
+
+        if (context.Services
+                .ExecutePreConfiguredActions<WebRemoteDynamicClaimsPrincipalContributorOptions>().IsEnabled &&
+            context.Services
+                .ExecutePreConfiguredActions<AbpClaimsPrincipalFactoryOptions>().IsRemoteRefreshEnabled)
+        {
+            context.Services.AddTransient<WebRemoteDynamicClaimsPrincipalContributor>();
+            context.Services.AddTransient<WebRemoteDynamicClaimsPrincipalContributorCache>();
+        }
+    }
+}
+```
+
+Two conditions must both be true for the contributor to register:
+
+1. `WebRemoteDynamicClaimsPrincipalContributorOptions.IsEnabled` — default `true` for the JWT Bearer module.
+2. `AbpClaimsPrincipalFactoryOptions.IsRemoteRefreshEnabled` — default `true` when the host opted into dynamic claims via `AddDynamicClaims()` / OpenIddict.
+
+Disable it explicitly on internal services that don't need to revalidate claims (e.g. background workers reading a service‑to‑service token):
+
+```csharp
+PreConfigure<WebRemoteDynamicClaimsPrincipalContributorOptions>(options =>
+{
+    options.IsEnabled = false;
+});
+```
+
+## What the contributor does
+
+`WebRemoteDynamicClaimsPrincipalContributor.cs` implements `IAbpDynamicClaimsPrincipalContributor`. It is invoked by `AbpClaimsPrincipalFactory` when a request arrives with an authenticated principal. The contributor:
+
+<Steps>
+  <Step title="Check the cache">
+    Queries `WebRemoteDynamicClaimsPrincipalContributorCache` for a recent claims payload keyed by `sub` (user id) and `client_id`. The cache uses ABP's distributed cache, so refreshes are coordinated across instances.
+  </Step>
+  <Step title="If stale, call the auth server">
+    Issues an HTTP call (via `IHttpClientFactory`) to the auth server's `/api/account/my-claims` (or the configured endpoint) using the inbound JWT as bearer credentials. The auth server returns the current claim set for that user.
+  </Step>
+  <Step title="Merge claims into the principal">
+    Replaces the principal's dynamic claims (anything in `AbpClaimTypes` flagged as refreshable) with the freshly fetched set. Static claims (`sub`, `iss`, `aud`, `iat`) are untouched.
+  </Step>
+  <Step title="Cache the result">
+    Stores the merged set with a sliding TTL (driven by `AbpClaimsPrincipalFactoryOptions.DynamicClaimsCacheDuration`).
+  </Step>
+</Steps>
+
+The result: roles / permissions assigned within the cache TTL window propagate to every microservice without the user re‑logging in, and revoked permissions take effect within the same window.
+
+## `WebRemoteDynamicClaimsPrincipalContributorOptions`
+
+```csharp
+public class WebRemoteDynamicClaimsPrincipalContributorOptions
+{
+    public bool IsEnabled { get; set; } = true;
+    // ... endpoint URL, retry counts, headers
+}
+```
+
+`PreConfigure<...>(...)` is the canonical way to set this — `AbpAspNetCoreAuthenticationJwtBearerModule.ConfigureServices` reads it via `ExecutePreConfiguredActions`, which means it must be set in a `PreConfigureServices` block of a host module that depends on this one.
+
+## Cache layer
+
+`WebRemoteDynamicClaimsPrincipalContributorCache.cs` wraps `IDistributedCache` with typed Get / Set methods. The cache key encodes user id, client id and the host module's culture so per‑tenant per‑user values don't collide.
+
+## Wiring it up in a resource API host
+
+```csharp
+// MyApiHostModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(AbpAspNetCoreAuthenticationJwtBearerModule),
+    typeof(AbpAccountHttpApiClientModule)  // for the /my-claims endpoint
+)]
+public class MyApiHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        context.Services
+            .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+            .AddJwtBearer(options =>
+            {
+                options.Authority = configuration["AuthServer:Authority"];
+                options.RequireHttpsMetadata = true;
+                options.Audience = "MyApi";
+            });
+    }
+}
+```
+
+`AddDynamicClaims()` (extension method in `Volo.Abp.Security.Claims`) is already wired by the security module; this JWT module supplies the contributor it needs.
+
+## How it interacts with the request pipeline
+
+`AbpClaimsPrincipalFactory` runs from `UseDynamicClaims()`:
+
+```mermaid
+flowchart LR
+    Req([Request with JWT]) --> JwtMw[JwtBearer handler]
+    JwtMw --> Authn[(ClaimsPrincipal)]
+    Authn --> Dynamic[UseDynamicClaims<br/>AbpDynamicClaimsPrincipalContributorMiddleware]
+    Dynamic --> Contrib[WebRemoteDynamicClaimsPrincipalContributor]
+    Contrib --> Cache{Cache hit?}
+    Cache -->|yes| Merge[Merge cached claims]
+    Cache -->|no| Remote[HTTP /api/account/my-claims]
+    Remote --> Store[Distributed cache]
+    Store --> Merge
+    Merge --> Next[(Refreshed ClaimsPrincipal)]
+    Next --> Tenant[UseMultiTenancy]
+    Tenant --> Endpoints[UseConfiguredEndpoints]
+```
+
+`MultiTenancyMiddleware` runs after the dynamic claims refresh so `CurrentUserTenantResolveContributor` can read a fresh `tenantid` claim — important for impersonation scenarios where an admin from the host swaps into a tenant context.
+
+## SignalR consideration
+
+The `AbpAuthenticationHubFilter` (in [/aspnetcore/signalr](/aspnetcore/signalr)) re‑runs the same contributor chain on a timer for active hub connections. The interval is governed by `AbpSignalROptions.CheckDynamicClaimsInterval` (default 5 seconds). Without this filter, a SignalR connection opened with a 1‑hour JWT would not see permission changes for the entire connection lifetime.
+
+## File layout
+
+```
+Volo.Abp.AspNetCore.Authentication.JwtBearer/
+└── Volo/Abp/AspNetCore/Authentication/JwtBearer/
+    ├── AbpAspNetCoreAuthenticationJwtBearerModule.cs
+    └── DynamicClaims/
+        ├── WebRemoteDynamicClaimsPrincipalContributor.cs
+        ├── WebRemoteDynamicClaimsPrincipalContributorCache.cs
+        └── WebRemoteDynamicClaimsPrincipalContributorOptions.cs
+```
+
+Four files in total — the package is intentionally minimal so it composes cleanly with whichever JWT validation library the host picked (`Microsoft.AspNetCore.Authentication.JwtBearer` is the default; `OpenIddict.Validation.AspNetCore` is an alternative). The dynamic claims behaviour is independent of the validator.
+
+## Caching behaviour in detail
+
+The cache key built by `WebRemoteDynamicClaimsPrincipalContributorCache` includes:
+
+| Component | Why |
+| --- | --- |
+| User id (`sub`) | One entry per user. |
+| Client id (`client_id`) | A single user authenticated via two different OIDC clients may have different scopes / permissions for each. |
+| Tenant id from `ICurrentTenant` | Per‑tenant entries — a host user impersonating tenant `acme` has a different claim set than the same user impersonating tenant `widgets`. |
+| Cache version (`AbpClaimsPrincipalFactoryOptions.CacheVersion`) | Bumped by ABP when the contributor schema changes — invalidates legacy entries. |
+
+The TTL combines:
+
+- `AbpClaimsPrincipalFactoryOptions.DynamicClaimsCacheDuration` — sliding TTL (default 30 seconds).
+- `WebRemoteDynamicClaimsPrincipalContributorOptions` overrides — host‑specific fixed TTL.
+
+Smaller TTLs trade auth‑server load for revocation latency; the default 30 seconds is appropriate for interactive APIs.
+
+## What happens on cache miss / endpoint failure
+
+If the upstream `/api/account/my-claims` call fails (network error, 5xx), the contributor logs the exception via `ILogger<WebRemoteDynamicClaimsPrincipalContributor>` and **keeps the stale claims**. The rationale: an auth server outage should not log every user out — it should leave their last‑known claim set in place and retry on the next request.
+
+For HTTP `401` responses (token revoked), the contributor clears the cache entry and lets the standard JWT bearer handler reject the request.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="OAuth helpers" icon="id-badge" href="/aspnetcore/auth-oauth">
+    Shared claim transformations used by the OAuth / OIDC handlers.
+  </Card>
+  <Card title="OpenID Connect" icon="lock" href="/aspnetcore/auth-openidconnect">
+    Cookie + OIDC flow for browser apps that backs the same dynamic claims story.
+  </Card>
+  <Card title="Current user" icon="shield-halved" href="/security/overview">
+    `ICurrentUser`, `AbpClaimTypes` and the dynamic claims contributor contract.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    Where `UseDynamicClaims()` sits between authentication and multi‑tenancy.
+  </Card>
+</CardGroup>

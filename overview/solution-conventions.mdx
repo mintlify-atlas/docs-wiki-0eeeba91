@@ -1,0 +1,287 @@
+---
+title: "ABP Solution Files And Package Naming Conventions"
+sidebarTitle: "Solution Conventions"
+description: "How ABP organizes solutions with .abpsln, .abpmdl, .slnx, .abppkg, .abppkg.analyze.json plus the Volo.Abp.X.Layer naming rule."
+---
+
+This page documents the file types and naming rules that make the ABP monorepo navigable. ABP relies on five custom solution / package marker files (`.abpsln`, `.abpmdl`, `.slnx`, `.abppkg`, `.abppkg.analyze.json`) on top of the standard `.csproj` / `.sln`. Together with a strict `Volo.Abp.<Area>.<Layer>` package naming rule they let the ABP Studio tooling, the CLI (`abp` — see [/cli/overview](/cli/overview)), and the build pipeline (see [Build System](/overview/build-system)) understand each project's role without parsing C# source. The Identity module (`modules/identity/`) is used as the worked example throughout, because it ships every layer suffix the framework recognizes.
+
+## File types at a glance
+
+| Extension                   | Owner          | Format    | Purpose                                                                                       |
+| --------------------------- | -------------- | --------- | --------------------------------------------------------------------------------------------- |
+| `.sln` (omitted in modules) | Visual Studio  | INI‑like  | Classic Visual Studio solution. Not used at the root of `modules/identity/`.                  |
+| `.slnx`                     | `dotnet` CLI   | XML       | New XML solution format. `dotnet build modules/identity/Volo.Abp.Identity.slnx` works.        |
+| `.abpsln`                   | ABP Studio     | JSON      | Studio solution. Lists the modules a solution composes.                                       |
+| `.abpmdl`                   | ABP Studio     | JSON      | Module manifest. Lists the packages inside one logical "module" plus folder grouping.         |
+| `.abppkg`                   | ABP CLI / Studio | JSON    | Per‑project package marker. Declares the package's *role* (`lib.domain`, `lib.application`, …).|
+| `.abppkg.analyze.json`      | Auto‑generated | JSON    | Output of the analyzer: dependsOn graph, implemented interfaces, namespace, hash.              |
+
+All of them ship as `Content` with `PackagePath=content\` thanks to the rules in `Directory.Build.props`:
+
+```xml
+<!-- Directory.Build.props (root) -->
+<ItemGroup Condition="'$(UsingMicrosoftNETSdkWeb)' != 'true' AND '$(UsingMicrosoftNETSdkRazor)' != 'true'">
+  <None Remove="*.abppkg.analyze.json" />
+  <Content Include="*.abppkg.analyze.json">
+    <Pack>true</Pack>
+    <PackagePath>content\</PackagePath>
+  </Content>
+</ItemGroup>
+<ItemGroup>
+  <None Remove="*.abppkg" />
+  <Content Include="*.abppkg">
+    <Pack>true</Pack>
+    <PackagePath>content\</PackagePath>
+  </Content>
+</ItemGroup>
+```
+
+This means consumers can read the role of any installed NuGet by inspecting `content/<Name>.abppkg`. The CLI uses that when running `abp add-module` to decide which target project each `Volo.Abp.X.Layer` package goes into.
+
+<Note>
+  The exclusion `'$(UsingMicrosoftNETSdkWeb)' != 'true' AND '$(UsingMicrosoftNETSdkRazor)' != 'true'` exists because Web / Razor SDK projects already include all `*.json` as content by default and would otherwise produce duplicate items.
+</Note>
+
+## `.abpsln` — Studio solution
+
+A `.abpsln` lists the *modules* (not the individual `.csproj`s) that participate in the solution. From `modules/identity/Volo.Abp.Identity.abpsln`:
+
+```json
+{
+  "modules": {
+    "Volo.Abp.Identity": {
+      "path": "Volo.Abp.Identity.abpmdl"
+    }
+  }
+}
+```
+
+A bigger Studio solution (e.g. the one inside an app generated from `templates/app/aspnet-core/`) would map multiple modules to their `.abpmdl` files — typically the application module plus any installed feature modules (account, identity, openiddict…).
+
+## `.abpmdl` — module manifest
+
+`modules/identity/Volo.Abp.Identity.abpmdl` declares the folder structure ABP Studio shows in its solution explorer and the *packages* that make up the module:
+
+```json
+{
+  "folders": {
+    "items": {
+      "src": {},
+      "test": {}
+    }
+  },
+  "packages": {
+    "Volo.Abp.Identity.Web": {
+      "path": "src/Volo.Abp.Identity.Web/Volo.Abp.Identity.Web.abppkg",
+      "folder": "src"
+    },
+    "Volo.Abp.Identity.HttpApi": {
+      "path": "src/Volo.Abp.Identity.HttpApi/Volo.Abp.Identity.HttpApi.abppkg",
+      "folder": "src"
+    },
+    "Volo.Abp.Identity.HttpApi.Client": {
+      "path": "src/Volo.Abp.Identity.HttpApi.Client/Volo.Abp.Identity.HttpApi.Client.abppkg",
+      "folder": "src"
+    },
+    "Volo.Abp.Identity.Blazor": {
+      "path": "src/Volo.Abp.Identity.Blazor/Volo.Abp.Identity.Blazor.abppkg",
+      "folder": "src"
+    }
+    // ... entries for every project under src/ and test/
+  }
+}
+```
+
+The manifest is what makes ABP a "module of modules" framework — at the file level a *module* is the collection of layered packages, not a single project.
+
+## `.slnx` — XML solution
+
+`.slnx` is the new XML solution format `dotnet` understands directly. `modules/identity/Volo.Abp.Identity.slnx` looks like:
+
+```xml
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Volo.Abp.Identity.Application.Contracts/Volo.Abp.Identity.Application.Contracts.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Application/Volo.Abp.Identity.Application.csproj" />
+    <Project Path="src/Volo.Abp.Identity.AspNetCore/Volo.Abp.Identity.AspNetCore.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Blazor.Server/Volo.Abp.Identity.Blazor.Server.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Blazor.WebAssembly/Volo.Abp.Identity.Blazor.WebAssembly.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Blazor/Volo.Abp.Identity.Blazor.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Domain.Shared/Volo.Abp.Identity.Domain.Shared.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.csproj" />
+    <Project Path="src/Volo.Abp.Identity.EntityFrameworkCore/Volo.Abp.Identity.EntityFrameworkCore.csproj" />
+    <Project Path="src/Volo.Abp.Identity.HttpApi.Client/Volo.Abp.Identity.HttpApi.Client.csproj" />
+    <Project Path="src/Volo.Abp.Identity.HttpApi/Volo.Abp.Identity.HttpApi.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Installer/Volo.Abp.Identity.Installer.csproj" />
+    <Project Path="src/Volo.Abp.Identity.MongoDB/Volo.Abp.Identity.MongoDB.csproj" />
+    <Project Path="src/Volo.Abp.Identity.Web/Volo.Abp.Identity.Web.csproj" />
+    <Project Path="src/Volo.Abp.PermissionManagement.Domain.Identity/Volo.Abp.PermissionManagement.Domain.Identity.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/Volo.Abp.Identity.Application.Tests/Volo.Abp.Identity.Application.Tests.csproj" />
+    <Project Path="test/Volo.Abp.Identity.AspNetCore.Tests/Volo.Abp.Identity.AspNetCore.Tests.csproj" />
+    <Project Path="test/Volo.Abp.Identity.Domain.Tests/Volo.Abp.Identity.Domain.Tests.csproj" />
+    <Project Path="test/Volo.Abp.Identity.EntityFrameworkCore.Tests/Volo.Abp.Identity.EntityFrameworkCore.Tests.csproj" />
+    <Project Path="test/Volo.Abp.Identity.MongoDB.Tests/Volo.Abp.Identity.MongoDB.Tests.csproj" />
+    <Project Path="test/Volo.Abp.Identity.TestBase/Volo.Abp.Identity.TestBase.csproj" />
+  </Folder>
+</Solution>
+```
+
+The `.slnx` is what `build/build-all.ps1` walks (via `dotnet build` against each path listed in `build/common.ps1` — see [Build System](/overview/build-system)).
+
+## `.abppkg` — per‑project role marker
+
+Each `src/Volo.Abp.X.Layer/` folder contains a 1‑line role file. For example, `modules/identity/src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.abppkg`:
+
+```json
+{
+  "role": "lib.domain"
+}
+```
+
+The role string is consumed by:
+
+| Consumer            | What it does with `role`                                                  |
+| ------------------- | ------------------------------------------------------------------------- |
+| ABP CLI             | `abp add-module identity` picks the right target project per role.        |
+| ABP Studio          | Renders icons / categorization in the solution tree.                      |
+| `apiSpec` generator | Knows that `lib.httpapi` projects should expose controllers via Swagger.  |
+
+The canonical role values seen in `framework/src/` and `modules/` are:
+
+| Role                  | Project suffix             |
+| --------------------- | -------------------------- |
+| `lib.domain.shared`   | `.Domain.Shared`           |
+| `lib.domain`          | `.Domain`                  |
+| `lib.application.contracts` | `.Application.Contracts` |
+| `lib.application`     | `.Application`             |
+| `lib.httpapi`         | `.HttpApi`                 |
+| `lib.httpapi.client`  | `.HttpApi.Client`          |
+| `lib.web`             | `.Web`                     |
+| `lib.blazor`          | `.Blazor` (& `.Server`, `.WebAssembly` variants) |
+| `lib.entityframeworkcore` | `.EntityFrameworkCore` |
+| `lib.mongodb`         | `.MongoDB`                 |
+| `lib.installer`       | `.Installer`               |
+
+## `.abppkg.analyze.json` — generated dependency graph
+
+Sibling to every `.abppkg` is a `<Name>.abppkg.analyze.json` written by the build's analyzer. Example excerpt from `modules/identity/src/Volo.Abp.Identity.Domain/Volo.Abp.Identity.Domain.abppkg.analyze.json`:
+
+```json
+{
+  "name": "Volo.Abp.Identity.Domain",
+  "hash": "",
+  "contents": [
+    {
+      "namespace": "Volo.Abp.Identity",
+      "dependsOnModules": [
+        { "declaringAssemblyName": "Volo.Abp.Ddd.Domain",            "namespace": "Volo.Abp.Domain",    "name": "AbpDddDomainModule" },
+        { "declaringAssemblyName": "Volo.Abp.Identity.Domain.Shared","namespace": "Volo.Abp.Identity",  "name": "AbpIdentityDomainSharedModule" },
+        { "declaringAssemblyName": "Volo.Abp.Users.Domain",          "namespace": "Volo.Abp.Users",    "name": "AbpUsersDomainModule" },
+        { "declaringAssemblyName": "Volo.Abp.Mapperly",              "namespace": "Volo.Abp.Mapperly", "name": "AbpMapperlyModule" }
+      ],
+      "implementingInterfaces": [
+        { "name": "IAbpModule", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IAbpModule" },
+        { "name": "IOnPreApplicationInitialization", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IOnPreApplicationInitialization" }
+      ]
+    }
+  ]
+}
+```
+
+This file is the *static* reflection of what `DependsOnAttribute` declares in `AbpIdentityDomainModule.cs`. Studio uses it to render the dependency graph and to refuse circular references *before* the project is built.
+
+<Warning>
+  Never hand‑edit `.abppkg.analyze.json` — it is overwritten on every build. Edit the C# `[DependsOn]` attribute in the module class instead, then build the project to regenerate the JSON.
+</Warning>
+
+## The `Volo.Abp.<Area>.<Layer>` naming rule
+
+Every shipped package follows the pattern `Volo.Abp.<Area>[.<Sub-area>].<Layer>`. Layers are listed below — applied consistently to both `framework/src/` and `modules/`:
+
+| Suffix                  | Layer (DDD)                | Role string             | What it contains                                                                       |
+| ----------------------- | -------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
+| `.Domain.Shared`        | Domain.Shared              | `lib.domain.shared`     | Constants, enums, shared DTOs; *no* domain types.                                       |
+| `.Domain`               | Domain                     | `lib.domain`            | Aggregates, value objects, repository interfaces, domain services.                     |
+| `.Application.Contracts`| Application.Contracts      | `lib.application.contracts` | `IApplicationService` interfaces, request / response DTOs, permission definitions.  |
+| `.Application`          | Application                | `lib.application`       | Implementations of `IApplicationService` (use cases). Depends on `Domain` + `Application.Contracts`. |
+| `.HttpApi`              | Presentation (REST)        | `lib.httpapi`           | API controllers exposing application services.                                          |
+| `.HttpApi.Client`       | Client                     | `lib.httpapi.client`    | C# dynamic proxies generated against `Application.Contracts` to call `.HttpApi`.        |
+| `.Web`                  | Presentation (Razor/MVC)   | `lib.web`               | Razor Pages + tag helpers + JS bundles.                                                 |
+| `.Blazor`               | Presentation (Blazor)      | `lib.blazor`            | Shared Razor components.                                                                |
+| `.Blazor.Server`        | Presentation (Blazor)      | `lib.blazor`            | Server‑interactive host.                                                                |
+| `.Blazor.WebAssembly`   | Presentation (Blazor)      | `lib.blazor`            | WebAssembly host.                                                                       |
+| `.EntityFrameworkCore`  | Infrastructure (RDBMS)     | `lib.entityframeworkcore` | `AbpDbContext<T>` derivation + EF Core repository implementations + `FluentApi` model. |
+| `.MongoDB`              | Infrastructure (NoSQL)     | `lib.mongodb`           | `AbpMongoDbContext` derivation + Mongo repository implementations.                      |
+| `.Installer`            | Tooling                    | `lib.installer`         | Metadata used by `abp add-module` to install the package. Not loaded at runtime.        |
+| `.MauiBlazor`           | Presentation (MAUI)        | —                       | Blazor Hybrid host (rare — only in `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor`). |
+| `.AspNetCore`           | Presentation (ASP.NET)     | —                       | Shared ASP.NET integration (auth, middleware) used by both `.Web` and `.HttpApi`.        |
+
+`modules/identity/` ships *every* one of the rows above except `.MauiBlazor`. The package `Volo.Abp.PermissionManagement.Domain.Identity` (also under `modules/identity/src/`) is an exception to the area rule — it belongs to the `PermissionManagement` area but is shipped from the Identity solution because it provides Identity‑specific permission contributors. This kind of cross‑area placement is rare but allowed.
+
+### Layer dependency rule
+
+A `.Application` package may depend on `.Domain`, `.Domain.Shared`, `.Application.Contracts` and on lower‑layer packages from other modules; it must *never* depend on `.HttpApi`, `.Web`, `.Blazor`, `.EntityFrameworkCore` or `.MongoDB`. This is enforced socially (code review + the analyzer that produces `.abppkg.analyze.json`) rather than via MSBuild — but the convention has held across all of `framework/src/` and `modules/`.
+
+| Allowed: | `.Application` → `.Domain`, `.Application.Contracts`, `.Domain.Shared` |
+| -------- | ---------------------------------------------------------------------- |
+| Allowed: | `.HttpApi` → `.Application.Contracts` (not `.Application`)             |
+| Allowed: | `.EntityFrameworkCore` → `.Domain` (implements repos)                  |
+| Forbidden:| Any `.Domain` reference to `.Application*`, `.HttpApi*`, `.Web`, `.Blazor`, infra. |
+
+The Identity Domain module's `.abppkg.analyze.json` reflects this: its only depended modules are *other Domain* / *Domain.Shared* modules.
+
+## Test naming
+
+Test projects under `modules/identity/test/` mirror the source layout but append `.Tests` or `.TestBase`:
+
+| Source project                                    | Test project                                              |
+| ------------------------------------------------- | --------------------------------------------------------- |
+| `Volo.Abp.Identity.Domain`                        | `Volo.Abp.Identity.Domain.Tests`                          |
+| `Volo.Abp.Identity.Application`                   | `Volo.Abp.Identity.Application.Tests`                     |
+| `Volo.Abp.Identity.AspNetCore`                    | `Volo.Abp.Identity.AspNetCore.Tests`                      |
+| `Volo.Abp.Identity.EntityFrameworkCore`           | `Volo.Abp.Identity.EntityFrameworkCore.Tests`             |
+| `Volo.Abp.Identity.MongoDB`                       | `Volo.Abp.Identity.MongoDB.Tests`                         |
+| —                                                 | `Volo.Abp.Identity.TestBase` (shared fixtures)            |
+
+`Directory.Build.props` detects tests by path + name:
+
+```xml
+<!-- Directory.Build.props -->
+<IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test'))
+                          and ($(MSBuildProjectName.EndsWith('.Tests'))
+                          or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+```
+
+When `IsTestProject` is true, `coverlet.collector` is auto‑injected. See [Build System](/overview/build-system) for the details.
+
+## Sample: how one `.csproj` looks
+
+Inside any `Volo.Abp.<Area>.<Layer>` folder you will see:
+
+```text
+src/Volo.Abp.Identity.Domain/
+├── AbpIdentityDomainModule.cs            # the AbpModule subclass with [DependsOn]
+├── Volo.Abp.Identity.Domain.csproj
+├── Volo.Abp.Identity.Domain.abppkg                  # {"role":"lib.domain"}
+├── Volo.Abp.Identity.Domain.abppkg.analyze.json     # generated
+└── Volo/Abp/Identity/                                # namespace-mirroring folder tree
+    ├── IdentityUser.cs
+    ├── IdentityRole.cs
+    ├── ...
+```
+
+The `Volo/Abp/Identity/` folder tree mirrors the C# namespace exactly — a convention applied across every package in `framework/src/` and `modules/`. The pattern lets readers translate `Volo.Abp.Identity.IdentityUser` directly to a path.
+
+## Cross‑references
+
+<CardGroup cols={3}>
+  <Card title="Repository layout" icon="folder-tree" href="/overview/repository-layout">Where these solutions live.</Card>
+  <Card title="Layered architecture" icon="layer-group" href="/overview/layered-architecture">What each layer suffix does at runtime.</Card>
+  <Card title="Architecture" icon="diagram-project" href="/overview/architecture">How modules compose at boot.</Card>
+  <Card title="Build system" icon="hammer" href="/overview/build-system">How `.abppkg` and `.abppkg.analyze.json` ship.</Card>
+  <Card title="CLI" icon="terminal" href="/cli/overview">How `abp add-module` reads `role`.</Card>
+  <Card title="Identity module" icon="user-shield" href="/modules/identity/overview">The reference module used here.</Card>
+</CardGroup>

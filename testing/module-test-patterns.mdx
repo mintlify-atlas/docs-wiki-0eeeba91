@@ -1,0 +1,530 @@
+---
+title: "Module Test Patterns: The Identity Walkthrough"
+sidebarTitle: "Module test patterns"
+description: "How every official ABP module structures its tests — a shared .TestBase, separate Domain.Tests / Application.Tests / EntityFrameworkCore.Tests / MongoDB.Tests projects, plus a TestDataBuilder for deterministic seeds."
+---
+
+Every official ABP module follows the same test layout. Once you understand it through one module, you can navigate the test folder of any other. This page walks through `modules/identity/test/` — the most fully-featured example — and then maps the same conventions to the rest of the framework.
+
+## The five-project layout
+
+```
+modules/identity/test/
+├── Volo.Abp.Identity.TestBase/                   // shared: data builder, abstract base, repository tests
+├── Volo.Abp.Identity.Domain.Tests/               // domain services, managers, options
+├── Volo.Abp.Identity.Application.Tests/          // application services
+├── Volo.Abp.Identity.AspNetCore.Tests/           // HTTP / controller layer
+├── Volo.Abp.Identity.EntityFrameworkCore.Tests/  // EF Core repositories (Sqlite in-memory)
+└── Volo.Abp.Identity.MongoDB.Tests/              // MongoDB repositories (MongoSandbox)
+```
+
+The same fan-out appears in `modules/permission-management`, `modules/tenant-management`, `modules/setting-management`, `modules/feature-management`, and the others. The two database test projects (`EntityFrameworkCore.Tests`, `MongoDB.Tests`) share their repository test classes — both reference the same abstract test classes from `.TestBase` and only differ in their startup module.
+
+## Volo.Abp.Identity.TestBase — the shared layer
+
+This project is **not** a unit test project per se. It contains the abstract base classes, the data builder, and (importantly) the repository test classes themselves. The other test projects derive from it and pick a backing store.
+
+```
+modules/identity/test/Volo.Abp.Identity.TestBase/Volo/Abp/Identity/
+├── AbpIdentityTestBase.cs              // generic abstract base
+├── AbpIdentityTestBaseModule.cs        // dependency root, runs IDataSeeder + builder
+├── AbpIdentityTestDataBuilder.cs       // inserts deterministic users/roles/OUs
+├── IdentityTestData.cs                 // GUIDs as constants
+├── IdentityClaimTypeRepository_Tests.cs
+├── IdentityDataSeeder_Tests.cs
+├── IdentityLinkUserRepository_Tests.cs
+├── IdentityRoleRepository_Tests.cs
+├── IdentitySecurityLogRepository_Tests.cs
+├── IdentityUserDelegationepository_Tests.cs
+├── IdentityUserRepository_Tests.cs
+├── Identity_Repository_Resolve_Tests.cs
+├── LazyLoading_Tests.cs
+└── OrganizationUnitRepository_Tests.cs
+```
+
+### The generic test base
+
+```csharp
+// AbpIdentityTestBase.cs
+public abstract class AbpIdentityTestBase<TStartupModule>
+    : AbpIntegratedTest<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    protected override void SetAbpApplicationCreationOptions(
+        AbpApplicationCreationOptions options)
+    {
+        options.UseAutofac();
+    }
+}
+```
+
+Two things to notice:
+
+1. It is generic over `TStartupModule`. The subclasses lock in a concrete module (EF Core or MongoDB).
+2. It overrides `SetAbpApplicationCreationOptions` to call `UseAutofac()`. This is the one piece of configuration **every** module test base does, for the reasons covered in [TestBase](/testing/testbase) — without it, `[UnitOfWork]` interception doesn't work.
+
+### The test-base module
+
+```csharp
+// AbpIdentityTestBaseModule.cs
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpTestBaseModule),
+    typeof(AbpIdentityDomainModule),
+    typeof(AbpAuthorizationModule)
+    )]
+public class AbpIdentityTestBaseModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAlwaysAllowAuthorization();
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        SeedTestData(context);
+    }
+
+    private static void SeedTestData(ApplicationInitializationContext context)
+    {
+        using (var scope = context.ServiceProvider.CreateScope())
+        {
+            var dataSeeder = scope.ServiceProvider.GetRequiredService<IDataSeeder>();
+            AsyncHelper.RunSync(async () =>
+            {
+                await dataSeeder.SeedAsync();
+                await scope.ServiceProvider
+                    .GetRequiredService<AbpIdentityTestDataBuilder>()
+                    .Build();
+            });
+        }
+    }
+}
+```
+
+Three jobs:
+
+1. **`AddAlwaysAllowAuthorization`** turns off the permission checker. Tests assert business rules, not authorization.
+2. **`IDataSeeder.SeedAsync()`** runs every registered `IDataSeedContributor` — this is what creates the default `admin` role and admin user (see [Data Seeding](/data/data-seeding)).
+3. **`AbpIdentityTestDataBuilder.Build()`** layers on top: the deterministic users/roles/OUs that the test classes assert against.
+
+### The data builder
+
+`AbpIdentityTestDataBuilder` is a `ITransientDependency` that builds an opinionated dataset. Its constructor pulls in every domain repository it needs:
+
+```csharp
+public class AbpIdentityTestDataBuilder : ITransientDependency
+{
+    private readonly IGuidGenerator _guidGenerator;
+    private readonly IIdentityUserRepository _userRepository;
+    private readonly IdentityUserManager _userManager;
+    private readonly IIdentityClaimTypeRepository _identityClaimTypeRepository;
+    private readonly IIdentityRoleRepository _roleRepository;
+    private readonly IOrganizationUnitRepository _organizationUnitRepository;
+    private readonly IIdentitySecurityLogRepository _identitySecurityLogRepository;
+    private readonly ILookupNormalizer _lookupNormalizer;
+    private readonly IdentityTestData _testData;
+    private readonly OrganizationUnitManager _organizationUnitManager;
+    private readonly IIdentityLinkUserRepository _identityLinkUserRepository;
+    private readonly IdentityLinkUserManager _identityLinkUserManager;
+    private readonly IIdentityUserDelegationRepository _identityUserDelegationRepository;
+    // ... constructor assigns all of them
+
+    public async Task Build()
+    {
+        await AddRoles();
+        await AddOrganizationUnits();
+        await AddUsers();
+        await AddLinkUsers();
+        await AddClaimTypes();
+        await AddSecurityLogs();
+        await AddUserDelegations();
+    }
+    // ... private helpers
+}
+```
+
+The role-creation step shows the pattern:
+
+```csharp
+private async Task AddRoles()
+{
+    _adminRole = await _roleRepository.FindByNormalizedNameAsync(
+        _lookupNormalizer.NormalizeName("admin"));
+
+    _moderatorRole = new IdentityRole(_testData.RoleModeratorId, "moderator");
+    _moderatorRole.AddClaim(_guidGenerator, new Claim("test-claim", "test-value"));
+    await _roleRepository.InsertAsync(_moderatorRole);
+
+    _supporterRole = new IdentityRole(_testData.RoleSupporterId, "supporter");
+    await _roleRepository.InsertAsync(_supporterRole);
+    // ...
+}
+```
+
+The deterministic GUIDs come from `IdentityTestData`, a singleton:
+
+```csharp
+public class IdentityTestData : ISingletonDependency
+{
+    public Guid RoleModeratorId { get; } = Guid.NewGuid();
+    public Guid RoleSupporterId { get; } = Guid.NewGuid();
+    public Guid RoleManagerId { get; } = Guid.NewGuid();
+    public Guid UserJohnId { get; } = Guid.NewGuid();
+    public Guid UserDavidId { get; } = Guid.NewGuid();
+    public Guid UserNeoId { get; } = Guid.NewGuid();
+    public Guid UserBobId { get; } = Guid.NewGuid();
+    public Guid AgeClaimId { get; } = Guid.NewGuid();
+    public Guid EducationClaimId { get; } = Guid.NewGuid();
+}
+```
+
+`Guid.NewGuid()` runs once per test class because the type is a singleton inside the per-test container. The test classes then resolve it from DI:
+
+```csharp
+public class IdentityUserManager_Tests : AbpIdentityDomainTestBase
+{
+    private readonly IdentityTestData _testData;
+
+    public IdentityUserManager_Tests()
+    {
+        _testData = GetRequiredService<IdentityTestData>();
+    }
+
+    [Fact]
+    public async Task SetRolesAsync()
+    {
+        var user = await _userRepository.GetAsync(_testData.UserJohnId);
+        // ...
+    }
+}
+```
+
+<Note>
+Same code, different store — the repository tests in `Volo.Abp.Identity.TestBase` are **shared abstract base classes**. The EF Core and MongoDB test projects subclass them and supply a different startup module. `[Fact]` discovery still works because xUnit discovers tests through inheritance.
+</Note>
+
+## Volo.Abp.Identity.Domain.Tests — the deepest layer
+
+This project pulls in the EF Core test module, then exposes a `AbpIdentityDomainTestBase`:
+
+```csharp
+// AbpIdentityDomainTestBase.cs
+public abstract class AbpIdentityDomainTestBase
+    : AbpIdentityExtendedTestBase<AbpIdentityDomainTestModule>
+{
+}
+```
+
+The startup module is `AbpIdentityDomainTestModule`:
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityEntityFrameworkCoreTestModule),
+    typeof(AbpIdentityTestBaseModule),
+    typeof(AbpPermissionManagementDomainIdentityModule)
+    )]
+public class AbpIdentityDomainTestModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDistributedEntityEventOptions>(options =>
+        {
+            options.AutoEventSelectors.Add<IdentityUser>();
+        });
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpIdentityDomainTestModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<IdentityResource>()
+                .AddVirtualJson("/Volo/Abp/Identity/LocalizationExtensions");
+        });
+
+        Configure<PermissionManagementOptions>(options =>
+        {
+            options.IsDynamicPermissionStoreEnabled = false;
+            options.SaveStaticPermissionsToDatabase = false;
+        });
+
+        Configure<AbpUnitOfWorkDefaultOptions>(options =>
+        {
+            options.TransactionBehavior = UnitOfWorkTransactionBehavior.Disabled;
+        });
+
+        Configure<AbpSettingOptions>(options =>
+        {
+            options.ValueProviders.Add<TestSettingValueProvider>();
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        SeedTestData(context);
+    }
+
+    private static void SeedTestData(ApplicationInitializationContext context)
+    {
+        using (var scope = context.ServiceProvider.CreateScope())
+        {
+            AsyncHelper.RunSync(() => scope.ServiceProvider
+                .GetRequiredService<TestPermissionDataBuilder>()
+                .Build());
+        }
+    }
+}
+```
+
+Three patterns worth highlighting:
+
+- **`UnitOfWorkTransactionBehavior.Disabled`** — Sqlite in-memory doesn't support nested transactions the way SQL Server does, so the test module disables them. See [Unit of Work](/data/unit-of-work).
+- **`IsDynamicPermissionStoreEnabled = false`** — turns off dynamic permission management in tests; the static permission graph from the providers is enough.
+- **`AutoEventSelectors.Add<IdentityUser>()`** — opts in to distributed entity events for `IdentityUser` so the `Distributed_User_Change_Event_Tests` can assert they fire.
+
+### AbpIdentityExtendedTestBase — convenience helpers
+
+Between `AbpIdentityTestBase<T>` and `AbpIdentityDomainTestBase` sits one more abstract layer that gives tests direct DbContext access and a unit-of-work helper:
+
+```csharp
+public abstract class AbpIdentityExtendedTestBase<TStartupModule>
+    : AbpIdentityTestBase<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    protected virtual T UsingDbContext<T>(Func<IIdentityDbContext, T> action)
+    {
+        using (var dbContext = GetRequiredService<IIdentityDbContext>())
+        {
+            return action.Invoke(dbContext);
+        }
+    }
+
+    protected virtual async Task UsingUowAsync(Func<Task> action)
+    {
+        using (var uow = GetRequiredService<IUnitOfWorkManager>().Begin())
+        {
+            await action();
+            await uow.CompleteAsync();
+        }
+    }
+
+    protected virtual IdentityUser GetUser(string userName)
+    {
+        var user = UsingDbContext(context =>
+            context.Users.FirstOrDefault(u => u.UserName == userName));
+        if (user == null)
+        {
+            throw new EntityNotFoundException();
+        }
+        return user;
+    }
+}
+```
+
+These helpers are the reason most assertions in `IdentityUserManager_Tests` read like:
+
+```csharp
+[Fact]
+public async Task ConcurrencyStampShouldChange()
+{
+    await UsingUowAsync(async () =>
+    {
+        var david = await _userManager.GetByIdAsync(_testData.UserDavidId);
+        // mutate
+        await _userManager.UpdateAsync(david);
+    });
+
+    var davidAfter = GetUser("david");
+    davidAfter.ConcurrencyStamp.ShouldNotBeNullOrEmpty();
+}
+```
+
+## Volo.Abp.Identity.EntityFrameworkCore.Tests — the EF Core backing store
+
+The interesting file here is the test module:
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityTestBaseModule),
+    typeof(AbpPermissionManagementEntityFrameworkCoreModule),
+    typeof(AbpIdentityEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreSqliteModule)
+    )]
+public class AbpIdentityEntityFrameworkCoreTestModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var sqliteConnection = CreateDatabaseAndGetConnection();
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.Configure(abpDbContextConfigurationContext =>
+            {
+                abpDbContextConfigurationContext.DbContextOptions.UseSqlite(sqliteConnection);
+            });
+        });
+
+        context.Services.AddAlwaysDisableUnitOfWorkTransaction();
+    }
+
+    private static SqliteConnection CreateDatabaseAndGetConnection()
+    {
+        var connection = new AbpUnitTestSqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        new IdentityDbContext(
+            new DbContextOptionsBuilder<IdentityDbContext>().UseSqlite(connection).Options
+        ).GetService<IRelationalDatabaseCreator>().CreateTables();
+
+        new PermissionManagementDbContext(
+            new DbContextOptionsBuilder<PermissionManagementDbContext>().UseSqlite(connection).Options
+        ).GetService<IRelationalDatabaseCreator>().CreateTables();
+
+        return connection;
+    }
+}
+```
+
+The recipe is universal across modules:
+
+1. Open an in-memory Sqlite connection (a custom `AbpUnitTestSqliteConnection` that lives across the test lifetime — closing it drops the in-memory DB).
+2. Run `CreateTables()` via `IRelationalDatabaseCreator` against every DbContext your module owns.
+3. Tell `AbpDbContextOptions` to `UseSqlite(connection)` so the same connection is reused for every ABP-managed DbContext.
+4. `AddAlwaysDisableUnitOfWorkTransaction()` — Sqlite plus EF Core nested transactions don't mix.
+
+This module is also referenced from the `EntityFrameworkCore.Tests` project — that project itself contains only thin subclasses like `IdentityUserRepository_Tests : Volo.Abp.Identity.IdentityUserRepository_Tests` because the test bodies live in `Volo.Abp.Identity.TestBase`.
+
+## Volo.Abp.Identity.MongoDB.Tests — the Mongo backing store
+
+Same pattern, MongoDB substrate:
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityTestBaseModule),
+    typeof(AbpPermissionManagementMongoDbModule),
+    typeof(AbpIdentityMongoDbModule)
+)]
+public class AbpIdentityMongoDbTestModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbConnectionOptions>(options =>
+        {
+            options.ConnectionStrings.Default = MongoDbFixture.GetRandomConnectionString();
+        });
+
+        Configure<AbpUnitOfWorkDefaultOptions>(options =>
+        {
+            options.TransactionBehavior = UnitOfWorkTransactionBehavior.Disabled;
+        });
+    }
+}
+```
+
+The `MongoDbFixture` boots a single-node replica set once per test process via `MongoSandbox`:
+
+```csharp
+public class MongoDbFixture : IDisposable
+{
+    public readonly static IMongoRunner MongoDbRunner;
+
+    static MongoDbFixture()
+    {
+        MongoDbRunner = MongoRunner.Run(new MongoRunnerOptions
+        {
+            UseSingleNodeReplicaSet = true
+        });
+    }
+
+    public static string GetRandomConnectionString()
+    {
+        return GetConnectionString("Db_" + Guid.NewGuid().ToString("N"));
+    }
+    // ...
+}
+```
+
+`GetRandomConnectionString()` returns a unique database name per test class so they don't bleed into each other.
+
+## Volo.Abp.Identity.Application.Tests — application-service tests
+
+Very thin — it depends on the Domain test module and adds the application module:
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityApplicationModule),
+    typeof(AbpIdentityDomainTestModule)
+    )]
+public class AbpIdentityApplicationTestModule : AbpModule
+{
+}
+
+public class AbpIdentityApplicationTestBase
+    : AbpIdentityExtendedTestBase<AbpIdentityApplicationTestModule>
+{
+}
+```
+
+Inheriting `AbpIdentityDomainTestModule` brings the entire Sqlite-backed graph along, so application-service tests resolve the real `IIdentityUserAppService`, hit the real `IdentityUserManager`, persist to the in-memory database, and assert the result. The data seeded by `AbpIdentityTestBaseModule` and `TestPermissionDataBuilder` is already there.
+
+## The pattern, generalized
+
+```mermaid
+flowchart TD
+    TB[AbpIntegratedTest&lt;TStartupModule&gt;]
+    TB --> ModBase[Abp{Module}TestBase&lt;TStartupModule&gt;<br/>UseAutofac]
+    ModBase --> Ext[Abp{Module}ExtendedTestBase&lt;TStartupModule&gt;<br/>UsingDbContext, UsingUowAsync helpers]
+
+    Ext --> DomBase[Abp{Module}DomainTestBase<br/>fixes EF Core test module]
+    Ext --> AppBase[Abp{Module}ApplicationTestBase<br/>fixes App test module]
+    Ext --> MongoBase[Abp{Module}MongoDbTestBase<br/>fixes Mongo test module]
+
+    DomBase --> DT[*.Domain.Tests/<br/>UserManager_Tests, ...]
+    AppBase --> AT[*.Application.Tests/<br/>UserAppService_Tests, ...]
+    MongoBase --> MT[*.MongoDB.Tests/<br/>thin subclasses of repository tests]
+
+    style ModBase fill:#fff4d6
+    style Ext fill:#fff4d6
+```
+
+Substitute "Identity" with `TenantManagement`, `PermissionManagement`, `FeatureManagement`, `SettingManagement`, `BackgroundJobs`, etc. and the diagram still holds.
+
+### Module-specific tweaks
+
+A few modules add small wrinkles, but the skeleton is constant:
+
+- **PermissionManagement** ships its own `TestPermissionDataBuilder` that the Identity Domain tests reuse.
+- **BackgroundJobs** test bases register an in-memory job store so jobs run synchronously.
+- **SettingManagement** tests register a `TestSettingValueProvider` (same trick `AbpIdentityDomainTestModule` uses) to inject deterministic settings.
+
+## What to put where, as a recipe
+
+<Steps>
+  <Step title="Create *.TestBase">
+    Shared abstract base + a data builder + the test data POCO + reusable abstract test classes that target both EF Core and MongoDB.
+  </Step>
+  <Step title="Create *.Domain.Tests">
+    Pick EF Core or MongoDB as the backing store (Identity picks EF Core). Add the test module, set `UnitOfWorkTransactionBehavior.Disabled`, and let `AbpIdentityTestBaseModule` seed.
+  </Step>
+  <Step title="Create *.Application.Tests">
+    `[DependsOn(YourApplicationModule, YourDomainTestModule)]`. Almost always empty otherwise.
+  </Step>
+  <Step title="Create *.EntityFrameworkCore.Tests and/or *.MongoDB.Tests">
+    Subclass the shared repository tests with one concrete startup module per store. The test bodies stay in `*.TestBase`.
+  </Step>
+  <Step title="Create *.AspNetCore.Tests when you need HTTP">
+    Inherit `AbpWebApplicationFactoryIntegratedTest<TProgram>` or the legacy `AbpAspNetCoreIntegratedTestBase<T>`. See [AspNetCore TestBase](/testing/aspnetcore-testbase).
+  </Step>
+</Steps>
+
+## Cross-references
+
+- [TestBase](/testing/testbase) — `AbpIntegratedTest<T>` and the boot-hook order this all builds on.
+- [Modularity](/core/modularity) — `[DependsOn]` graph composition that the test modules exploit.
+- [Unit of Work](/data/unit-of-work) — why `TransactionBehavior.Disabled` is necessary with Sqlite and Mongo.
+- [Data Seeding](/data/data-seeding) — `IDataSeeder`, the abstraction `AbpIdentityTestBaseModule` invokes before `AbpIdentityTestDataBuilder.Build()` runs.
+- [Test Base (guide)](/aspnetcore/test-base) — application-author angle on the same plumbing.
+- [Framework test suite](/testing/framework-test-suite) — the bigger picture of all 84 framework tests.

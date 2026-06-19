@@ -1,0 +1,534 @@
+---
+title: "Modularity: Composing ABP Apps from AbpModule Graphs"
+sidebarTitle: "Modularity"
+description: "How AbpModule, DependsOn, and the lifecycle hooks compose an ABP application — including ModuleLoader, ModuleManager, and PlugIns."
+---
+
+ABP's most distinctive design choice is that a running application **is** a graph of modules. There is no `Startup.cs` doing everything; instead, a startup module declares `[DependsOn(typeof(SomeOtherModule))]` and the framework walks the closure, sorts it, and invokes every module through a fixed set of hooks. This page covers the [`framework/src/Volo.Abp.Core/Volo/Abp/Modularity/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Core/Volo/Abp/Modularity) folder in full.
+
+## The minimal module
+
+```csharp
+[DependsOn(typeof(AbpAutofacModule))]
+[DependsOn(typeof(MyDomainModule))]
+public class MyApplicationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddProfile<MyMappingProfile>(validate: true);
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var app = context.GetApplicationBuilder();
+        app.UseConfiguredEndpoints();
+    }
+}
+```
+
+Everything in that snippet — `AbpModule`, `[DependsOn]`, `ServiceConfigurationContext`, `Configure<T>`, `ApplicationInitializationContext` — is defined in the Modularity folder.
+
+## How a module is discovered, loaded, and run
+
+```mermaid
+flowchart TD
+    Startup[Startup module type] --> Helper[AbpModuleHelper.FindAllModuleTypes<br/>walks DependsOn]
+    Helper --> Loader[ModuleLoader.LoadModules]
+    PlugIns[PlugInSourceList] --> Loader
+    Loader --> Descriptors[AbpModuleDescriptor[]]
+    Descriptors --> Sort[SortByDependencies<br/>topological]
+    Sort --> Sorted[Sorted descriptors]
+    Sorted -->|PreConfigure / Configure / PostConfigure| DI[IServiceCollection]
+    DI --> Manager[ModuleManager]
+    Manager -->|OnPreApplicationInitialization| App1[Running]
+    Manager -->|OnApplicationInitialization| App1
+    Manager -->|OnPostApplicationInitialization| App1
+    App1 --> Shutdown[OnApplicationShutdown<br/>reverse order]
+    style Loader fill:#ba4395,color:#fff
+    style Manager fill:#ba4395,color:#fff
+```
+
+The two protagonists are `ModuleLoader` (assembles the graph) and `ModuleManager` (drives the hooks). The rest of the folder gives you the contracts to participate.
+
+## `IAbpModule` and `AbpModule`
+
+The contract is two methods:
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs
+public interface IAbpModule
+{
+    Task ConfigureServicesAsync(ServiceConfigurationContext context);
+    void ConfigureServices(ServiceConfigurationContext context);
+}
+```
+
+But you never implement that bare interface directly. You inherit `AbpModule`, which implements `IAbpModule` *plus* every optional hook:
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs
+public abstract class AbpModule :
+    IAbpModule,
+    IOnPreApplicationInitialization,
+    IOnApplicationInitialization,
+    IOnPostApplicationInitialization,
+    IOnApplicationShutdown,
+    IPreConfigureServices,
+    IPostConfigureServices
+{
+    protected internal bool SkipAutoServiceRegistration { get; protected set; }
+
+    protected internal ServiceConfigurationContext ServiceConfigurationContext {
+        get {
+            if (_serviceConfigurationContext == null)
+            {
+                throw new AbpException(
+                    $"{nameof(ServiceConfigurationContext)} is only available in the {nameof(ConfigureServices)}, {nameof(PreConfigureServices)} and {nameof(PostConfigureServices)} methods.");
+            }
+            return _serviceConfigurationContext;
+        }
+        internal set => _serviceConfigurationContext = value;
+    }
+
+    private ServiceConfigurationContext? _serviceConfigurationContext;
+
+    public virtual void PreConfigureServices(ServiceConfigurationContext context) { }
+    public virtual void ConfigureServices(ServiceConfigurationContext context) { }
+    public virtual void PostConfigureServices(ServiceConfigurationContext context) { }
+
+    public virtual void OnPreApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual void OnApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual void OnPostApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual void OnApplicationShutdown(ApplicationShutdownContext context) { }
+
+    // ... async overloads that delegate to the sync ones
+}
+```
+
+You override only the hooks you need. The async overloads call the sync ones unless you also override them.
+
+The `Async`/sync pair pattern repeats for every hook. Override `OnApplicationInitializationAsync` if you need to `await` something; the default `OnApplicationInitializationAsync` just calls the sync `OnApplicationInitialization` and returns `Task.CompletedTask`.
+
+`SkipAutoServiceRegistration = true` opts the module out of the `Services.AddAssembly(asm)` loop in [`AbpApplicationBase`](/core/abp-application-base#configureservices--three-passes-over-every-module). Almost never used outside of the framework's own infrastructure modules.
+
+## The hook lifecycle in order
+
+| Phase | Interface | When it runs | Throws wrapper |
+| --- | --- | --- | --- |
+| Service config: pre | `IPreConfigureServices` | First pass — before any module's `ConfigureServices` runs. Use to set defaults other modules read. | `AbpInitializationException` |
+| Service config: main | `IAbpModule` (`ConfigureServices`) | Second pass — assembly auto-registration happens immediately before this. Most modules only override this. | `AbpInitializationException` |
+| Service config: post | `IPostConfigureServices` | Third pass — after every module's `ConfigureServices`. Use to validate or post-process options. | `AbpInitializationException` |
+| Runtime: pre-init | `IOnPreApplicationInitialization` | Inside `Initialize()`, scoped provider. First lifecycle contributor pass. | `AbpInitializationException` |
+| Runtime: init | `IOnApplicationInitialization` | Second contributor pass. ASP.NET Core middleware wiring happens here. | `AbpInitializationException` |
+| Runtime: post-init | `IOnPostApplicationInitialization` | Third contributor pass — every module's `OnApplicationInitialization` has finished by now. | `AbpInitializationException` |
+| Runtime: shutdown | `IOnApplicationShutdown` | Inside `Shutdown()`. Modules visited in **reverse dependency order**. | `AbpShutdownException` |
+
+Sources for the interfaces, one line each:
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IPreConfigureServices.cs
+public interface IPreConfigureServices
+{
+    Task PreConfigureServicesAsync(ServiceConfigurationContext context);
+    void PreConfigureServices(ServiceConfigurationContext context);
+}
+
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IPostConfigureServices.cs
+public interface IPostConfigureServices
+{
+    Task PostConfigureServicesAsync(ServiceConfigurationContext context);
+    void PostConfigureServices(ServiceConfigurationContext context);
+}
+
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IOnPreApplicationInitialization.cs
+public interface IOnPreApplicationInitialization
+{
+    Task OnPreApplicationInitializationAsync([NotNull] ApplicationInitializationContext context);
+    void OnPreApplicationInitialization([NotNull] ApplicationInitializationContext context);
+}
+```
+
+The `IOnApplicationInitialization`, `IOnPostApplicationInitialization`, and `IOnApplicationShutdown` interfaces follow the exact same shape — async + sync pair.
+
+## `[DependsOn]` — declaring the graph
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+public class DependsOnAttribute : Attribute, IDependedTypesProvider
+{
+    public Type[] DependedTypes { get; }
+
+    public DependsOnAttribute(params Type[]? dependedTypes)
+    {
+        DependedTypes = dependedTypes ?? Type.EmptyTypes;
+    }
+
+    public virtual Type[] GetDependedTypes()
+    {
+        return DependedTypes;
+    }
+}
+```
+
+It is `AllowMultiple = true` so you can split the list:
+
+```csharp
+[DependsOn(typeof(AbpAuthorizationModule))]
+[DependsOn(typeof(AbpAutoMapperModule))]
+[DependsOn(typeof(AbpDddDomainModule))]
+public class MyDomainModule : AbpModule { }
+```
+
+The implementation behind the scenes is `IDependedTypesProvider`. You can build your own attribute that derives from `DependsOnAttribute` (or implements `IDependedTypesProvider`) if you need conditional dependencies — `AbpModuleHelper.FindDependedModuleTypes` enumerates *every* `IDependedTypesProvider` attribute on a module type.
+
+## `[AdditionalAssembly]` — pulling in extra assemblies
+
+A module's primary assembly is its own. Sometimes a module needs the conventional registrar to walk *another* assembly too (e.g. a shared types DLL that has no module of its own).
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AdditionalAssemblyAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+public class AdditionalAssemblyAttribute : Attribute, IAdditionalModuleAssemblyProvider
+{
+    public Type[] TypesInAssemblies { get; }
+
+    public AdditionalAssemblyAttribute(params Type[]? typesInAssemblies)
+    {
+        TypesInAssemblies = typesInAssemblies ?? Type.EmptyTypes;
+    }
+
+    public virtual Assembly[] GetAssemblies()
+    {
+        return TypesInAssemblies.Select(t => t.Assembly).Distinct().ToArray();
+    }
+}
+```
+
+You pass a representative type from each extra assembly; the attribute extracts `.Assembly`. The result feeds into `AbpModuleDescriptor.AllAssemblies`, which is exactly the list iterated for assembly auto-registration in `AbpApplicationBase`.
+
+## `ServiceConfigurationContext`
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ServiceConfigurationContext.cs
+public class ServiceConfigurationContext
+{
+    public IServiceCollection Services { get; }
+
+    public IConfiguration Configuration {
+        get { return _configuration ??= Services.GetConfiguration(); }
+    }
+    private IConfiguration? _configuration;
+
+    public IDictionary<string, object?> Items { get; }
+
+    public object? this[string key] {
+        get => Items.GetOrDefault(key);
+        set => Items[key] = value;
+    }
+
+    public ServiceConfigurationContext([NotNull] IServiceCollection services)
+    {
+        Services = Check.NotNull(services, nameof(services));
+        Items = new Dictionary<string, object?>();
+    }
+}
+```
+
+- **`Services`** is the live `IServiceCollection`. Every `Configure<TOptions>` modules write to is `context.Services.Configure<TOptions>(...)`. See [Options & configuration](/core/options-and-configuration).
+- **`Configuration`** is lazily resolved from the service collection — backed by `ServiceCollectionConfigurationExtensions.GetConfiguration`.
+- **`Items`** is the cross-module passing channel: module A stores `context["MyKey"] = something;`, module B (loaded later because of `[DependsOn]`) reads it back. A single `ServiceConfigurationContext` instance is shared across all three passes (Pre → Configure → Post), so this dictionary survives the phases.
+
+## `AbpModuleDescriptor`
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptor.cs
+public class AbpModuleDescriptor : IAbpModuleDescriptor
+{
+    public Type Type { get; }
+    public Assembly Assembly { get; }
+    public Assembly[] AllAssemblies { get; }
+    public IAbpModule Instance { get; }
+    public bool IsLoadedAsPlugIn { get; }
+
+    public IReadOnlyList<IAbpModuleDescriptor> Dependencies => _dependencies.ToImmutableList();
+    private readonly List<IAbpModuleDescriptor> _dependencies;
+
+    public AbpModuleDescriptor(
+        [NotNull] Type type,
+        [NotNull] IAbpModule instance,
+        bool isLoadedAsPlugIn)
+    {
+        Check.NotNull(type, nameof(type));
+        Check.NotNull(instance, nameof(instance));
+        AbpModule.CheckAbpModuleType(type);
+
+        if (!type.GetTypeInfo().IsAssignableFrom(instance.GetType()))
+        {
+            throw new ArgumentException(
+                $"Given module instance ({instance.GetType().AssemblyQualifiedName}) is not an instance of given module type: {type.AssemblyQualifiedName}");
+        }
+
+        Type = type;
+        Assembly = type.Assembly;
+        AllAssemblies = AbpModuleHelper.GetAllAssemblies(type);
+        Instance = instance;
+        IsLoadedAsPlugIn = isLoadedAsPlugIn;
+
+        _dependencies = new List<IAbpModuleDescriptor>();
+    }
+}
+```
+
+You never construct one — `ModuleLoader.CreateModuleDescriptor` does. But you read these descriptors all the time: `IAbpApplication.Modules` exposes the full list, ordered by dependency.
+
+## `ModuleLoader`
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+public class ModuleLoader : IModuleLoader
+{
+    public IAbpModuleDescriptor[] LoadModules(
+        IServiceCollection services,
+        Type startupModuleType,
+        PlugInSourceList plugInSources)
+    {
+        Check.NotNull(services, nameof(services));
+        Check.NotNull(startupModuleType, nameof(startupModuleType));
+        Check.NotNull(plugInSources, nameof(plugInSources));
+
+        var modules = GetDescriptors(services, startupModuleType, plugInSources);
+        modules = SortByDependency(modules, startupModuleType);
+        return modules.ToArray();
+    }
+```
+
+Three steps:
+
+1. **`FillModules`** runs `AbpModuleHelper.FindAllModuleTypes(startupModuleType)` to walk `[DependsOn]` transitively, then appends every plug-in source's modules:
+
+```csharp
+foreach (var moduleType in AbpModuleHelper.FindAllModuleTypes(startupModuleType, logger))
+{
+    modules.Add(CreateModuleDescriptor(services, moduleType));
+}
+
+foreach (var moduleType in plugInSources.GetAllModules(logger))
+{
+    if (modules.Any(m => m.Type == moduleType)) { continue; }
+    modules.Add(CreateModuleDescriptor(services, moduleType, isLoadedAsPlugIn: true));
+}
+```
+
+2. **`SetDependencies`** wires each descriptor's `Dependencies` list:
+
+```csharp
+foreach (var dependedModuleType in AbpModuleHelper.FindDependedModuleTypes(module.Type))
+{
+    var dependedModule = modules.FirstOrDefault(m => m.Type == dependedModuleType);
+    if (dependedModule == null)
+    {
+        throw new AbpException(
+            "Could not find a depended module " + dependedModuleType.AssemblyQualifiedName +
+            " for " + module.Type.AssemblyQualifiedName);
+    }
+
+    module.AddDependency(dependedModule);
+}
+```
+
+3. **`SortByDependency`** topologically sorts so dependencies come first, then **forcibly moves the startup module to the very end**:
+
+```csharp
+protected virtual List<IAbpModuleDescriptor> SortByDependency(List<IAbpModuleDescriptor> modules, Type startupModuleType)
+{
+    var sortedModules = modules.SortByDependencies(m => m.Dependencies);
+    sortedModules.MoveItem(m => m.Type == startupModuleType, modules.Count - 1);
+    return sortedModules;
+}
+```
+
+The startup module is *always* last. This is a deliberate guarantee: whatever the app's own module does runs after every framework module has had its say. Your app gets the last word during `ConfigureServices` and the first/last position during initialization (first in `OnPreApplicationInitialization`'s contributor sweep is the deepest dependency, last is your startup module — so your module sees everyone else's state).
+
+Module instances are constructed via `Activator.CreateInstance` and registered as singletons keyed by their concrete type:
+
+```csharp
+protected virtual IAbpModule CreateAndRegisterModule(IServiceCollection services, Type moduleType)
+{
+    var module = (IAbpModule)Activator.CreateInstance(moduleType)!;
+    services.AddSingleton(moduleType, module);
+    return module;
+}
+```
+
+That means any code anywhere can `serviceProvider.GetRequiredService<MyStartupModule>()` and inspect the instance — though you almost never need to.
+
+## `ModuleManager`
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs
+public class ModuleManager : IModuleManager, ISingletonDependency
+{
+    private readonly IModuleContainer _moduleContainer;
+    private readonly IEnumerable<IModuleLifecycleContributor> _lifecycleContributors;
+    private readonly ILogger<ModuleManager> _logger;
+
+    public ModuleManager(
+        IModuleContainer moduleContainer,
+        ILogger<ModuleManager> logger,
+        IOptions<AbpModuleLifecycleOptions> options,
+        IServiceProvider serviceProvider)
+    {
+        _moduleContainer = moduleContainer;
+        _logger = logger;
+
+        _lifecycleContributors = options.Value
+            .Contributors
+            .Select(serviceProvider.GetRequiredService)
+            .Cast<IModuleLifecycleContributor>()
+            .ToArray();
+    }
+```
+
+The contributor list comes from `AbpModuleLifecycleOptions.Contributors` — a `List<Type>` that maps to one entry per hook (pre-init, init, post-init, shutdown). Each contributor type implements `IModuleLifecycleContributor`, which has `InitializeAsync(context, module)` and `ShutdownAsync(context, module)` methods. `DefaultModuleLifecycleContributor` is the abstract base; concrete subclasses each cast the module to one of the four hook interfaces.
+
+That means you can register a **custom** lifecycle contributor by writing `Configure<AbpModuleLifecycleOptions>(options => options.Contributors.Add(typeof(MyContributor)))` — though this is rare.
+
+`InitializeModulesAsync` was quoted in [Application lifecycle](/core/abp-application-base#initialize--the-four-ordered-hooks); the shutdown counterpart iterates `_moduleContainer.Modules.Reverse()` so dependents tear down before their dependencies.
+
+## `IModuleLoader` and `IModuleManager`
+
+```csharp
+public interface IModuleLoader
+{
+    IAbpModuleDescriptor[] LoadModules(
+        IServiceCollection services,
+        Type startupModuleType,
+        PlugInSourceList plugInSources);
+}
+
+public interface IModuleManager
+{
+    void InitializeModules(ApplicationInitializationContext context);
+    Task InitializeModulesAsync(ApplicationInitializationContext context);
+    void ShutdownModules(ApplicationShutdownContext context);
+    Task ShutdownModulesAsync(ApplicationShutdownContext context);
+}
+```
+
+`IModuleLoader` is registered as a singleton in `AddCoreServices` (called from `AbpApplicationBase` ctor); `IModuleManager` is registered via its `ISingletonDependency` marker through conventional registration. You can replace either by writing a `[Dependency(ReplaceServices = true)]` implementation, but in practice you never need to.
+
+## PlugIns — modules without `[DependsOn]`
+
+Some scenarios need modules to be **loaded at runtime**: the host doesn't statically reference them. The [`Modularity/PlugIns/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns) subfolder is the answer.
+
+```text
+PlugIns/
+├── FilePlugInSource.cs       ← load assemblies from a list of DLL paths
+├── FolderPlugInSource.cs     ← scan a folder for *.dll
+├── TypePlugInSource.cs       ← include a specific module Type directly
+├── IPlugInSource.cs          ← contract: GetModules(), GetAllAssemblies()
+├── PlugInSourceList.cs       ← List<IPlugInSource> with GetAllModules()
+├── PlugInSourceExtensions.cs ← .AddFolder(), .AddFiles(), .AddTypes() sugar
+└── PlugInSourceListExtensions.cs
+```
+
+You register plug-in sources in `AbpApplicationCreationOptions.PlugInSources`:
+
+```csharp
+options.PlugInSources.AddFolder(@"/var/app/plugins");
+options.PlugInSources.AddTypes(typeof(MyHotSwappableModule));
+```
+
+Inside `ModuleLoader.FillModules` the plug-in modules are appended *after* the `[DependsOn]` closure (and skipped if already present). They still participate in the topological sort, so a plug-in's own `[DependsOn]` is honored.
+
+<Warning>
+  Plug-in modules cannot replace services from the static module graph during `PreConfigureServices` if they are loaded *after* a module that already configured those services. Plug-in load order is "as-discovered" within a `PlugInSourceList`; consider this when designing extension points.
+</Warning>
+
+## How a module composes — a concrete trace
+
+Given:
+
+```csharp
+[DependsOn(typeof(AbpDddDomainModule))]
+public class MyDomainModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context["MyDomain:Initialized"] = false;
+        PreConfigure<AbpAutoMapperOptions>(opts =>
+            opts.AddProfile<DomainEventToDtoProfile>(validate: true));
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // services from this assembly were already registered by AddAssembly()
+        Configure<MyDomainOptions>(context.Configuration.GetSection("MyDomain"));
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        context["MyDomain:Initialized"] = true;
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var seeder = context.ServiceProvider.GetRequiredService<IDataSeeder>();
+        AsyncHelper.RunSync(() => seeder.SeedAsync(new DataSeedContext()));
+    }
+}
+```
+
+The framework's run, in order:
+
+1. `ModuleLoader.LoadModules` resolves `[AbpDddDomainModule, MyDomainModule]` (in dependency order, startup last).
+2. `AbpApplicationBase.ConfigureServices`:
+   - **Pre pass:** `AbpDddDomainModule.PreConfigureServices` (if it has one), then `MyDomainModule.PreConfigureServices`. `PreConfigure<AbpAutoMapperOptions>(...)` queues into `PreConfigureActionList<AbpAutoMapperOptions>` exposed via `IObjectAccessor`.
+   - **Main pass, per module:** `Services.AddAssembly(asm)` runs the conventional registrars over the module's assemblies, then `ConfigureServices` runs. `Configure<MyDomainOptions>(...)` calls `services.Configure<MyDomainOptions>(IConfigurationSection)`.
+   - **Post pass:** `MyDomainModule.PostConfigureServices` updates the shared `Items` dictionary.
+3. `IServiceProvider` is built (Microsoft DI or Autofac).
+4. `AbpApplicationBase.InitializeModules` opens a scope, asks `IModuleManager`, the manager iterates contributors × modules, so `OnApplicationInitialization` fires on `AbpDddDomainModule` before `MyDomainModule`. By the time `MyDomainModule.OnApplicationInitialization` runs, `IDataSeeder` is fully wired.
+5. On shutdown, `MyDomainModule.OnApplicationShutdown` runs **before** `AbpDddDomainModule.OnApplicationShutdown`.
+
+## `AbpModule` helpers you actually call
+
+```csharp
+// AbpModule.cs (excerpts)
+protected void Configure<TOptions>(Action<TOptions> configureOptions) where TOptions : class
+    => ServiceConfigurationContext.Services.Configure(configureOptions);
+
+protected void Configure<TOptions>(IConfiguration configuration) where TOptions : class
+    => ServiceConfigurationContext.Services.Configure<TOptions>(configuration);
+
+protected void PreConfigure<TOptions>(Action<TOptions> configureOptions) where TOptions : class
+    => ServiceConfigurationContext.Services.PreConfigure(configureOptions);
+
+protected void PostConfigure<TOptions>(Action<TOptions> configureOptions) where TOptions : class
+    => ServiceConfigurationContext.Services.PostConfigure(configureOptions);
+
+protected void PostConfigureAll<TOptions>(Action<TOptions> configureOptions) where TOptions : class
+    => ServiceConfigurationContext.Services.PostConfigureAll(configureOptions);
+```
+
+These are the verbs you use in every real module. The semantics are documented in [Options & configuration](/core/options-and-configuration).
+
+## Related reading
+
+<CardGroup cols={2}>
+  <Card title="Application lifecycle" icon="play" href="/core/abp-application-base">
+    The `AbpApplicationBase` orchestration that calls every hook documented here.
+  </Card>
+  <Card title="Dependency injection" icon="diagram-project" href="/core/dependency-injection">
+    What `Services.AddAssembly(assembly)` does between modules — the conventional registrar pipeline.
+  </Card>
+  <Card title="Options & configuration" icon="sliders" href="/core/options-and-configuration">
+    `PreConfigure` vs `Configure` vs `PostConfigure` semantics on the underlying options pattern.
+  </Card>
+  <Card title="DDD module" icon="cubes" href="/ddd/overview">
+    Concrete example of how `AbpDddDomainModule` composes with your domain module.
+  </Card>
+</CardGroup>

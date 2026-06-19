@@ -1,0 +1,461 @@
+---
+title: "Razor template rendering engine with typed C# models"
+sidebarTitle: "Razor Engine"
+description: "RazorTemplateRenderingEngine, the Roslyn-compiled IRazorTemplatePage<TModel>, AbpCompiledViewProvider, and how layouts and localizers are wired."
+---
+
+`Volo.Abp.TextTemplating.Razor` plugs Razor — the same syntax used by MVC views and Razor Pages — into the [text templating](/localization/text-templating) pipeline. Templates are written as `.cshtml` files, compiled to in-memory assemblies by Roslyn at first use, then cached forever. Inside the template you have a strongly-typed `Model`, an `IServiceProvider` for arbitrary DI lookups, an `IStringLocalizer` ready to call, and the usual encoders.
+
+Use this engine when:
+
+- You want full C# (loops, generics, conditional formatting) instead of a sandboxed expression language.
+- You need a strongly typed `Model` (intellisense and refactoring matter).
+- The templates are written by developers, not by tenants — the engine has the same trust level as application code.
+
+If templates are end-user editable, prefer [Scriban](/localization/text-templating-scriban) instead, which is sandboxed by design.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.TextTemplating.Razor/Volo/Abp/TextTemplating/Razor/
+├── AbpTextTemplatingRazorModule.cs
+├── RazorTemplateRenderingEngine.cs       # the engine
+├── RazorTemplateDefinitionExtensions.cs  # .WithRazorEngine()
+├── AbpRazorTemplateConsts.cs             # "Abp.Razor.Template" type name
+├── IRazorTemplatePage.cs                 # abstraction the compiled type implements
+├── RazorTemplatePageBase.cs              # base class your .cshtml inherits at runtime
+├── IAbpCompiledViewProvider.cs
+├── DefaultAbpCompiledViewProvider.cs     # Roslyn compilation + Assembly cache
+├── IAbpRazorProjectEngineFactory.cs
+├── DefaultAbpRazorProjectEngineFactory.cs
+├── AbpCompiledViewProviderOptions.cs     # per-template MetadataReference list
+├── AbpRazorTemplateCSharpCompiler.cs
+├── AbpRazorTemplateCSharpCompilerOptions.cs
+├── EmptyProjectFileSystem.cs
+└── NotFoundProjectItem.cs
+```
+
+## Module
+
+```csharp
+// AbpTextTemplatingRazorModule.cs
+[DependsOn(typeof(AbpTextTemplatingCoreModule))]
+public class AbpTextTemplatingRazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpTextTemplatingOptions>(options =>
+        {
+            if (options.DefaultRenderingEngine.IsNullOrWhiteSpace())
+            {
+                options.DefaultRenderingEngine = RazorTemplateRenderingEngine.EngineName;
+            }
+            options.RenderingEngines[RazorTemplateRenderingEngine.EngineName] = typeof(RazorTemplateRenderingEngine);
+        });
+    }
+}
+```
+
+Two effects:
+
+1. **Register** the `"Razor"` engine name → `RazorTemplateRenderingEngine` type mapping inside `AbpTextTemplatingOptions.RenderingEngines`.
+2. **Set** `DefaultRenderingEngine` to `"Razor"` **only if no other engine has set it yet**. If you depend on both Razor and Scriban, Scriban will overwrite the default unconditionally — see the note on engine ordering below.
+
+The engine name is a const:
+
+```csharp
+public const string EngineName = "Razor";
+```
+
+And `AbpRazorTemplateConsts` pins the generated CLR type the compiled assembly must expose:
+
+```csharp
+// AbpRazorTemplateConsts.cs
+public static class AbpRazorTemplateConsts
+{
+    public const string DefaultNameSpace = "Abp.Razor";
+    public const string DefaultClassName = "Template";
+    public const string TypeName = DefaultNameSpace + "." + DefaultClassName;
+}
+```
+
+## `RazorTemplateRenderingEngine`
+
+This is the engine `AbpTemplateRenderer` resolves through `Options.RenderingEngines["Razor"]`. It inherits the engine base (which exposes the localizer and the content provider) and adds the compilation + activation walk:
+
+```csharp
+// RazorTemplateRenderingEngine.cs
+public class RazorTemplateRenderingEngine : TemplateRenderingEngineBase, ITransientDependency
+{
+    public const string EngineName = "Razor";
+    public override string Name => EngineName;
+
+    protected readonly IServiceScopeFactory ServiceScopeFactory;
+
+    public RazorTemplateRenderingEngine(
+        IServiceScopeFactory serviceScopeFactory,
+        ITemplateDefinitionManager templateDefinitionManager,
+        ITemplateContentProvider templateContentProvider,
+        IStringLocalizerFactory stringLocalizerFactory)
+        : base(templateDefinitionManager, templateContentProvider, stringLocalizerFactory)
+    {
+        ServiceScopeFactory = serviceScopeFactory;
+    }
+
+    public override async Task<string> RenderAsync(
+        [NotNull] string templateName,
+        object? model = null,
+        string? cultureName = null,
+        Dictionary<string, object>? globalContext = null)
+    {
+        Check.NotNullOrWhiteSpace(templateName, nameof(templateName));
+
+        if (globalContext == null)
+            globalContext = new Dictionary<string, object>();
+
+        if (cultureName == null)
+        {
+            return await RenderInternalAsync(templateName, null, globalContext, model);
+        }
+        else
+        {
+            using (CultureHelper.Use(cultureName))
+            {
+                return await RenderInternalAsync(templateName, null, globalContext, model);
+            }
+        }
+    }
+}
+```
+
+The `CultureHelper.Use(cultureName)` block is important — it temporarily sets `CultureInfo.CurrentCulture` and `CurrentUICulture` for the duration of the render, so `TemplateContentProvider`'s culture fallback and the localizer's lookups all see the same culture.
+
+### Layouts
+
+`RenderInternalAsync` recursively renders the layout, passing the inner rendered body as the `Body` property of the outer page:
+
+```csharp
+protected virtual async Task<string> RenderInternalAsync(
+    string templateName,
+    string? body,
+    Dictionary<string, object> globalContext,
+    object? model = null)
+{
+    var templateDefinition = await TemplateDefinitionManager.GetAsync(templateName);
+
+    var renderedContent = await RenderSingleTemplateAsync(
+        templateDefinition, body, globalContext, model);
+
+    if (templateDefinition.Layout != null)
+    {
+        renderedContent = await RenderInternalAsync(
+            templateDefinition.Layout,
+            renderedContent,
+            globalContext
+        );
+    }
+
+    return renderedContent;
+}
+```
+
+So if `WelcomeEmail` declares `Layout = "EmailLayout"`, ABP renders `WelcomeEmail` first, then renders `EmailLayout` with the result available as `Body` in the layout's `.cshtml`.
+
+### Activation and `IRazorTemplatePage`
+
+The heart of the engine — note the reflection-based generic dispatch for the `Model` setter so the engine itself never has to know `TModel`:
+
+```csharp
+protected virtual async Task<string> RenderTemplateContentWithRazorAsync(
+    TemplateDefinition templateDefinition,
+    string? body,
+    Dictionary<string, object> globalContext,
+    object? model = null)
+{
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var compiledViewProvider = scope.ServiceProvider.GetRequiredService<IAbpCompiledViewProvider>();
+        var assembly = await compiledViewProvider.GetAssemblyAsync(templateDefinition);
+        var templateType = assembly.GetType(AbpRazorTemplateConsts.TypeName)!;
+        var template = (IRazorTemplatePage)Activator.CreateInstance(templateType)!;
+
+        var modelType = templateType
+            .GetInterfaces()
+            .Where(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IRazorTemplatePage<>))
+            .Select(x => x.GenericTypeArguments.FirstOrDefault())
+            .FirstOrDefault();
+
+        if (modelType != null)
+        {
+            GetType().GetMethod(nameof(SetModel), BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.MakeGenericMethod(modelType).Invoke(this, new[] { template, model });
+        }
+
+        template.ServiceProvider = scope.ServiceProvider;
+        template.Localizer = GetLocalizerOrNull(templateDefinition);
+        template.HtmlEncoder = scope.ServiceProvider.GetService<HtmlEncoder>();
+        template.JavaScriptEncoder = scope.ServiceProvider.GetService<JavaScriptEncoder>();
+        template.UrlEncoder = scope.ServiceProvider.GetService<UrlEncoder>();
+        template.Body = body;
+        template.GlobalContext = globalContext;
+
+        await template.ExecuteAsync();
+
+        return await template.GetOutputAsync();
+    }
+}
+
+private void SetModel<TModel>(IRazorTemplatePage razorTemplatePage, object? model = null)
+{
+    if (razorTemplatePage is IRazorTemplatePage<TModel> razorTemplatePageWithModel)
+        razorTemplatePageWithModel.Model = (TModel?)model;
+}
+```
+
+So each render: new scope → look up the assembly (compiled or cached) → activate `Abp.Razor.Template` → inject the localizer / `ServiceProvider` / encoders → run `ExecuteAsync` → grab the rendered string.
+
+### `IRazorTemplatePage<TModel>`
+
+The contract the generated class implements:
+
+```csharp
+// IRazorTemplatePage.cs
+public interface IRazorTemplatePage<TModel> : IRazorTemplatePage
+{
+    TModel? Model { get; set; }
+}
+
+public interface IRazorTemplatePage
+{
+    IServiceProvider ServiceProvider { get; set; }
+    IStringLocalizer? Localizer { get; set; }
+    HtmlEncoder? HtmlEncoder { get; set; }
+    JavaScriptEncoder? JavaScriptEncoder { get; set; }
+    UrlEncoder? UrlEncoder { get; set; }
+    Dictionary<string, object> GlobalContext { get; set; }
+    string? Body { get; set; }
+    Task ExecuteAsync();
+    Task<string> GetOutputAsync();
+}
+```
+
+`Localizer` is what backs the `L["Key"]` calls in your `.cshtml`. It is resolved by the base engine's `GetLocalizerOrNull(templateDefinition)` — see [text-templating](/localization/text-templating). If the template's `TemplateDefinition.LocalizationResourceName` is set, the localizer points at that [resource](/localization/multi-lingual-objects); otherwise it points at `AbpLocalizationOptions.DefaultResourceType`.
+
+## `DefaultAbpCompiledViewProvider` — Roslyn compilation
+
+The provider runs the standard Razor source generator (`RazorProjectEngine`) on the template content, hands the generated C# to Roslyn, and emits a one-class assembly into memory. The assembly is keyed by `md5(name + content)` and cached on a static dictionary, so a content change automatically invalidates the cache without any explicit reload step:
+
+```csharp
+// DefaultAbpCompiledViewProvider.cs
+public virtual async Task<Assembly> GetAssemblyAsync(TemplateDefinition templateDefinition)
+{
+    async Task<Assembly> CreateAssembly(string content)
+    {
+        using (var assemblyStream = await GetAssemblyStreamAsync(templateDefinition, content))
+            return Assembly.Load(await assemblyStream.GetAllBytesAsync());
+    }
+
+    var templateContent = await _templateContentProvider.GetContentOrNullAsync(templateDefinition);
+    if (templateContent == null)
+        throw new AbpException($"Razor template content of {templateDefinition.Name} is null!");
+
+    using (await SemaphoreSlim.LockAsync())
+    {
+        var cacheKey = (templateDefinition.Name + templateContent).ToMd5();
+        if (CachedAssembles.TryGetValue(cacheKey, out var cachedAssemble))
+            return cachedAssemble;
+        var assemble = await CreateAssembly(templateContent);
+        CachedAssembles.TryAdd(cacheKey, assemble);
+        return assemble;
+    }
+}
+```
+
+Note `CachedAssembles` is `static` — assemblies stay loaded for the process lifetime. ABP intentionally does not unload them; templates change rarely, the surface is small.
+
+The C# generation step pins the namespace and class name so the engine can `assembly.GetType("Abp.Razor.Template")`:
+
+```csharp
+protected virtual async Task<Stream> GetAssemblyStreamAsync(
+    TemplateDefinition templateDefinition, string templateContent)
+{
+    var razorProjectEngine = await _razorProjectEngineFactory.CreateAsync(builder =>
+    {
+        builder.SetNamespace(AbpRazorTemplateConsts.DefaultNameSpace);
+        builder.ConfigureClass((document, node) =>
+        {
+            node.ClassName = AbpRazorTemplateConsts.DefaultClassName;
+        });
+    });
+
+    var codeDocument = razorProjectEngine.Process(
+        RazorSourceDocument.Create(templateContent, templateDefinition.Name), null,
+        new List<RazorSourceDocument>(), new List<TagHelperDescriptor>());
+
+    var cSharpDocument = codeDocument.GetCSharpDocument();
+
+    var templateReferences = _options.TemplateReferences
+        .GetOrDefault(templateDefinition.Name)
+        ?.Select(x => x).Cast<MetadataReference>().ToList();
+
+    return _razorTemplateCSharpCompiler.CreateAssembly(
+        cSharpDocument.GeneratedCode, templateDefinition.Name, templateReferences);
+}
+```
+
+### `AbpCompiledViewProviderOptions` — per-template assembly references
+
+If your template needs `using` directives that point at non-default assemblies (e.g. your own DTO type), register a reference list keyed by template name. The provider feeds them straight into the Roslyn compilation:
+
+```csharp
+Configure<AbpCompiledViewProviderOptions>(options =>
+{
+    options.TemplateReferences["WelcomeEmail"] = new List<PortableExecutableReference>
+    {
+        MetadataReference.CreateFromFile(typeof(WelcomeModel).Assembly.Location),
+    };
+});
+```
+
+## Writing a Razor template
+
+A typical template file `/Templates/WelcomeEmail.cshtml`:
+
+```html
+@inherits Volo.Abp.TextTemplating.Razor.RazorTemplatePageBase<WelcomeModel>
+
+<h1>@Localizer["WelcomeEmailGreeting", Model!.UserName]</h1>
+
+<p>@Localizer["WelcomeEmailBody"]</p>
+
+@if (Model!.IsAdmin)
+{
+    <p>@Localizer["AdminInstructions"]</p>
+}
+```
+
+The matching definition opts the template into Razor explicitly (otherwise it would use `Options.DefaultRenderingEngine`):
+
+```csharp
+public class BookStoreTemplateDefinitionProvider : TemplateDefinitionProvider
+{
+    public override void Define(ITemplateDefinitionContext context)
+    {
+        context.Add(
+            new TemplateDefinition("WelcomeEmail", typeof(BookStoreResource))
+                .WithVirtualFilePath("/Templates/WelcomeEmail.cshtml", isInlineLocalized: true)
+                .WithRazorEngine()
+        );
+    }
+}
+```
+
+The `WithRazorEngine` extension sets `TemplateDefinition.RenderEngine = "Razor"`:
+
+```csharp
+// RazorTemplateDefinitionExtensions.cs
+public static TemplateDefinition WithRazorEngine([NotNull] this TemplateDefinition templateDefinition)
+{
+    return templateDefinition.WithRenderEngine(RazorTemplateRenderingEngine.EngineName);
+}
+```
+
+## `RazorTemplatePageBase<TModel>`
+
+The runtime base your `.cshtml` inherits via `@inherits`. It implements both `IRazorTemplatePage` (for engine plumbing) and `IRazorTemplatePage<TModel>` (for typed `Model`):
+
+```csharp
+// RazorTemplatePageBase.cs
+public abstract class RazorTemplatePageBase<TModel> : RazorTemplatePageBase, IRazorTemplatePage<TModel>
+{
+    public TModel? Model { get; set; }
+}
+
+public abstract class RazorTemplatePageBase : IRazorTemplatePage
+{
+    public Dictionary<string, object> GlobalContext { get; set; } = default!;
+    public IServiceProvider ServiceProvider { get; set; } = default!;
+    public IStringLocalizer? Localizer { get; set; }
+    public HtmlEncoder? HtmlEncoder { get; set; }
+    public JavaScriptEncoder? JavaScriptEncoder { get; set; }
+    public UrlEncoder? UrlEncoder { get; set; }
+    // ... ExecuteAsync(), GetOutputAsync(), Write(), WriteLiteral(), etc.
+}
+```
+
+If a template does not need a model, inherit `RazorTemplatePageBase` (non-generic) and skip the `<TModel>`.
+
+## Engine ordering with Scriban
+
+If a module graph depends on both engines:
+
+```csharp
+[DependsOn(
+    typeof(AbpTextTemplatingScribanModule),
+    typeof(AbpTextTemplatingRazorModule)
+)]
+public class MyHostModule : AbpModule { }
+```
+
+Module initialization order is not guaranteed to favor one. Both engines register themselves into `Options.RenderingEngines`, so engine selection per template via `RenderEngine` always works. But `DefaultRenderingEngine` is set unconditionally by Scriban, and only-if-empty by Razor — so the **default** will be `"Scriban"` whenever Scriban runs last. To pin Razor as default in your host:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpTextTemplatingOptions>(options =>
+    {
+        options.DefaultRenderingEngine = RazorTemplateRenderingEngine.EngineName;
+    });
+}
+```
+
+Or — recommended — depend on **only one** engine module per host, and use `.WithRazorEngine()` / `.WithScribanEngine()` on each definition to be explicit.
+
+## Where the template files live
+
+Razor templates load through the same [virtual file system](/ui/virtual-file-system) that JSON localization files use. Embed them with `AddEmbedded<TModule>` and edit them in development with `ReplaceEmbeddedByPhysical<TModule>`:
+
+```csharp
+Configure<AbpVirtualFileSystemOptions>(options =>
+{
+    options.FileSets.AddEmbedded<BookStoreApplicationModule>();
+});
+```
+
+A `.cshtml` template change while running in `IsDevelopment()` is picked up immediately because `LocalizedTemplateContentReaderFactory` skips its cache in development, and `DefaultAbpCompiledViewProvider` keys its assembly cache by content hash — new content → new key → new compilation.
+
+## Choosing Razor
+
+| Concern                  | Razor                                    | Scriban                                |
+| ------------------------ | ---------------------------------------- | -------------------------------------- |
+| Author audience          | Developers only                          | Developers or end-users                |
+| Sandbox                  | None (full C# / `Assembly.Load`)         | Sandboxed                              |
+| Typed `Model`            | Yes (`@inherits ... <TModel>`)           | Dynamic (`model.Foo`)                  |
+| First-render cost        | Roslyn compile (~tens of ms)             | Parse only (cheap)                     |
+| Layouts                  | Yes — `Body` passed to outer template    | Yes — `content` passed via globals     |
+| Refactor & intellisense  | Yes                                      | No                                     |
+
+If you don't need C# control flow or typed models, [Scriban](/localization/text-templating-scriban) is lighter — it is also the framework default.
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Templating core" icon="file-lines" href="/localization/text-templating">
+    `ITemplateRenderer`, `TemplateDefinition`, `TemplateContentProvider` — what this engine plugs into.
+  </Card>
+  <Card title="Scriban engine" icon="scroll" href="/localization/text-templating-scriban">
+    The other first-party engine. The default in `Volo.Abp.TextTemplating` shims.
+  </Card>
+  <Card title="Virtual file system" icon="folder-tree" href="/ui/virtual-file-system">
+    Where `.cshtml` template files live and how `ReplaceEmbeddedByPhysical<T>` enables hot edit.
+  </Card>
+  <Card title="Resources" icon="database" href="/localization/multi-lingual-objects">
+    The localization resource backing `@Localizer["Key"]` inside the template.
+  </Card>
+  <Card title="Abstractions" icon="cube" href="/localization/abstractions">
+    `IAbpStringLocalizerFactory.CreateByResourceName` — how `GetLocalizerOrNull` resolves the localizer.
+  </Card>
+  <Card title="Options" icon="sliders" href="/core/options-and-configuration">
+    `AbpTextTemplatingOptions` and `AbpCompiledViewProviderOptions`.
+  </Card>
+</CardGroup>

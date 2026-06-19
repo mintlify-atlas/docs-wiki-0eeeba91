@@ -1,0 +1,513 @@
+---
+title: "Feature Management EF Core and MongoDB Persistence"
+sidebarTitle: "EF Core, MongoDB"
+description: "Schema, repository implementations, model-creating extensions, and how the host-scoped FeatureManagementDbContext maps onto your application's database."
+---
+
+The feature‑management persistence layer is small — one aggregate (`FeatureValue`) plus two dynamic‑definition entities (`FeatureDefinitionRecord`, `FeatureGroupDefinitionRecord`). Both EF Core and MongoDB ship a thin context that holds them and a repository implementation per entity. This page is the schema reference and the integration recipe.
+
+If you have not yet read the [domain page](/modules/feature-management/domain), do that first — it explains why the repository methods take `(name, providerName, providerKey)` triples and how `FeatureManagementStore` caches the results.
+
+## Project files
+
+```
+modules/feature-management/src/
+├── Volo.Abp.FeatureManagement.EntityFrameworkCore/
+│   └── Volo/Abp/FeatureManagement/EntityFrameworkCore/
+│       ├── AbpFeatureManagementEntityFrameworkCoreModule.cs
+│       ├── IFeatureManagementDbContext.cs
+│       ├── FeatureManagementDbContext.cs
+│       ├── FeatureManagementDbContextModelCreatingExtensions.cs
+│       ├── EfCoreFeatureValueRepository.cs
+│       ├── EfCoreFeatureDefinitionRecordRepository.cs
+│       └── EfCoreFeatureGroupDefinitionRecordRepository.cs
+└── Volo.Abp.FeatureManagement.MongoDB/
+    └── Volo/Abp/FeatureManagement/MongoDB/
+        ├── AbpFeatureManagementMongoDbModule.cs
+        ├── IFeatureManagementMongoDbContext.cs
+        ├── FeatureManagementMongoDbContext.cs
+        ├── FeatureManagementMongoDbContextExtensions.cs
+        ├── MongoFeatureValueRepository.cs
+        ├── MongoFeatureDefinitionRecordRepository.cs
+        └── MongoFeatureGroupDefinitionRecordRepository.cs
+```
+
+The shapes are deliberately symmetrical — the EF Core file names start with `EfCore` and the Mongo file names start with `Mongo`, but the methods inside align line‑for‑line.
+
+## Shared connection string and schema
+
+Both contexts pull metadata from `AbpFeatureManagementDbProperties`:
+
+```csharp
+// AbpFeatureManagementDbProperties.cs
+public static class AbpFeatureManagementDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+
+    public const string ConnectionStringName = "AbpFeatureManagement";
+}
+```
+
+| Setting | Default | Where it lives |
+| --- | --- | --- |
+| `DbTablePrefix` | `"Abp"` (from `AbpCommonDbProperties`) | Both EF Core and MongoDB use it. EF Core prepends it to table names; MongoDB prepends it to collection names. |
+| `DbSchema` | `null` (default schema) | EF Core only. Ignored by MongoDB. |
+| `ConnectionStringName` | `"AbpFeatureManagement"` | Both contexts. If unconfigured, `ConnectionStrings:Default` is used. |
+
+Change `DbTablePrefix` in your host module **before** registering the EF Core / MongoDB module if you want a different prefix (e.g. multi‑tenant SaaS deployments often use `"Saas"`).
+
+## EF Core integration
+
+### `IFeatureManagementDbContext`
+
+```csharp
+// IFeatureManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public interface IFeatureManagementDbContext : IEfCoreDbContext
+{
+    DbSet<FeatureGroupDefinitionRecord> FeatureGroups { get; }
+
+    DbSet<FeatureDefinitionRecord> Features { get; }
+
+    DbSet<FeatureValue> FeatureValues { get; }
+}
+```
+
+Two attributes drive the runtime behaviour:
+
+- **`[IgnoreMultiTenancy]`** — the rows in this context belong to the **host** even when accessed from a tenant request. Every tenant's overrides live in the host database in the same `AbpFeatureValues` table; `ProviderKey` is the tenant id. Do not host the feature‑management tables in tenant‑specific databases.
+- **`[ConnectionStringName("AbpFeatureManagement")]`** — lets you route this context to a separate database while keeping the rest of the app on `Default`. Most apps share the connection string with `Default`.
+
+### `FeatureManagementDbContext`
+
+```csharp
+// FeatureManagementDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public class FeatureManagementDbContext :
+    AbpDbContext<FeatureManagementDbContext>,
+    IFeatureManagementDbContext
+{
+    public DbSet<FeatureGroupDefinitionRecord> FeatureGroups { get; set; }
+    public DbSet<FeatureDefinitionRecord> Features { get; set; }
+    public DbSet<FeatureValue> FeatureValues { get; set; }
+
+    public FeatureManagementDbContext(DbContextOptions<FeatureManagementDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureFeatureManagement();
+    }
+}
+```
+
+This context is what you register if your app has a dedicated feature‑management database. In a unified database (the common case), you do **not** register `FeatureManagementDbContext` directly — you call `builder.ConfigureFeatureManagement()` from inside *your* main DbContext's `OnModelCreating`. See the [Integration](#integrating-into-your-own-dbcontext) section below.
+
+### `ConfigureFeatureManagement` — the model
+
+```csharp
+// FeatureManagementDbContextModelCreatingExtensions.cs (FeatureValue mapping)
+builder.Entity<FeatureValue>(b =>
+{
+    b.ToTable(AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureValues",
+              AbpFeatureManagementDbProperties.DbSchema);
+
+    b.ConfigureByConvention();
+
+    b.Property(x => x.Name).HasMaxLength(FeatureValueConsts.MaxNameLength).IsRequired();
+    b.Property(x => x.Value).HasMaxLength(FeatureValueConsts.MaxValueLength).IsRequired();
+    b.Property(x => x.ProviderName).HasMaxLength(FeatureValueConsts.MaxProviderNameLength);
+    b.Property(x => x.ProviderKey).HasMaxLength(FeatureValueConsts.MaxProviderKeyLength);
+
+    b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique();
+
+    b.ApplyObjectExtensionMappings();
+});
+```
+
+The four notable mappings:
+
+- **Table name** is `{prefix}FeatureValues` — default `AbpFeatureValues`.
+- **`HasIndex(...).IsUnique()`** on `(Name, ProviderName, ProviderKey)` enforces a single row per feature per (provider, key). The store relies on it: `FindAsync` calls `FirstOrDefaultAsync`, expecting at most one match.
+- **`HasMaxLength(...)`** uses the per‑column constants from `FeatureValueConsts` (128 / 64 / 64 / 128 by default). Bump them *before* the first migration if you need more room.
+- **`ApplyObjectExtensionMappings()`** wires the `ObjectExtensionManager` so you can add columns from your host module via `ObjectExtensionManager.Instance.AddOrUpdateProperty<FeatureValue, string>("Tag")`.
+
+`FeatureGroupDefinitionRecord` and `FeatureDefinitionRecord` follow the same pattern with their own length constants and unique indexes on `Name`. The `FeatureDefinitionRecord` table also has a non‑unique `GroupName` index for the dynamic store's "all features in this group" lookups.
+
+There's one early exit worth noting:
+
+```csharp
+if (builder.IsTenantOnlyDatabase()) return;
+```
+
+If the calling DbContext is flagged as tenant‑only (i.e. the multi‑tenancy module knows it never holds host‑scoped data), the entire feature‑management model is skipped — there is nothing to map.
+
+### `AbpFeatureManagementEntityFrameworkCoreModule`
+
+```csharp
+// AbpFeatureManagementEntityFrameworkCoreModule.cs
+[DependsOn(typeof(AbpFeatureManagementDomainModule), typeof(AbpEntityFrameworkCoreModule))]
+public class AbpFeatureManagementEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<FeatureManagementDbContext>(options =>
+        {
+            options.AddRepository<FeatureGroupDefinitionRecord, EfCoreFeatureGroupDefinitionRecordRepository>();
+            options.AddRepository<FeatureDefinitionRecord, EfCoreFeatureDefinitionRecordRepository>();
+            options.AddDefaultRepositories<IFeatureManagementDbContext>();
+
+            options.AddRepository<FeatureValue, EfCoreFeatureValueRepository>();
+        });
+    }
+}
+```
+
+`AddDefaultRepositories<IFeatureManagementDbContext>()` only registers a default `IRepository<FeatureValue, Guid>` — to bind it to the *custom* `IFeatureValueRepository` interface (with the four lookup methods), the module also calls the explicit `AddRepository<FeatureValue, EfCoreFeatureValueRepository>()` line below.
+
+### `EfCoreFeatureValueRepository`
+
+```csharp
+// EfCoreFeatureValueRepository.cs
+public class EfCoreFeatureValueRepository :
+    EfCoreRepository<IFeatureManagementDbContext, FeatureValue, Guid>,
+    IFeatureValueRepository
+{
+    public EfCoreFeatureValueRepository(IDbContextProvider<IFeatureManagementDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<FeatureValue> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                s => s.Name == name &&
+                     s.ProviderName == providerName &&
+                     s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> FindAllAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> GetListAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        await DeleteAsync(
+            s => s.ProviderName == providerName && s.ProviderKey == providerKey,
+            cancellationToken: GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Three implementation details worth understanding:
+
+- **`OrderBy(x => x.Id).FirstOrDefaultAsync`** — even though the unique index guarantees at most one match, the `OrderBy` makes the query plan deterministic and produces a stable result if the index is ever dropped during a maintenance migration.
+- **`GetDbSetAsync()`** lazily resolves the `DbSet<FeatureValue>` through the unit‑of‑work‑aware `IDbContextProvider` — every method respects the surrounding `[UnitOfWork]` boundary started by `FeatureManagementStore`.
+- **`DeleteAsync(predicate, …)`** delegates to ABP's base bulk delete, which raises `EntityChangedEventData<FeatureValue>` on the local event bus once per row. `FeatureValueCacheItemInvalidator` consumes those events and removes the cache entries — the cache cannot diverge from the database.
+
+### Integrating into your own DbContext
+
+In the standard ABP project layout you do not register `FeatureManagementDbContext`; instead, your application's main DbContext absorbs the feature‑management tables. The integration is two lines:
+
+```csharp
+// MyAppDbContext.cs
+public class MyAppDbContext :
+    AbpDbContext<MyAppDbContext>,
+    IFeatureManagementDbContext   // ← implement the interface
+{
+    public DbSet<FeatureGroupDefinitionRecord> FeatureGroups { get; set; }
+    public DbSet<FeatureDefinitionRecord> Features { get; set; }
+    public DbSet<FeatureValue> FeatureValues { get; set; }
+
+    // …your own DbSets…
+
+    public MyAppDbContext(DbContextOptions<MyAppDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.ConfigureFeatureManagement(); // ← the model-creating extension
+
+        // …configure your own entities…
+    }
+}
+```
+
+Then mark your DbContext as the implementation in your EF Core module so that `EfCoreFeatureValueRepository` resolves your context, not the bundled one:
+
+```csharp
+context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+{
+    options.ReplaceDbContext<IFeatureManagementDbContext>();
+    // …other replacements…
+});
+```
+
+After `dotnet ef migrations add Add_FeatureManagement`, the three tables appear in your application's database. Run the migration as usual — the `OnApplicationInitialization` hook in `AbpFeatureManagementDomainModule` will populate `AbpFeatures` / `AbpFeatureGroups` once `SaveStaticFeaturesToDatabase` is allowed to run (it is forced to `false` in data‑migration environments).
+
+## MongoDB integration
+
+### `IFeatureManagementMongoDbContext`
+
+```csharp
+// IFeatureManagementMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public interface IFeatureManagementMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<FeatureGroupDefinitionRecord> FeatureGroups { get; }
+    IMongoCollection<FeatureDefinitionRecord> Features { get; }
+    IMongoCollection<FeatureValue> FeatureValues { get; }
+}
+```
+
+The same two attributes apply — host‑scoped, separate connection string optional. Three `IMongoCollection<T>` properties replace the EF Core `DbSet<T>` properties.
+
+### `FeatureManagementMongoDbContext`
+
+```csharp
+// FeatureManagementMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public class FeatureManagementMongoDbContext :
+    AbpMongoDbContext,
+    IFeatureManagementMongoDbContext
+{
+    public IMongoCollection<FeatureGroupDefinitionRecord> FeatureGroups
+        => Collection<FeatureGroupDefinitionRecord>();
+    public IMongoCollection<FeatureDefinitionRecord> Features
+        => Collection<FeatureDefinitionRecord>();
+    public IMongoCollection<FeatureValue> FeatureValues
+        => Collection<FeatureValue>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureFeatureManagement();
+    }
+}
+```
+
+`Collection<T>()` returns the strongly typed `IMongoCollection<T>` from the underlying `IMongoDatabase`. The collection name is decided by `ConfigureFeatureManagement` below.
+
+### `ConfigureFeatureManagement` (Mongo)
+
+```csharp
+// FeatureManagementMongoDbContextExtensions.cs
+public static void ConfigureFeatureManagement(this IMongoModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    builder.Entity<FeatureGroupDefinitionRecord>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureGroups";
+    });
+
+    builder.Entity<FeatureDefinitionRecord>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "Features";
+    });
+
+    builder.Entity<FeatureValue>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureValues";
+    });
+}
+```
+
+There are no length constraints (Mongo stores variable‑length strings) and **no unique index is declared at the model level**. If you need the index, create it manually on startup:
+
+```csharp
+public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    var collection = context.ServiceProvider
+        .GetRequiredService<IFeatureManagementMongoDbContext>()
+        .FeatureValues;
+
+    await collection.Indexes.CreateOneAsync(
+        new CreateIndexModel<FeatureValue>(
+            Builders<FeatureValue>.IndexKeys
+                .Ascending(x => x.Name)
+                .Ascending(x => x.ProviderName)
+                .Ascending(x => x.ProviderKey),
+            new CreateIndexOptions { Unique = true }));
+}
+```
+
+The omission is intentional — Mongo indexes are part of operational tuning, not modelling.
+
+### `AbpFeatureManagementMongoDbModule`
+
+```csharp
+// AbpFeatureManagementMongoDbModule.cs
+[DependsOn(typeof(AbpFeatureManagementDomainModule), typeof(AbpMongoDbModule))]
+public class AbpFeatureManagementMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<FeatureManagementMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IFeatureManagementMongoDbContext>();
+
+            options.AddRepository<FeatureGroupDefinitionRecord, MongoFeatureGroupDefinitionRecordRepository>();
+            options.AddRepository<FeatureDefinitionRecord, MongoFeatureDefinitionRecordRepository>();
+            options.AddRepository<FeatureValue, MongoFeatureValueRepository>();
+        });
+    }
+}
+```
+
+Same shape as EF Core — defaults plus explicit per‑entity registrations to bind the `IFeatureValueRepository` interface.
+
+### `MongoFeatureValueRepository`
+
+```csharp
+// MongoFeatureValueRepository.cs
+public class MongoFeatureValueRepository :
+    MongoDbRepository<IFeatureManagementMongoDbContext, FeatureValue, Guid>,
+    IFeatureValueRepository
+{
+    public MongoFeatureValueRepository(
+        IMongoDbContextProvider<IFeatureManagementMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<FeatureValue> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                s => s.Name == name &&
+                     s.ProviderName == providerName &&
+                     s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> FindAllAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> GetListAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync(cancellationToken))
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteAsync(
+        string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        var dbContext = await GetDbContextAsync();
+
+        await dbContext.FeatureValues.DeleteManyAsync(
+            x => x.ProviderName == providerName && x.ProviderKey == providerKey,
+            GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+The signatures match the EF Core repository line‑for‑line. Two implementation notes:
+
+- **`GetQueryableAsync(ct)`** returns a `MongoDB.Driver.Linq.IMongoQueryable<FeatureValue>` from the underlying `IMongoCollection<FeatureValue>`. The `FirstOrDefaultAsync` overload is the MongoDB‑driver flavour, not LINQ‑to‑objects.
+- **`DeleteMany`** bypasses the ABP repository helper and hits the collection directly so the deletion is atomic on the Mongo side. The repository wrapper still raises domain events through the base `DeleteAsync(predicate)` path used by the other code paths.
+
+### Integrating into your own MongoDbContext
+
+Like EF Core, you typically merge the feature‑management collections into your application's Mongo context:
+
+```csharp
+public class MyAppMongoDbContext :
+    AbpMongoDbContext,
+    IFeatureManagementMongoDbContext
+{
+    public IMongoCollection<FeatureGroupDefinitionRecord> FeatureGroups
+        => Collection<FeatureGroupDefinitionRecord>();
+    public IMongoCollection<FeatureDefinitionRecord> Features
+        => Collection<FeatureDefinitionRecord>();
+    public IMongoCollection<FeatureValue> FeatureValues
+        => Collection<FeatureValue>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureFeatureManagement();
+    }
+}
+```
+
+And in the Mongo module:
+
+```csharp
+context.Services.AddMongoDbContext<MyAppMongoDbContext>(options =>
+{
+    options.ReplaceDbContext<IFeatureManagementMongoDbContext>();
+    // …other replacements…
+});
+```
+
+## Database object reference
+
+| Object | Type | EF Core / Mongo name | Index | Notes |
+| --- | --- | --- | --- | --- |
+| `FeatureValue` | aggregate | `{prefix}FeatureValues` | unique `(Name, ProviderName, ProviderKey)` (EF Core) | Length constraints on EF Core only |
+| `FeatureGroupDefinitionRecord` | dynamic definition | `{prefix}FeatureGroups` | unique `(Name)` (EF Core) | Only populated when `SaveStaticFeaturesToDatabase` or `IsDynamicFeatureStoreEnabled` is on |
+| `FeatureDefinitionRecord` | dynamic definition | `{prefix}Features` | unique `(Name)`, index on `(GroupName)` (EF Core) | Same as above |
+
+Default `{prefix}` is `"Abp"` — see [`AbpCommonDbProperties.DbTablePrefix`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpCommonDbProperties.cs).
+
+## Operational checklist
+
+<CardGroup cols={2}>
+  <Card title="Host scope" icon="server">
+    `[IgnoreMultiTenancy]` keeps all rows in the host database. Do not partition by tenant — the `ProviderKey` is what differentiates tenants.
+  </Card>
+  <Card title="Unique index" icon="lock">
+    EF Core guarantees one row per `(Name, ProviderName, ProviderKey)`. Replicate the same index on MongoDB in production.
+  </Card>
+  <Card title="Connection string" icon="plug">
+    Set `ConnectionStrings:AbpFeatureManagement` only if you want a dedicated database. Otherwise `Default` is used.
+  </Card>
+  <Card title="Migrations" icon="database">
+    `dotnet ef migrations add Add_FeatureManagement` against your unified DbContext picks up `ConfigureFeatureManagement` automatically — no extra scaffolding.
+  </Card>
+</CardGroup>
+
+## Where to read next
+
+- [Domain](/modules/feature-management/domain) — `IFeatureValueRepository` contract and `FeatureManagementStore` cache flow.
+- [Application](/modules/feature-management/application) — the only callers that *should* touch these repositories in production.
+- [HTTP API](/modules/feature-management/http-api) — what reaches the database from the wire.
+- [Tenant Management EF Core / Mongo](/modules/tenant-management/efcore-mongodb) — the sibling persistence model; `TenantId`s living in *that* table become `ProviderKey`s in *this* one.
+- [Features framework](/security/features) — the runtime read path that ends in `IFeatureChecker`.

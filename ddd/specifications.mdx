@@ -1,0 +1,347 @@
+---
+title: "Volo.Abp.Specifications: ISpecification and Composition"
+sidebarTitle: "Specifications"
+description: "ISpecification<T>, Specification<T>, the And/Or/Not/AndNot composites and how to feed them into IRepository.GetListAsync(predicate)."
+---
+
+The `Volo.Abp.Specifications` package, located at `framework/src/Volo.Abp.Specifications/`, provides ABP's implementation of the **specification pattern** — a way to encapsulate predicates as objects, compose them with `And`/`Or`/`Not`/`AndNot`, and feed the resulting `Expression<Func<T, bool>>` directly into LINQ-backed repositories. Because the underlying expression composition uses an `ExpressionFuncExtender` that rewires parameters, you can safely combine specifications and pass them straight to EF Core or any IQueryable without `InvalidCastException`.
+
+This page enumerates the package contents, explains the design, and shows how to use the resulting predicates with ABP repositories and `CrudAppService` query overrides.
+
+## Folder map
+
+```
+framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/
+├── AbpSpecificationsModule.cs
+├── ISpecification.cs
+├── Specification.cs
+├── ICompositeSpecification.cs
+├── CompositeSpecification.cs
+├── AndSpecification.cs
+├── OrSpecification.cs
+├── NotSpecification.cs
+├── AndNotSpecification.cs
+├── AnySpecification.cs
+├── NoneSpecification.cs
+├── ExpressionSpecification.cs
+├── ExpressionFuncExtender.cs
+├── ISpecificationParser.cs
+├── ParameterRebinder.cs
+└── SpecificationExtensions.cs
+```
+
+`AbpSpecificationsModule` is intentionally empty — it just lets other modules declare a hard `[DependsOn]` link:
+
+```csharp
+// framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AbpSpecificationsModule.cs
+public class AbpSpecificationsModule : AbpModule { }
+```
+
+`AbpDddDomainModule` references this module so every domain layer transitively gets specification types — see [Domain](/ddd/domain).
+
+## The core abstraction
+
+```csharp
+// framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ISpecification.cs
+public interface ISpecification<T>
+{
+    /// <summary>
+    /// Returns a <see cref="bool"/> value which indicates whether the specification
+    /// is satisfied by the given object.
+    /// </summary>
+    bool IsSatisfiedBy(T obj);
+
+    /// <summary>
+    /// Gets the LINQ expression which represents the current specification.
+    /// </summary>
+    Expression<Func<T, bool>> ToExpression();
+}
+```
+
+A specification exposes two faces:
+
+- `IsSatisfiedBy(T)` — for **in-memory** evaluation (e.g. validating a single instance you already have).
+- `ToExpression()` — for **queryable** evaluation against a repository or in-memory `IQueryable<T>`.
+
+## Specification\<T\>
+
+```csharp
+// framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs
+public abstract class Specification<T> : ISpecification<T>
+{
+    public virtual bool IsSatisfiedBy(T obj) => ToExpression().Compile()(obj);
+
+    public abstract Expression<Func<T, bool>> ToExpression();
+
+    public static implicit operator Expression<Func<T, bool>>(Specification<T> specification)
+        => specification.ToExpression();
+}
+```
+
+Two niceties:
+
+- The default `IsSatisfiedBy` simply compiles the expression and invokes it, so concrete specs only have to override `ToExpression()`.
+- The `implicit operator` to `Expression<Func<T, bool>>` lets you pass a specification straight to anything that accepts a LINQ predicate, including `IRepository<TEntity>.GetListAsync(predicate)`.
+
+## Composing specifications
+
+ABP ships five composite specifications:
+
+```csharp
+// AndSpecification.cs
+public class AndSpecification<T> : CompositeSpecification<T>
+{
+    public AndSpecification(ISpecification<T> left, ISpecification<T> right) : base(left, right) { }
+    public override Expression<Func<T, bool>> ToExpression()
+        => Left.ToExpression().And(Right.ToExpression());
+}
+
+// OrSpecification.cs
+public class OrSpecification<T> : CompositeSpecification<T>
+{
+    public OrSpecification(ISpecification<T> left, ISpecification<T> right) : base(left, right) { }
+    public override Expression<Func<T, bool>> ToExpression()
+        => Left.ToExpression().Or(Right.ToExpression());
+}
+
+// NotSpecification.cs
+public class NotSpecification<T> : Specification<T>
+{
+    private readonly ISpecification<T> _specification;
+    public NotSpecification(ISpecification<T> specification) { _specification = specification; }
+
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        var expression = _specification.ToExpression();
+        return Expression.Lambda<Func<T, bool>>(
+            Expression.Not(expression.Body), expression.Parameters);
+    }
+}
+
+// AndNotSpecification.cs
+public class AndNotSpecification<T> : CompositeSpecification<T>
+{
+    public AndNotSpecification(ISpecification<T> left, ISpecification<T> right) : base(left, right) { }
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        var rightExpression = Right.ToExpression();
+        var bodyNot = Expression.Not(rightExpression.Body);
+        var bodyNotExpression = Expression.Lambda<Func<T, bool>>(bodyNot, rightExpression.Parameters);
+        return Left.ToExpression().And(bodyNotExpression);
+    }
+}
+
+// AnySpecification.cs
+public sealed class AnySpecification<T> : Specification<T>
+{
+    public override Expression<Func<T, bool>> ToExpression() => o => true;
+}
+
+// NoneSpecification.cs
+public sealed class NoneSpecification<T> : Specification<T>
+{
+    public override Expression<Func<T, bool>> ToExpression() => o => false;
+}
+```
+
+`AnySpecification<T>` and `NoneSpecification<T>` are the algebraic identity / null elements — handy when you build a specification chain conditionally and need a no-op starting value (`spec ?? new AnySpecification<Order>()`).
+
+## CompositeSpecification and ICompositeSpecification
+
+```csharp
+// ICompositeSpecification.cs
+public interface ICompositeSpecification<T> : ISpecification<T>
+{
+    ISpecification<T> Left { get; }
+    ISpecification<T> Right { get; }
+}
+
+// CompositeSpecification.cs
+public abstract class CompositeSpecification<T> : Specification<T>, ICompositeSpecification<T>
+{
+    protected CompositeSpecification(ISpecification<T> left, ISpecification<T> right)
+    {
+        Left = left;
+        Right = right;
+    }
+
+    public ISpecification<T> Left { get; }
+    public ISpecification<T> Right { get; }
+}
+```
+
+Exposing `Left`/`Right` lets specification visitors walk and rewrite a tree — for instance, an audit module could log every specification used in a session by inspecting the tree.
+
+## ExpressionSpecification
+
+```csharp
+// ExpressionSpecification.cs
+public class ExpressionSpecification<T> : Specification<T>
+{
+    private readonly Expression<Func<T, bool>> _expression;
+    public ExpressionSpecification(Expression<Func<T, bool>> expression) { _expression = expression; }
+    public override Expression<Func<T, bool>> ToExpression() => _expression;
+}
+```
+
+This is the bridge from raw LINQ predicates to specifications — useful when you want to convert an ad-hoc lambda into something composable:
+
+```csharp
+ISpecification<Order> active = new ExpressionSpecification<Order>(o => o.Status == OrderStatus.Active);
+ISpecification<Order> highValue = new ExpressionSpecification<Order>(o => o.Total >= 1000);
+ISpecification<Order> activeAndHigh = active.And(highValue);
+```
+
+## SpecificationExtensions: the fluent surface
+
+```csharp
+// SpecificationExtensions.cs
+public static class SpecificationExtensions
+{
+    public static ISpecification<T> And<T>(this ISpecification<T> specification, ISpecification<T> other)
+        => new AndSpecification<T>(specification, other);
+
+    public static ISpecification<T> Or<T>(this ISpecification<T> specification, ISpecification<T> other)
+        => new OrSpecification<T>(specification, other);
+
+    public static ISpecification<T> AndNot<T>(this ISpecification<T> specification, ISpecification<T> other)
+        => new AndNotSpecification<T>(specification, other);
+
+    public static ISpecification<T> Not<T>(this ISpecification<T> specification)
+        => new NotSpecification<T>(specification);
+}
+```
+
+This is the only API most callers use:
+
+```csharp
+var spec = new ActiveCustomerSpec()
+    .And(new SubscribedSpec())
+    .AndNot(new BlocklistedSpec());
+
+var customers = await _customers.GetListAsync(spec); // implicit -> Expression<Func<Customer, bool>>
+```
+
+## ExpressionFuncExtender — why composition actually works
+
+LINQ's `Expression<Func<T, bool>>` cannot be "AND"-ed directly because each predicate has its own `ParameterExpression`. ABP solves this with `ExpressionFuncExtender` (and its helper `ParameterRebinder`):
+
+```csharp
+// ExpressionFuncExtender.cs
+public static class ExpressionFuncExtender
+{
+    private static Expression<T> Compose<T>(this Expression<T> first, Expression<T> second,
+        Func<Expression, Expression, Expression> merge)
+    {
+        var map = first.Parameters.Select((f, i) => new { f, s = second.Parameters[i] })
+            .ToDictionary(p => p.s, p => p.f);
+
+        var secondBody = ParameterRebinder.ReplaceParameters(map, second.Body);
+
+        return Expression.Lambda<T>(merge(first.Body, secondBody), first.Parameters);
+    }
+
+    public static Expression<Func<T, bool>> And<T>(this Expression<Func<T, bool>> first,
+        Expression<Func<T, bool>> second)
+        => first.Compose(second, Expression.AndAlso);
+
+    public static Expression<Func<T, bool>> Or<T>(this Expression<Func<T, bool>> first,
+        Expression<Func<T, bool>> second)
+        => first.Compose(second, Expression.OrElse);
+}
+```
+
+`Compose` walks the second expression's body and rebinds every reference to its `ParameterExpression` to the corresponding one from the first expression. Without this step, `(x => x.IsActive).And(x => x.Total > 1000)` would compile but EF Core would fail to translate the resulting tree (`The LINQ expression 'x => True && y.Total > 1000' could not be translated.`). With it, the rewritten tree is a single `x => x.IsActive && x.Total > 1000` expression.
+
+`ParameterRebinder` is the `ExpressionVisitor` used by `Compose`:
+
+```csharp
+internal class ParameterRebinder : ExpressionVisitor
+{
+    private readonly Dictionary<ParameterExpression, ParameterExpression> _map;
+    private ParameterRebinder(Dictionary<ParameterExpression, ParameterExpression> map) { _map = map; }
+    public static Expression ReplaceParameters(
+        Dictionary<ParameterExpression, ParameterExpression> map, Expression exp)
+        => new ParameterRebinder(map).Visit(exp);
+    protected override Expression VisitParameter(ParameterExpression node)
+        => _map.TryGetValue(node, out var replacement) ? replacement : base.VisitParameter(node);
+}
+```
+
+## Writing your own specification
+
+```csharp
+public class ExpensiveSubscriberSpec : Specification<Customer>
+{
+    private readonly decimal _threshold;
+
+    public ExpensiveSubscriberSpec(decimal threshold) { _threshold = threshold; }
+
+    public override Expression<Func<Customer, bool>> ToExpression()
+        => c => c.IsSubscribed && c.LifetimeValue >= _threshold;
+}
+
+// In a domain service:
+public async Task<List<Customer>> GetExpensiveSubscribersAsync(decimal threshold)
+{
+    var spec = new ExpensiveSubscriberSpec(threshold);
+    return await _customers.GetListAsync(spec);
+}
+```
+
+The key things to remember:
+
+- Inherit from `Specification<T>`, override `ToExpression`.
+- Store any parameters as private fields so the predicate can reference them.
+- Compose with `And` / `Or` / `Not` / `AndNot`. Capture intermediate `ISpecification<T>` instances if you'll reuse them.
+
+## Using specifications inside CrudAppService
+
+`AbstractKeyReadOnlyAppService<TEntity, TGetOutputDto, TGetListOutputDto, TKey, TGetListInput>` lets you override `CreateFilteredQueryAsync` to apply filters per request. Specifications fit naturally:
+
+```csharp
+protected override async Task<IQueryable<Customer>> CreateFilteredQueryAsync(GetCustomerListInput input)
+{
+    var queryable = await Repository.GetQueryableAsync();
+
+    var spec = (ISpecification<Customer>)new AnySpecification<Customer>();
+
+    if (!input.Filter.IsNullOrWhiteSpace())
+        spec = spec.And(new NameContainsSpec(input.Filter!));
+
+    if (input.OnlySubscribed)
+        spec = spec.And(new SubscribedSpec());
+
+    if (input.MinLifetimeValue is { } min)
+        spec = spec.And(new ExpensiveSubscriberSpec(min));
+
+    return queryable.Where(spec.ToExpression());
+}
+```
+
+The same approach works in any domain service — it's just `IQueryable<T>.Where(spec.ToExpression())` under the hood.
+
+## ISpecificationParser
+
+```csharp
+public interface ISpecificationParser
+{
+    ISpecification<T> Parse<T>(string expression);
+}
+```
+
+This interface is the seam for module authors who want to build a parser for a textual DSL (think Lucene-style search strings). ABP does not ship a default implementation in this package — you would register your own implementation against `ISpecificationParser` and call it from a custom application service.
+
+## Cross-references
+
+- [Domain](/ddd/domain) — `AbpDddDomainModule` references `AbpSpecificationsModule` so every domain project transitively has access to these types.
+- [Repositories](/ddd/repositories) — call `GetListAsync(specification)` or `GetListAsync(specification.ToExpression())` for queryable evaluation.
+- [Application](/ddd/application) — override `CreateFilteredQueryAsync` to apply specifications per CRUD list request.
+- [Domain Services](/ddd/domain-services) — the most idiomatic home for non-trivial specifications.
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — entities being filtered.
+- [data/entityframeworkcore](/data/entityframeworkcore) — the EF Core repository converts the resulting expression into SQL.
+- [core/options-and-configuration](/core/options-and-configuration) — register a custom `ISpecificationParser` if you build one.
+
+<Tip>
+Specifications are an excellent way to make your domain *self-document*. Naming a spec `ActiveCustomerSpec` puts the business vocabulary front and centre, rather than burying it in anonymous lambdas inside an application service.
+</Tip>

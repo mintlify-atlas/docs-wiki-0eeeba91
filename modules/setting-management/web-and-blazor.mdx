@@ -1,0 +1,662 @@
+---
+title: "Web & Blazor UI"
+description: "The Administration → Settings page in Razor Pages and Blazor: SettingManagementPageOptions, the contributor model, and the per-group view components."
+---
+
+This is the visible half of the module — the **Administration → Settings** page that ships with every ABP startup template. Two parallel implementations:
+
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.Web/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Web) — MVC / Razor Pages
+- [`modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Blazor), with hosting modules
+  [`.Blazor.Server`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Blazor.Server) and
+  [`.Blazor.WebAssembly`](https://github.com/abpframework/abp/tree/dev/modules/setting-management/src/Volo.Abp.SettingManagement.Blazor.WebAssembly) — Blazor
+
+Both follow the same architecture: a host page (the **`SettingManagementComponent`** in Blazor, `Index.cshtml` in MVC) iterates a list of *contributors* registered through an `Options` object, and each contributor adds a tab whose body is a view component.
+
+## The Razor Pages host
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/Index.cshtml.cs
+[Authorize]
+[RequiresFeature(SettingManagementFeatures.Enable)]
+public class IndexModel : AbpPageModel
+{
+    public SettingPageCreationContext SettingPageCreationContext { get; private set; }
+
+    protected SettingPageContributorManager SettingPageContributorManager { get; }
+    protected ILocalEventBus LocalEventBus { get; }
+
+    public IndexModel(ILocalEventBus localEventBus, SettingPageContributorManager settingPageContributorManager)
+    {
+        LocalEventBus = localEventBus;
+        SettingPageContributorManager = settingPageContributorManager;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        SettingPageCreationContext = await SettingPageContributorManager.ConfigureAsync();
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostRenderViewAsync(string id)
+    {
+        var context = await SettingPageContributorManager.ConfigureAsync();
+        var view = context.Groups.FirstOrDefault(x => x.Id == id);
+        if (view != null)
+        {
+            return ViewComponent(view.ComponentType, view.Parameter);
+        }
+        return NoContent();
+    }
+
+    public virtual async Task<NoContentResult> OnPostRefreshConfigurationAsync()
+    {
+        await LocalEventBus.PublishAsync(
+            new CurrentApplicationConfigurationCacheResetEventData()
+        );
+
+        return NoContent();
+    }
+}
+```
+
+Three things to notice:
+
+1. **`[RequiresFeature(SettingManagementFeatures.Enable)]`** at the page level. A tenant whose `SettingManagement.Enable` is off gets a 404 before any handler runs — see [Application → CheckFeatureAsync](/modules/setting-management/application#checkfeatureasync-multi-tenant-gating) for the same gate enforced server-side.
+2. **`OnPostRenderViewAsync`** is the AJAX endpoint that the left-side menu calls when the user clicks a tab. Only the chosen group's view component is rendered, not the full page — that's why the page feels SPA-like even though it's MVC.
+3. **`OnPostRefreshConfigurationAsync`** publishes `CurrentApplicationConfigurationCacheResetEventData`. The framework's `AbpApplicationConfigurationService` caches the per-user setting bag; after a save the page calls this handler so the cache is invalidated on every node listening to the local event bus.
+
+## The Blazor host
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/
+//   Pages/SettingManagement/SettingManagement.razor.cs
+public partial class SettingManagement
+{
+    [Inject]
+    protected IServiceProvider ServiceProvider { get; set; }
+
+    protected SettingComponentCreationContext SettingComponentCreationContext { get; set; }
+
+    [Inject]
+    protected IOptions<SettingManagementComponentOptions> _options { get; set; }
+    [Inject]
+    protected IStringLocalizer<AbpSettingManagementResource> L { get; set; }
+
+    protected SettingManagementComponentOptions Options => _options.Value;
+
+    protected List<RenderFragment> SettingItemRenders { get; set; } = new();
+
+    protected string SelectedGroup;
+    protected List<BreadcrumbItem> BreadcrumbItems = new();
+
+    protected async override Task OnInitializedAsync()
+    {
+        BreadcrumbItems.Add(new BreadcrumbItem(LUiNavigation["Menu:Administration"].Value));
+        BreadcrumbItems.Add(new BreadcrumbItem(@L["Menu:Settings"].Value));
+
+        SettingComponentCreationContext = new SettingComponentCreationContext(ServiceProvider);
+
+        foreach (var contributor in Options.Contributors)
+        {
+            await contributor.ConfigureAsync(SettingComponentCreationContext);
+        }
+        SettingComponentCreationContext.Normalize();
+        SettingItemRenders.Clear();
+
+        if (SelectedGroup.IsNullOrEmpty() && SettingComponentCreationContext.Groups.Any())
+        {
+            SelectedGroup = GetNormalizedString(SettingComponentCreationContext.Groups.First().Id);
+        }
+    }
+
+    protected virtual string GetNormalizedString(string value)
+    {
+        return value.Replace('.', '_');
+    }
+}
+```
+
+The pattern matches MVC exactly: collect contributors, let each one push a `SettingComponentGroup` onto the context, normalize/sort, pick the first as the default active tab. The matching `SettingManagement.razor` markup renders Blazorise `Tabs` whose `RenderContent` is the contributor's `ComponentType`.
+
+## SettingManagementPageOptions (MVC) and SettingManagementComponentOptions (Blazor)
+
+These are the two extension points administrators and module authors care about. Both are tiny:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/SettingManagementPageOptions.cs
+public class SettingManagementPageOptions
+{
+    public List<ISettingPageContributor> Contributors { get; }
+
+    public SettingManagementPageOptions()
+    {
+        Contributors = new List<ISettingPageContributor>();
+    }
+}
+```
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/
+//   SettingManagementComponentOptions.cs
+public class SettingManagementComponentOptions
+{
+    public List<ISettingComponentContributor> Contributors { get; }
+
+    public SettingManagementComponentOptions()
+    {
+        Contributors = new List<ISettingComponentContributor>();
+    }
+}
+```
+
+The Web module pre-registers two:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/AbpSettingManagementWebModule.cs
+Configure<SettingManagementPageOptions>(options =>
+{
+    options.Contributors.Add(new EmailingPageContributor());
+    options.Contributors.Add(new TimeZonePageContributor());
+});
+```
+
+The Blazor module mirrors that:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/AbpSettingManagementBlazorModule.cs
+Configure<SettingManagementComponentOptions>(options =>
+{
+    options.Contributors.Add(new EmailingPageContributor());
+    options.Contributors.Add(new TimeZonePageContributor());
+});
+```
+
+<Info>
+Both options classes live in distinct namespaces — `Volo.Abp.SettingManagement.Web.Pages.SettingManagement` and `Volo.Abp.SettingManagement.Blazor`. Don't confuse them with an `AbpSettingManagementWebOptions` (no such type exists in the codebase). The Web module's full configuration class is `SettingManagementPageOptions`.
+</Info>
+
+## ISettingPageContributor (MVC)
+
+The MVC contributor interface is two methods, with a thick abstract base that does most of the work:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/ISettingPageContributor.cs
+public interface ISettingPageContributor
+{
+    Task ConfigureAsync(SettingPageCreationContext context);
+
+    [Obsolete("Use SettingPageContributorBase as base class and call `RequiredPermissions` or `RequiredFeatures` for better performance.")]
+    Task<bool> CheckPermissionsAsync(SettingPageCreationContext context);
+}
+```
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/SettingPageContributorBase.cs
+public abstract class SettingPageContributorBase : ISettingPageContributor
+{
+    private readonly HashSet<string> _requiredPermissions;
+    private readonly HashSet<string> _requiredFeatures;
+    private readonly HashSet<string> _requiredTenantSideFeatures;
+
+    protected virtual SettingPageContributorBase RequiredPermissions(params string[] permissions)
+    {
+        Check.NotNullOrEmpty(permissions, nameof(permissions));
+        _requiredPermissions.AddIfNotContains(permissions);
+        return this;
+    }
+
+    protected virtual SettingPageContributorBase RequiredFeatures(params string[] features) { ... }
+
+    protected virtual SettingPageContributorBase RequiredTenantSideFeatures(params string[] features) { ... }
+
+    public virtual IReadOnlySet<string> GetRequiredPermissions() => _requiredPermissions;
+
+    public virtual IReadOnlySet<string> GetRequiredFeatures(MultiTenancySides? sides = null)
+    {
+        return sides == null || sides != MultiTenancySides.Tenant
+            ? _requiredFeatures
+            : _requiredTenantSideFeatures;
+    }
+
+    public abstract Task ConfigureAsync(SettingPageCreationContext context);
+
+    public virtual Task<bool> CheckPermissionsAsync(SettingPageCreationContext context)
+    {
+        return Task.FromResult(true);
+    }
+}
+```
+
+`SettingPageContributorBase` lets you **declare** required permissions/features in the constructor, and `SettingPageContributorManager` reads them in **bulk** — one `IPermissionChecker.IsGrantedAsync(...)` call evaluates every tab's permissions at once, instead of doing a checker round-trip per contributor:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/SettingPageContributorManager.cs (excerpt)
+var contributorBases = contributors
+    .Where(x => x is SettingPageContributorBase)
+    .Cast<SettingPageContributorBase>()
+    .ToList();
+
+var permissions = new HashSet<string>();
+permissions.AddIfNotContains(contributorBases.SelectMany(x => x.GetRequiredPermissions()));
+
+var grantResult = await permissionChecker.IsGrantedAsync(permissions.ToArray());
+
+foreach (var contributor in contributorBases)
+{
+    var available = true;
+
+    var requiredFeatures = contributor.GetRequiredFeatures();
+    if (requiredFeatures.Any() && !await featureChecker.IsEnabledAsync(true, requiredFeatures.ToArray()))
+    {
+        available = false;
+    }
+
+    if (available)
+    {
+        var requiredTenantSideFeatures = contributor.GetRequiredFeatures(MultiTenancySides.Tenant);
+        if (requiredTenantSideFeatures.Any() &&
+            ServiceProvider.GetRequiredService<ICurrentTenant>().IsAvailable &&
+            !await featureChecker.IsEnabledAsync(true, requiredTenantSideFeatures.ToArray()))
+        {
+            available = false;
+        }
+    }
+
+    if (available)
+    {
+        available = contributor.GetRequiredPermissions()
+            .All(x => grantResult.Result.ContainsKey(x) &&
+                      grantResult.Result[x] == PermissionGrantResult.Granted);
+    }
+
+    if (available)
+    {
+        availableContributors.Add(contributor);
+    }
+}
+```
+
+## EmailingPageContributor (MVC)
+
+A real contributor is ~12 lines:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Settings/EmailingPageContributor.cs
+public class EmailingPageContributor : SettingPageContributorBase
+{
+    public EmailingPageContributor()
+    {
+        RequiredTenantSideFeatures(SettingManagementFeatures.Enable);
+        RequiredTenantSideFeatures(SettingManagementFeatures.AllowChangingEmailSettings);
+        RequiredPermissions(SettingManagementPermissions.Emailing);
+    }
+
+    public override Task ConfigureAsync(SettingPageCreationContext context)
+    {
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<AbpSettingManagementResource>>();
+        context.Groups.Add(
+            new SettingPageGroup(
+                "Volo.Abp.EmailSetting",
+                l["Menu:Emailing"],
+                typeof(EmailSettingGroupViewComponent)
+            )
+        );
+        return Task.CompletedTask;
+    }
+}
+```
+
+Note that **tenant-side features are required only for tenants** — a host user sees Emailing without `AllowChangingEmailSettings` being enabled. That mirrors `AllowChangingEmailSettingsFeatureSimpleStateChecker` from [Application](/modules/setting-management/application#permissions).
+
+## TimeZonePageContributor (MVC)
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Settings/TimeZonePageContributor.cs
+public class TimeZonePageContributor : SettingPageContributorBase
+{
+    public TimeZonePageContributor()
+    {
+        RequiredPermissions(SettingManagementPermissions.TimeZone);
+    }
+
+    public override Task ConfigureAsync(SettingPageCreationContext context)
+    {
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<AbpSettingManagementResource>>();
+
+        if (context.ServiceProvider.GetRequiredService<IClock>().SupportsMultipleTimezone)
+        {
+            context.Groups.Add(
+                new SettingPageGroup(
+                    "Volo.Abp.TimeZone",
+                    l["Menu:TimeZone"],
+                    typeof(TimeZoneSettingGroupViewComponent)
+                )
+            );
+        }
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+The contributor consults `IClock.SupportsMultipleTimezone` before adding the tab. In a single-timezone deployment (`AbpClockOptions.Kind = DateTimeKind.Utc` everywhere) there is nothing meaningful to configure.
+
+## SettingPageGroup / SettingComponentGroup
+
+The two host pages each render a list of these:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/
+//   Pages/SettingManagement/SettingPageGroup.cs
+public class SettingPageGroup
+{
+    public const int DefaultOrder = 1000;
+
+    public string Id { get; set; }
+    public string DisplayName { get; set; }
+    public Type ComponentType { get; set; }
+    public object Parameter { get; set; }
+    public int Order { get; set; }
+
+    public SettingPageGroup(
+        [NotNull] string id,
+        [NotNull] string displayName,
+        [NotNull] Type componentType,
+        object parameter = null,
+        int order = DefaultOrder)
+    {
+        Id = id;
+        DisplayName = displayName;
+        ComponentType = componentType;
+        Parameter = parameter;
+        Order = order;
+    }
+}
+```
+
+The Blazor `SettingComponentGroup` is identical in shape — same properties, same `Order = 1000` default — but lives in the `Volo.Abp.SettingManagement.Blazor` namespace.
+
+| Property | Role |
+| --- | --- |
+| `Id` | Stable identifier used as the tab anchor (e.g. `"Volo.Abp.EmailSetting"`). The Razor host normalizes `.` → `_` so it works as a DOM id. |
+| `DisplayName` | The localized tab label. |
+| `ComponentType` | The Razor `ViewComponent` or Blazor `ComponentBase` to render. |
+| `Parameter` | An optional state object passed to the component as `parameters[0]`. |
+| `Order` | Lower numbers render first. The pre-registered Email and Time Zone contributors use the default `1000`. |
+
+## ISettingComponentContributor (Blazor)
+
+The Blazor interface is simpler — it inlines permission checks inside `ConfigureAsync` because there is no DI-time bulk checker like `SettingPageContributorManager`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/
+//   ISettingComponentContributor.cs
+public interface ISettingComponentContributor
+{
+    Task ConfigureAsync(SettingComponentCreationContext context);
+    Task<bool> CheckPermissionsAsync(SettingComponentCreationContext context);
+}
+```
+
+`EmailingPageContributor` (Blazor variant) shows the pattern:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/
+//   Settings/EmailingPageContributor.cs
+public class EmailingPageContributor : ISettingComponentContributor
+{
+    public async Task ConfigureAsync(SettingComponentCreationContext context)
+    {
+        if (!await CheckPermissionsInternalAsync(context))
+        {
+            return;
+        }
+
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<AbpSettingManagementResource>>();
+        context.Groups.Add(
+            new SettingComponentGroup(
+                "Volo.Abp.SettingManagement",
+                l["Menu:Emailing"],
+                typeof(EmailSettingGroupViewComponent)
+            )
+        );
+    }
+
+    private async Task<bool> CheckPermissionsInternalAsync(SettingComponentCreationContext context)
+    {
+        if (!await CheckFeatureAsync(context))
+        {
+            return false;
+        }
+
+        var authorizationService = context.ServiceProvider.GetRequiredService<IAuthorizationService>();
+        return await authorizationService.IsGrantedAsync(SettingManagementPermissions.Emailing);
+    }
+
+    private async Task<bool> CheckFeatureAsync(SettingComponentCreationContext context)
+    {
+        var currentTenant = context.ServiceProvider.GetRequiredService<ICurrentTenant>();
+        if (!currentTenant.IsAvailable) return true;
+
+        var featureCheck = context.ServiceProvider.GetRequiredService<IFeatureChecker>();
+        return await featureCheck.IsEnabledAsync(SettingManagementFeatures.AllowChangingEmailSettings);
+    }
+}
+```
+
+## Extending with contributors
+
+Adding a custom tab requires three things: a view component, a contributor, and a `Configure<...Options>` call from your module's `ConfigureServices`.
+
+```csharp
+// 1. View component (MVC) or razor (Blazor).
+public class MyCompanySettingGroupViewComponent : AbpViewComponent
+{
+    public IViewComponentResult Invoke() => View();
+}
+
+// 2. Contributor.
+public class MyCompanyPageContributor : SettingPageContributorBase
+{
+    public MyCompanyPageContributor()
+    {
+        RequiredPermissions("MyCompany.Settings");
+    }
+
+    public override Task ConfigureAsync(SettingPageCreationContext context)
+    {
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<MyCompanyResource>>();
+        context.Groups.Add(
+            new SettingPageGroup(
+                "MyCompany.Settings",
+                l["MyCompanySettings"],
+                typeof(MyCompanySettingGroupViewComponent),
+                order: 500   // before Email/TimeZone which use 1000
+            )
+        );
+        return Task.CompletedTask;
+    }
+}
+
+// 3. Register from your module.
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<SettingManagementPageOptions>(options =>
+    {
+        options.Contributors.Add(new MyCompanyPageContributor());
+    });
+}
+```
+
+Inside the view component you would call your own app service (probably built on `ISettingManager`) — there is no requirement to use `EmailSettingsAppService` or anything in this module's application layer.
+
+## The Web module wiring
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Web/AbpSettingManagementWebModule.cs
+[DependsOn(
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpMapperlyModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpSettingManagementDomainSharedModule)
+    )]
+public class AbpSettingManagementWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new SettingManagementMainMenuContributor());
+        });
+
+        Configure<SettingManagementPageOptions>(options =>
+        {
+            options.Contributors.Add(new EmailingPageContributor());
+            options.Contributors.Add(new TimeZonePageContributor());
+        });
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSettingManagementWebModule>();
+        });
+
+        Configure<DynamicJavaScriptProxyOptions>(options =>
+        {
+            options.DisableModule(SettingManagementRemoteServiceConsts.ModuleName);
+        });
+
+        context.Services.AddMapperlyObjectMapper<AbpSettingManagementWebModule>();
+    }
+}
+```
+
+| Configure call | Effect |
+| --- | --- |
+| `AbpNavigationOptions` → `SettingManagementMainMenuContributor` | Adds the **Administration → Settings** menu item with `~/SettingManagement` route and `fa-cog` icon. Hidden when no contributor is available, or when the `SettingManagement.Enable` feature is off. |
+| `SettingManagementPageOptions` | Pre-registers the two built-in contributors. |
+| `AbpVirtualFileSystemOptions` | Embeds the `Pages/`, `Components/`, and `wwwroot/` static assets so a referencing host doesn't have to copy them. |
+| `DynamicJavaScriptProxyOptions.DisableModule(...)` | Hides this module from `abp.settingManagement.*` JS auto-generation (see [HTTP API](/modules/setting-management/http-api#disabling-the-dynamic-javascript-proxy)). |
+| `AddMapperlyObjectMapper<...>` | Wires the Mapperly source generator that transforms `EmailSettingsDto` ↔ `EmailSettingViewModel`. |
+
+The main-menu contributor itself shows how the page is hidden when nothing is available:
+
+```csharp
+// SettingManagementMainMenuContributor.cs (excerpt)
+public virtual async Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return;
+    if (context.Menu.FindMenuItem(SettingManagementMenuNames.GroupName) != null)
+    {
+        /* This may happen if blazor server UI is being used in the same application.
+         * In this case, we don't add the MVC setting management UI. */
+        return;
+    }
+
+    var settingPageContributorManager = context.ServiceProvider
+        .GetRequiredService<SettingPageContributorManager>();
+    if (!(await settingPageContributorManager.GetAvailableContributors()).Any())
+    {
+        return;
+    }
+
+    context.Menu.GetAdministration().AddItem(
+        new ApplicationMenuItem(
+            SettingManagementMenuNames.GroupName,
+            l["Settings"],
+            "~/SettingManagement",
+            icon: "fa fa-cog"
+        ).RequireFeatures(SettingManagementFeatures.Enable)
+    );
+}
+```
+
+The `FindMenuItem` guard handles the **dual-UI** case: in a Blazor-Server app that also references the MVC theme, the Blazor menu wins and the MVC menu skips itself.
+
+## The Blazor module wiring
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Blazor/AbpSettingManagementBlazorModule.cs
+[DependsOn(
+    typeof(AbpMapperlyModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpSettingManagementApplicationContractsModule)
+)]
+public class AbpSettingManagementBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper<AbpSettingManagementBlazorModule>();
+
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new SettingManagementMenuContributor());
+        });
+
+        Configure<AbpRouterOptions>(options =>
+        {
+            options.AdditionalAssemblies.Add(typeof(AbpSettingManagementBlazorModule).Assembly);
+        });
+
+        Configure<SettingManagementComponentOptions>(options =>
+        {
+            options.Contributors.Add(new EmailingPageContributor());
+            options.Contributors.Add(new TimeZonePageContributor());
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpSettingManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+`AbpRouterOptions.AdditionalAssemblies.Add(...)` is the Blazor-specific call that makes the router discover `SettingManagement.razor` even though the assembly is referenced indirectly.
+
+## The two hosting flavours
+
+`.Blazor.Server` and `.Blazor.WebAssembly` are tiny modules whose only job is to wire `AbpSettingManagementBlazorModule` into the correct host:
+
+- **`AbpSettingManagementBlazorServerModule`** depends additionally on `AbpSettingManagementApplicationModule` and `AbpSettingManagementHttpApiModule` — Blazor Server runs server-side so it uses the in-process app services.
+- **`AbpSettingManagementBlazorWebAssemblyModule`** depends additionally on `AbpSettingManagementHttpApiClientModule` so the WASM client calls the REST API via the generated client proxies from [HTTP API](/modules/setting-management/http-api#generated-client-proxies).
+
+## Localization resource
+
+Every label in the UI is keyed by `AbpSettingManagementResource`:
+
+```csharp
+// modules/setting-management/src/Volo.Abp.SettingManagement.Domain.Shared/
+//   Volo/Abp/SettingManagement/Localization/AbpSettingManagementResource.cs
+[LocalizationResourceName("AbpSettingManagement")]
+public class AbpSettingManagementResource
+{
+}
+```
+
+The JSON files for every supported culture live next to it under `Localization/Resources/`. Both the Web and Blazor modules call `AddBaseTypes(typeof(AbpUiResource))` so generic strings (Save, Cancel, Yes, No) come from the shared UI resource.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Application layer" icon="layer-group" href="/modules/setting-management/application">
+    `EmailSettingsAppService`, `TimeZoneSettingsAppService` — what the view components call.
+  </Card>
+  <Card title="HTTP API & client" icon="cloud" href="/modules/setting-management/http-api">
+    The REST routes and generated proxies that the Blazor WebAssembly host uses.
+  </Card>
+  <Card title="Domain layer" icon="database" href="/modules/setting-management/domain">
+    `ISettingManager` — what any custom contributor's app service should call.
+  </Card>
+  <Card title="Emailing" icon="envelope" href="/misc/emailing">
+    The `Abp.Mailing.*` settings shown on the Email tab.
+  </Card>
+</CardGroup>

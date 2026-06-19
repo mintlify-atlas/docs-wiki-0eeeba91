@@ -1,0 +1,218 @@
+---
+title: "MVC UI Bundling — Scripts, Styles And Tag Helpers"
+sidebarTitle: "UI Bundling"
+description: "Volo.Abp.AspNetCore.Bundling and Mvc.UI.Bundling — IBundleManager, BundlerContext, BundleConfigurationCollection and the abp-script-bundle tag helper."
+---
+
+ABP's MVC UI relies on its own bundler — not Microsoft's BundleConfig nor a webpack/Vite step. Two packages co‑operate: `Volo.Abp.AspNetCore.Bundling` defines the abstractions and base `BundleManagerBase`; `Volo.Abp.AspNetCore.Mvc.UI.Bundling` (paired with `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions`) supplies the MVC‑specific manager and tag helpers.
+
+This page documents the public surface — bundle contributors, configuration collection, the runtime manager, and the `<abp-script-bundle>` / `<abp-style-bundle>` tag helpers.
+
+## Packages
+
+| Package | Path | What it ships |
+| --- | --- | --- |
+| `Volo.Abp.AspNetCore.Bundling` | `framework/src/Volo.Abp.AspNetCore.Bundling/` | `IBundleManager`, `BundleManagerBase`, `IBundler`, `BundlerContext`, the `BundleCache`. |
+| `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions` | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/` | `AbpBundlingOptions`, `BundleConfiguration`, `BundleConfigurationCollection`, `IBundleContributor`. |
+| `Volo.Abp.AspNetCore.Mvc.UI.Bundling` | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/` | `BundleManager`, `MvcUiBundlerBase`, the tag helpers under `TagHelpers/`. |
+
+## `AbpAspNetCoreBundlingModule`
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Bundling/Volo/Abp/AspNetCore/Bundling/AbpAspNetCoreBundlingModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule),
+    typeof(AbpMinifyModule),
+    typeof(AbpVirtualFileSystemModule)
+)]
+public class AbpAspNetCoreBundlingModule : AbpModule
+{
+}
+```
+
+It pulls in `AbpMinifyModule` (which ships NUglify‑based minifiers) and `AbpVirtualFileSystemModule` so bundle contributors can resolve embedded `*.css` / `*.js` files from any ABP module's assembly without copying them to `wwwroot`.
+
+## Bundle definitions
+
+`AbpBundlingOptions.ScriptBundles` and `.StyleBundles` are two `BundleConfigurationCollection` instances, each keyed by bundle name. A module adds a bundle by writing into the options:
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.ScriptBundles
+        .Add("MyTheme.Global", bundle =>
+        {
+            bundle.AddBaseBundles(StandardBundles.Scripts.Global);
+            bundle.AddContributors(typeof(MyThemeGlobalScriptContributor));
+            bundle.AddFiles("/scripts/my-theme.js");
+        });
+
+    options.StyleBundles
+        .Add("MyTheme.Global", bundle =>
+        {
+            bundle.AddBaseBundles(StandardBundles.Styles.Global);
+            bundle.AddContributors(typeof(MyThemeGlobalStyleContributor));
+            bundle.AddFiles("/styles/my-theme.css");
+        });
+});
+```
+
+`BundleConfiguration` exposes:
+
+- `AddBaseBundles(params string[])` — chains another bundle to inherit its contributors/files in order.
+- `AddContributors(params Type[])` — registers `IBundleContributor` types that programmatically add files (used by `Volo.Abp.AspNetCore.Mvc.UI.Packages` for the standard libraries).
+- `AddFiles(params string[])` — adds explicit virtual paths.
+
+## `IBundleContributor`
+
+```csharp
+public interface IBundleContributor
+{
+    Task PreConfigureBundleAsync(BundleConfigurationContext context);
+    Task ConfigureBundleAsync(BundleConfigurationContext context);
+    Task PostConfigureBundleAsync(BundleConfigurationContext context);
+}
+```
+
+`BundleContributor` (in `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/`) is an abstract base that lets implementers override only `ConfigureBundleAsync`. The standard package contributors (e.g. `JQueryScriptContributor`, `BootstrapStyleContributor`) inherit from it and add their files to `context.Files`.
+
+## `IBundleManager` and `BundleManagerBase`
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Bundling/Volo/Abp/AspNetCore/Bundling/IBundleManager.cs
+public interface IBundleManager
+{
+    Task<IReadOnlyList<BundleFile>> GetStyleBundleFilesAsync(string bundleName);
+    Task<IReadOnlyList<BundleFile>> GetScriptBundleFilesAsync(string bundleName);
+}
+```
+
+The base implementation:
+
+```csharp
+// BundleManagerBase.cs (excerpt)
+public abstract class BundleManagerBase : IBundleManager
+{
+    protected readonly AbpBundlingOptions Options;
+    protected readonly AbpBundleContributorOptions ContributorOptions;
+    protected readonly IScriptBundler ScriptBundler;
+    protected readonly IStyleBundler StyleBundler;
+    protected readonly IServiceProvider ServiceProvider;
+    protected readonly IDynamicFileProvider DynamicFileProvider;
+    protected readonly IBundleCache BundleCache;
+
+    public virtual async Task<IReadOnlyList<BundleFile>> GetStyleBundleFilesAsync(string bundleName)
+        => await GetBundleFilesAsync(Options.StyleBundles, bundleName, StyleBundler);
+
+    public virtual async Task<IReadOnlyList<BundleFile>> GetScriptBundleFilesAsync(string bundleName)
+        => await GetBundleFilesAsync(Options.ScriptBundles, bundleName, ScriptBundler);
+}
+```
+
+It delegates the actual minification + concatenation to an `IScriptBundler` / `IStyleBundler` (NUglify under the hood) and caches the result in `IBundleCache`. The cache stores the minified content as a virtual file inside `IDynamicFileProvider` so the next request can serve it directly without re‑bundling.
+
+### `BundlerContext`
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Bundling/Volo/Abp/AspNetCore/Bundling/BundlerContext.cs
+public class BundlerContext : IBundlerContext
+{
+    public string BundleRelativePath { get; }
+    public IReadOnlyList<string> ContentFiles { get; }
+    public bool IsMinificationEnabled { get; }
+
+    public BundlerContext(string bundleRelativePath, IReadOnlyList<string> contentFiles, bool isMinificationEnabled)
+    {
+        BundleRelativePath = bundleRelativePath;
+        ContentFiles = contentFiles;
+        IsMinificationEnabled = isMinificationEnabled;
+    }
+}
+```
+
+Passed by the manager into the bundler; `IsMinificationEnabled` is sourced from `AbpAspNetCoreMvcOptions.MinifyGeneratedScript`, which `AbpAspNetCoreMvcModule.ConfigureServices` defaults to `IsProduction()`.
+
+## MVC manager — `BundleManager`
+
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundleManager.cs` extends `BundleManagerBase`. It overrides file resolution to use the MVC `IWebHostEnvironment.WebRootFileProvider` plus the `CachedBundleDynamicFileProvider` so previously bundled artifacts survive between requests inside the same process.
+
+The MVC module also ships `MvcUiBundlerBase` — a base class for site‑specific bundlers (LESS pre‑processor variants, etc.).
+
+## `AbpAspNetCoreMvcUiBundlingModule`
+
+```csharp
+// AbpAspNetCoreMvcUiBundlingModule.cs (truncated for brevity)
+[DependsOn(
+    typeof(AbpAspNetCoreBundlingModule),
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule)
+)]
+public class AbpAspNetCoreMvcUiBundlingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton<IBundleManager, BundleManager>();
+        // registers tag helpers via ApplicationPartManager
+    }
+}
+```
+
+## Tag helpers
+
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/TagHelpers/` ships:
+
+| Tag helper | Purpose |
+| --- | --- |
+| `AbpScriptBundleTagHelper` (`<abp-script-bundle>`) | Renders `<script src="...">` elements for every file in a named script bundle. |
+| `AbpStyleBundleTagHelper` (`<abp-style-bundle>`) | Same for stylesheets. |
+| `AbpScriptTagHelper` (`<abp-script>`) | Renders a single script with cache‑busting URL versioning. |
+| `AbpStyleTagHelper` (`<abp-style>`) | Same for one stylesheet. |
+| `AbpBundleTagHelper`, `AbpBundleItemTagHelper` | Base / item used by the typed bundle helpers. |
+
+A page uses them like this:
+
+```cshtml
+@addTagHelper *, Volo.Abp.AspNetCore.Mvc.UI.Bundling
+
+<abp-style-bundle name="MyTheme.Global" />
+
+<body>
+    @* ... *@
+    <abp-script-bundle name="MyTheme.Global" />
+</body>
+```
+
+The base class is small:
+
+```csharp
+// AbpBundleTagHelper.cs
+public abstract class AbpBundleTagHelper<TTagHelper, TService> : AbpTagHelper<TTagHelper, TService>, IBundleTagHelper
+    where TTagHelper : AbpTagHelper<TTagHelper, TService>
+    where TService : class, IAbpTagHelperService<TTagHelper>
+{
+    public string? Name { get; set; }
+
+    protected AbpBundleTagHelper(TService service) : base(service) { }
+
+    public virtual string? GetNameOrNull() => Name;
+}
+```
+
+The actual processing happens in `AbpBundleTagHelperService<T>` derivatives (next to each tag helper class), which resolve `IBundleManager.GetScriptBundleFilesAsync(name)` and emit one tag per file in development mode or a single minified output in production.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="UI Packages" icon="box-archive" href="/aspnetcore/mvc-ui-packages">
+    Standard bundle contributors for Bootstrap, jQuery, DataTables, Moment, Lodash etc. — files copied to `wwwroot/libs` by `install-libs`.
+  </Card>
+  <Card title="UI Widgets" icon="grip" href="/aspnetcore/mvc-ui-widgets">
+    Widgets attach their own `Styles` / `Scripts` lists which the bundle manager merges into per‑page bundles.
+  </Card>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    `AbpAspNetCoreMvcOptions.MinifyGeneratedScript` drives `BundlerContext.IsMinificationEnabled`.
+  </Card>
+  <Card title="Modularity" icon="diagram-project" href="/core/modularity">
+    `[DependsOn]` chain that lets a theme module supersede a base module's bundles.
+  </Card>
+</CardGroup>

@@ -1,0 +1,335 @@
+---
+title: "Single-Project (No-Layers) ASP.NET Core Template"
+description: "Tour of templates/app-nolayers/aspnet-core/ — the simpler ABP startup where Domain, Application, and Web collapse into one project per host."
+---
+
+The `app-nolayers` template under [`templates/app-nolayers/aspnet-core/`](https://github.com/abpframework/abp/tree/dev/templates/app-nolayers/aspnet-core) is the **flat alternative** to the layered DDD template. Instead of seven projects per host (`Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `EntityFrameworkCore`, `HttpApi`, `Web`), everything that belongs to a single bounded context lives in **one project**.
+
+It's the right pick when:
+
+- You're building an internal tool or a single-team CRUD app.
+- You're not going to share `Application.Contracts` with another solution.
+- You don't expect a separate API host, separate auth server, or Angular front-end.
+
+If any of those become true later, you can graduate to the [layered template](/templates/app-template-aspnet-core) — the building blocks (entities, application services, OpenIddict modules) are the same.
+
+```
+templates/app-nolayers/aspnet-core/
+├── MyCompanyName.MyProjectName.slnx          # Solution file
+├── NuGet.Config                              # Restore feeds
+├── README.md
+├── migrate-database.ps1                      # Convenience: run EF migrations
+├── MyCompanyName.MyProjectName.Host/         # Headless API host (EF)
+├── MyCompanyName.MyProjectName.Host.Mongo/   # Headless API host (Mongo)
+├── MyCompanyName.MyProjectName.Mvc/          # MVC + API combined (EF)
+├── MyCompanyName.MyProjectName.Mvc.Mongo/    # MVC + API combined (Mongo)
+├── MyCompanyName.MyProjectName.Blazor.Server/        # Blazor Server (EF)
+├── MyCompanyName.MyProjectName.Blazor.Server.Mongo/  # Blazor Server (Mongo)
+└── MyCompanyName.MyProjectName.Blazor.WebAssembly/   # Hosted Blazor WASM
+    ├── Client/                               # WASM client app
+    ├── Server/                               # ASP.NET Core host
+    ├── Server.Mongo/                         # ASP.NET Core host (Mongo)
+    └── Shared/                               # DTOs shared between Client + Server
+```
+
+<Info>
+Only **one** of these host projects survives in the generated solution — `abp new` keeps the one matching your `-u` / `-d` choice and deletes the rest. You'll never have both `.Mvc` and `.Mvc.Mongo` in your output.
+</Info>
+
+## How `-u` and `-d` map to projects
+
+| `abp new` flags | Surviving project |
+| --- | --- |
+| `-u mvc -d ef` | `MyCompanyName.MyProjectName.Mvc` |
+| `-u mvc -d mongodb` | `MyCompanyName.MyProjectName.Mvc.Mongo` |
+| `-u blazor-server -d ef` | `MyCompanyName.MyProjectName.Blazor.Server` |
+| `-u blazor-server -d mongodb` | `MyCompanyName.MyProjectName.Blazor.Server.Mongo` |
+| `-u blazor -d ef` | `MyCompanyName.MyProjectName.Blazor.WebAssembly` (Client + Server + Shared) |
+| `-u blazor -d mongodb` | `MyCompanyName.MyProjectName.Blazor.WebAssembly` with `Server.Mongo` |
+| `--no-ui -d ef` | `MyCompanyName.MyProjectName.Host` |
+| `--no-ui -d mongodb` | `MyCompanyName.MyProjectName.Host.Mongo` |
+
+## Anatomy of a no-layers project
+
+Open any of these host projects (let's use `MyCompanyName.MyProjectName.Mvc`) and you'll see:
+
+```
+MyCompanyName.MyProjectName.Mvc/
+├── Controllers/                  # MVC + dynamic API controllers
+├── Data/                         # MyProjectNameDbContext + MyProjectNameDbMigrationService
+├── Entities/                     # Aggregate roots and entities
+├── Localization/                 # XML / JSON localization files + MyProjectNameResource
+├── Menus/                        # IMenuContributor implementations
+├── Migrations/                   # EF Core migrations
+├── ObjectMapping/                # Mapperly / AutoMapper profiles
+├── Pages/                        # Razor Pages
+├── Properties/                   # launchSettings.json
+├── Services/                     # IApplicationService implementations
+├── MyCompanyName.MyProjectName.Mvc.csproj
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameGlobalFeatureConfigurator.cs
+├── MyProjectNameModule.cs        # The ABP module — depends on everything
+├── MyProjectNameModuleExtensionConfigurator.cs
+├── Program.cs
+├── abp.resourcemapping.js        # libman-style asset mapping
+├── appsettings.json
+├── package.json                  # NPM packages for theme assets
+├── web.config
+└── wwwroot/
+```
+
+The layering you'd find in the multi-project template still exists *conceptually* — it's just collapsed into folders.
+
+| Layered template project | No-layers folder |
+| --- | --- |
+| `Domain.Shared` (constants, enums) | `Localization/`, `Entities/`*Consts.cs* |
+| `Domain` (entities, repos) | `Entities/`, `Data/` |
+| `Application.Contracts` (DTOs, interfaces) | `Services/` (interfaces alongside implementations) |
+| `Application` (impls) | `Services/` |
+| `EntityFrameworkCore` | `Data/`, `Migrations/` |
+| `HttpApi` (controllers) | `Controllers/` |
+| `Web` (pages, theme) | `Pages/`, `wwwroot/`, `Menus/` |
+
+## The combined `MyProjectNameModule`
+
+In layered templates there's a separate ABP module per project. Here, **one module** brings in every dependency. The `using` list at the top of `MyProjectNameModule.cs` tells the story:
+
+```csharp templates/app-nolayers/aspnet-core/MyCompanyName.MyProjectName.Mvc/MyProjectNameModule.cs
+using Microsoft.AspNetCore.Extensions.DependencyInjection;
+using Microsoft.OpenApi.Models;
+using MyCompanyName.MyProjectName.Data;
+using MyCompanyName.MyProjectName.Localization;
+using MyCompanyName.MyProjectName.Menus;
+using OpenIddict.Validation.AspNetCore;
+using Volo.Abp;
+using Volo.Abp.Account;
+using Volo.Abp.Account.Web;
+using Volo.Abp.AspNetCore.Mvc;
+using Volo.Abp.AspNetCore.Mvc.Localization;
+using Volo.Abp.AspNetCore.Mvc.UI.Bundling;
+using Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite;
+using Volo.Abp.AspNetCore.Serilog;
+using Volo.Abp.AuditLogging.EntityFrameworkCore;
+using Volo.Abp.Autofac;
+using Volo.Abp.Mapperly;
+using Volo.Abp.EntityFrameworkCore;
+using Volo.Abp.EntityFrameworkCore.SqlServer;
+using Volo.Abp.FeatureManagement;
+using Volo.Abp.FeatureManagement.EntityFrameworkCore;
+using Volo.Abp.Identity;
+using Volo.Abp.Identity.EntityFrameworkCore;
+using Volo.Abp.OpenIddict;
+using Volo.Abp.OpenIddict.EntityFrameworkCore;
+using Volo.Abp.PermissionManagement;
+using Volo.Abp.PermissionManagement.EntityFrameworkCore;
+using Volo.Abp.SettingManagement;
+using Volo.Abp.SettingManagement.EntityFrameworkCore;
+using Volo.Abp.Swashbuckle;
+using Volo.Abp.TenantManagement;
+using Volo.Abp.TenantManagement.EntityFrameworkCore;
+/* … */
+```
+
+Identity, Tenant Management, Permission Management, Feature Management, Setting Management, OpenIddict, Audit Logging, Account, Swashbuckle, LeptonX Lite theme — all wired into one module via `[DependsOn(...)]` and configured inside `ConfigureServices`. This is convenient up to a few thousand lines of business logic; past that, splitting into the layered template becomes worth it.
+
+## `Program.cs` — note the dual-mode trick
+
+`Program.cs` in every EF-backed host doubles as the **DB migrator**. Run it with `--migrate-database` and it applies migrations + seeds instead of starting the web host:
+
+```csharp templates/app-nolayers/aspnet-core/MyCompanyName.MyProjectName.Mvc/Program.cs
+public async static Task<int> Main(string[] args)
+{
+//<TEMPLATE-REMOVE IF-NOT='dbms:PostgreSQL'>
+    // https://www.npgsql.org/efcore/release-notes/6.0.html#opting-out-of-the-new-timestamp-mapping-logic
+    AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
+
+//</TEMPLATE-REMOVE>
+    var loggerConfiguration = new LoggerConfiguration()
+#if DEBUG
+        .MinimumLevel.Debug()
+#else
+        .MinimumLevel.Information()
+#endif
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+        .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning)
+        .Enrich.FromLogContext()
+        .WriteTo.Async(c => c.File("Logs/logs.txt"))
+        .WriteTo.Async(c => c.Console());
+
+    if (IsMigrateDatabase(args))
+    {
+        loggerConfiguration.MinimumLevel.Override("Volo.Abp", LogEventLevel.Warning);
+        loggerConfiguration.MinimumLevel.Override("Microsoft", LogEventLevel.Warning);
+    }
+
+    Log.Logger = loggerConfiguration.CreateLogger();
+
+    try
+    {
+        var builder = WebApplication.CreateBuilder(args);
+        builder.Host.AddAppSettingsSecretsJson()
+            .UseAutofac()
+            .UseSerilog();
+        if (IsMigrateDatabase(args))
+        {
+            builder.Services.AddDataMigrationEnvironment();
+        }
+        await builder.AddApplicationAsync<MyProjectNameModule>();
+        var app = builder.Build();
+        await app.InitializeApplicationAsync();
+
+        if (IsMigrateDatabase(args))
+        {
+            await app.Services.GetRequiredService<MyProjectNameDbMigrationService>().MigrateAsync();
+            return 0;
+        }
+
+        Log.Information("Starting MyCompanyName.MyProjectName.");
+        await app.RunAsync();
+        return 0;
+    }
+    /* … catch / finally identical to layered template … */
+}
+```
+
+Two things to notice:
+
+1. **`<TEMPLATE-REMOVE IF-NOT='dbms:PostgreSQL'>`** — the Npgsql legacy-timestamp switch only ships when you pick PostgreSQL. The CLI strips the block otherwise.
+2. **`IsMigrateDatabase(args)`** — checks for `--migrate-database` and routes through `MyProjectNameDbMigrationService` instead of `app.RunAsync()`. That's why there's **no separate `DbMigrator` project** in this template — the host *is* the migrator.
+
+`migrate-database.ps1` at the solution root is a one-liner that does `dotnet run --project src/... -- --migrate-database`.
+
+## Blazor WebAssembly variant
+
+The `Blazor.WebAssembly` folder is special — it's the only no-layers host that **must** be multi-project (you can't host WASM and ASP.NET Core in a single assembly). Its sub-structure mirrors the standard hosted WASM template:
+
+<AccordionGroup>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly/Client">
+    The WASM project that runs in the browser. Bootstraps with `WebAssemblyHostBuilder`:
+
+    ```csharp templates/app-nolayers/aspnet-core/MyCompanyName.MyProjectName.Blazor.WebAssembly/Client/Program.cs
+    var builder = WebAssemblyHostBuilder.CreateDefault(args);
+
+    var application = await builder.AddApplicationAsync<MyProjectNameBlazorModule>(options =>
+    {
+        options.UseAutofac();
+    });
+
+    var host = builder.Build();
+
+    await application.InitializeApplicationAsync(host.Services);
+
+    await host.RunAsync();
+    ```
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly/Server">
+    The ASP.NET Core host that serves the WASM bundle and exposes the API. Uses the same `IsMigrateDatabase` dual-mode `Program.cs` shown above with EF Core.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly/Server.Mongo">
+    MongoDB variant of the server host.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly/Shared">
+    Class library shared between Client and Server — DTOs, application service interfaces, permission definitions.
+  </Accordion>
+</AccordionGroup>
+
+## `appsettings.json`
+
+The default file ships connection strings, OpenIddict signing/encryption certificate hints, and a `Settings:Abp.Mailing.*` block. After generation, your first edits will usually be:
+
+1. The `ConnectionStrings:Default` value.
+2. The `App:SelfUrl`.
+3. The `App:CorsOrigins` list (only matters for hosted Blazor WASM / Angular setups).
+
+## Workflow
+
+<Steps>
+  <Step title="Generate">
+    ```bash
+    abp new Acme.Internal -t app-nolayers -u mvc -d ef
+    ```
+    Output contains exactly one host project plus the solution file.
+  </Step>
+  <Step title="Migrate + seed">
+    ```powershell
+    ./migrate-database.ps1
+    ```
+    …or the explicit `dotnet run --project src/Acme.Internal.Mvc -- --migrate-database`.
+  </Step>
+  <Step title="Run">
+    ```bash
+    dotnet run --project src/Acme.Internal.Mvc
+    ```
+    Sign in with `admin` / `1q2w3E*` and start adding entities under `Entities/` and services under `Services/`.
+  </Step>
+</Steps>
+
+## When to graduate to the layered template
+
+<CardGroup cols={2}>
+  <Card title="Sharing DTOs / API contracts" icon="arrows-up-down-left-right">
+    Another solution needs to call this app over HTTP with strongly-typed clients → you want a separate `Application.Contracts` + `HttpApi.Client`.
+  </Card>
+  <Card title="Separate API host" icon="server">
+    The mobile app or SPA grows and you want an isolated `HttpApi.Host` with its own scaling profile.
+  </Card>
+  <Card title="Separate auth server" icon="lock">
+    Compliance / scale demands OpenIddict on its own host (`--separate-auth-server`).
+  </Card>
+  <Card title="More than one bounded context" icon="diagram-project">
+    Multiple aggregates with different lifecycles deserve `Domain` and `Application` projects per context.
+  </Card>
+</CardGroup>
+
+## What survives in a real generated solution
+
+To make the layout concrete, here's what `abp new Acme.Internal -t app-nolayers -u mvc -d ef` actually produces on disk:
+
+```
+Acme.Internal/
+├── Acme.Internal.slnx
+├── NuGet.Config
+├── README.md
+├── migrate-database.ps1
+├── common.props
+└── src/
+    └── Acme.Internal.Mvc/      # The single host project — everything lives here
+        ├── Controllers/
+        ├── Data/
+        ├── Entities/
+        ├── Localization/
+        ├── Menus/
+        ├── Migrations/
+        ├── ObjectMapping/
+        ├── Pages/
+        ├── Services/
+        ├── Acme.Internal.Mvc.csproj
+        ├── AcmeInternalBrandingProvider.cs
+        ├── AcmeInternalGlobalFeatureConfigurator.cs
+        ├── AcmeInternalModule.cs
+        ├── AcmeInternalModuleExtensionConfigurator.cs
+        ├── Program.cs
+        ├── abp.resourcemapping.js
+        ├── appsettings.json
+        ├── package.json
+        └── wwwroot/
+```
+
+Every other folder visible in the template repo (`Mvc.Mongo`, `Host`, `Host.Mongo`, `Blazor.Server`, `Blazor.WebAssembly`, etc.) has been deleted by the CLI's template engine because they don't match the `-u mvc -d ef` flags.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Angular pair" icon="angular" href="/templates/app-nolayers-angular">
+    The matching no-layers Angular workspace.
+  </Card>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    Flags for `-t app-nolayers`.
+  </Card>
+  <Card title="Project building" icon="hammer" href="/cli/project-building">
+    `migrate-database.ps1`, `install-libs`, and dev workflow.
+  </Card>
+  <Card title="Layered alternative" icon="layer-group" href="/templates/app-template-aspnet-core">
+    Compare with the multi-project DDD layout.
+  </Card>
+</CardGroup>

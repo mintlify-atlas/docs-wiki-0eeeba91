@@ -1,0 +1,555 @@
+---
+title: "Abp*Options catalogue: the framework-level Options classes"
+sidebarTitle: "AbpOptions classes"
+description: "A reference table of the ~20 Abp*Options types you will Configure<> most often — what each one toggles, which package owns it, and where the source lives."
+---
+
+ABP's framework packages expose dozens of `Abp*Options` types, but a small subset accounts for almost every line of `Configure<>` you will ever write. This page is the catalogue: one row per options class, with the source file, the namespace, and the headline knobs.
+
+For the *mechanics* of how `Configure<>`, `PreConfigure<>`, and `PostConfigure<>` work — and what `AbpOptionsFactory<T>` does behind the scenes — see [`/core/options-and-configuration`](/core/options-and-configuration). For where `IConfiguration` comes from inside a module see [`/config/overview`](/config/overview).
+
+## The catalogue
+
+All paths below are repo-relative to `framework/src/`.
+
+| Options class | Package | Source file | Headline knobs |
+| --- | --- | --- | --- |
+| [`AbpAuditingOptions`](#abpauditingoptions) | `Volo.Abp.Auditing` | `Volo.Abp.Auditing/Volo/Abp/Auditing/AbpAuditingOptions.cs` | `IsEnabled`, `HideErrors`, `ApplicationName`, `IsEnabledForAnonymousUsers`, `AlwaysLogOnException`, contributor/selector lists |
+| [`AbpBlobStoringOptions`](#abpblobstoringoptions) | `Volo.Abp.BlobStoring` | `Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/AbpBlobStoringOptions.cs` | `Containers` (a `BlobContainerConfigurations` dictionary) |
+| [`AbpDistributedEventBusOptions`](#abpdistributedeventbusoptions) | `Volo.Abp.EventBus` | `Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/AbpDistributedEventBusOptions.cs` | `Handlers`, `Outboxes`, `Inboxes` |
+| [`AbpDistributedEntityEventOptions`](#abpdistributedentityeventoptions) | `Volo.Abp.Ddd.Domain.Shared` | `Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/Entities/Events/Distributed/AbpDistributedEntityEventOptions.cs` | `AutoEventSelectors`, `IgnoredEventSelectors`, `EtoMappings` |
+| [`AbpClockOptions`](#abpclockoptions) | `Volo.Abp.Timing` | `Volo.Abp.Timing/Volo/Abp/Timing/AbpClockOptions.cs` | `Kind` (`DateTimeKind`) |
+| [`AbpDistributedCacheOptions`](#abpdistributedcacheoptions) | `Volo.Abp.Caching` | `Volo.Abp.Caching/Volo/Abp/Caching/AbpDistributedCacheOptions.cs` | `KeyPrefix`, `HideErrors`, `GlobalCacheEntryOptions`, `CacheConfigurators` |
+| [`AbpAntiForgeryOptions`](#abpantiforgeryoptions) | `Volo.Abp.AspNetCore.Mvc` | `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AntiForgery/AbpAntiForgeryOptions.cs` | `TokenCookie`, `AuthCookieSchemaName`, `AutoValidate`, `AutoValidateFilter` |
+| [`AbpEndpointRouterOptions`](#abpendpointrouteroptions) | `Volo.Abp.AspNetCore` | `Volo.Abp.AspNetCore/Microsoft/AspNetCore/Routing/AbpEndpointRouterOptions.cs` | `EndpointConfigureActions` |
+| [`AbpAspNetCoreContentOptions`](#abpaspnetcorecontentoptions) | `Volo.Abp.AspNetCore` | `Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/VirtualFileSystem/AbpAspNetCoreContentOptions.cs` | `ContentTypeMaps`, `AllowedExtraWebContentFolders`, `AllowedExtraWebContentFileExtensions` |
+| [`AbpAspNetCoreMvcOptions`](#abpaspnetcoremvcoptions) | `Volo.Abp.AspNetCore.Mvc` | `Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcOptions.cs` | `ConventionalControllers`, `ExposeIntegrationServices`, `AutoModelValidation`, `IgnoredControllersOnModelExclusion`, `ControllersToRemove` |
+| [`AbpDistributedLockOptions`](#abpdistributedlockoptions) | `Volo.Abp.DistributedLocking.Abstractions` | `Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/AbpDistributedLockOptions.cs` | `KeyPrefix` |
+| [`AbpHttpClientBuilderOptions`](#abphttpclientbuilderoptions) | `Volo.Abp.Http.Client` | `Volo.Abp.Http.Client/Volo/Abp/Http/Client/AbpHttpClientBuilderOptions.cs` | `ProxyClientBuildActions`, `ProxyClientActions`, `ProxyClientHandlerActions` |
+| [`AbpHttpClientOptions`](#abphttpclientoptions) | `Volo.Abp.Http.Client` | `Volo.Abp.Http.Client/Volo/Abp/Http/Client/AbpHttpClientOptions.cs` | `HttpClientProxies`, `ProxyHttpClientPreSendActions` |
+| [`AbpRemoteServiceOptions`](#abpremoteserviceoptions) | `Volo.Abp.RemoteServices` | `Volo.Abp.RemoteServices/Volo/Abp/Http/Client/AbpRemoteServiceOptions.cs` | `RemoteServices` (a `RemoteServiceConfigurationDictionary`) |
+| [`AbpIdentityOptions`](#abpidentityoptions) | `Volo.Abp.Identity.Domain` (modules) | `modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/AbpIdentityOptions.cs` | `ExternalLoginProviders` |
+| [`AbpLocalizationOptions`](#abplocalizationoptions) | `Volo.Abp.Localization` | `Volo.Abp.Localization/Volo/Abp/Localization/AbpLocalizationOptions.cs` | `Resources`, `DefaultResourceType`, `Languages`, `LanguagesMap`, `LanguageFilesMap`, `TryToGetFromBaseCulture`, `TryToGetFromDefaultCulture`, `GlobalContributors` |
+| [`AbpPermissionOptions`](#abppermissionoptions) | `Volo.Abp.Authorization.Abstractions` | `Volo.Abp.Authorization.Abstractions/Volo/Abp/Authorization/Permissions/AbpPermissionOptions.cs` | `DefinitionProviders`, `ValueProviders`, `DeletedPermissions`, `DeletedPermissionGroups` |
+| [`AbpSettingOptions`](#abpsettingoptions) | `Volo.Abp.Settings` | `Volo.Abp.Settings/Volo/Abp/Settings/AbpSettingOptions.cs` | `DefinitionProviders`, `ValueProviders`, `DeletedSettings`, `ReturnOriginalValueIfDecryptFailed` |
+| [`AbpFeatureOptions`](#abpfeatureoptions) | `Volo.Abp.Features` | `Volo.Abp.Features/Volo/Abp/Features/AbpFeatureOptions.cs` | `DefinitionProviders`, `ValueProviders`, `DeletedFeatures`, `DeletedFeatureGroups` |
+| [`AbpMultiTenancyOptions`](#abpmultitenancyoptions) | `Volo.Abp.MultiTenancy.Abstractions` | `Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/AbpMultiTenancyOptions.cs` | `IsEnabled`, `DatabaseStyle` |
+
+The sections below show the actual source for each class, the typical `Configure<>` call site, and the matching `appsettings.json` section when one exists.
+
+## AbpAuditingOptions
+
+Auditing's master switch and its contributor lists.
+
+```csharp
+// framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AbpAuditingOptions.cs
+public class AbpAuditingOptions
+{
+    /// <summary>
+    /// If this value is true, auditing will not throw an exceptions and it will
+    /// log it when an error occurred while saving AuditLog. Default: true.
+    /// </summary>
+    public bool HideErrors { get; set; }
+
+    /// <summary> Default: true. </summary>
+    public bool IsEnabled { get; set; }
+
+    /// <summary> The name of the application or service writing audit logs. </summary>
+    public string? ApplicationName { get; set; }
+
+    /// <summary> Default: true. </summary>
+    public bool IsEnabledForAnonymousUsers { get; set; }
+
+    /// <summary> Audit log on exceptions. Default: true. </summary>
+    public bool AlwaysLogOnException { get; set; }
+    // … Contributors, EntityHistorySelectors, IgnoredTypes, etc.
+}
+```
+
+Typical wiring:
+
+```csharp
+Configure<AbpAuditingOptions>(options =>
+{
+    options.ApplicationName  = "MyProjectName.HttpApi.Host";
+    options.IsEnabled        = true;
+    options.IsEnabledForAnonymousUsers = false;
+    options.EntityHistorySelectors.AddAllEntities();
+});
+```
+
+## AbpBlobStoringOptions
+
+Tiny class that delegates everything to `BlobContainerConfigurations` — a dictionary of named containers, each with its own provider.
+
+```csharp
+// framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/AbpBlobStoringOptions.cs
+public class AbpBlobStoringOptions
+{
+    public BlobContainerConfigurations Containers { get; }
+
+    public AbpBlobStoringOptions()
+    {
+        Containers = new BlobContainerConfigurations();
+    }
+}
+```
+
+Typical wiring (using the file-system provider as an example):
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseFileSystem(fileSystem =>
+        {
+            fileSystem.BasePath = "/var/blobs";
+        });
+    });
+});
+```
+
+## AbpDistributedEventBusOptions
+
+Carries the registered handler type list, plus the outbox and inbox configuration dictionaries used by the persisted event bus.
+
+```csharp
+// framework/src/Volo.Abp.EventBus/Volo/Abp/EventBus/Distributed/AbpDistributedEventBusOptions.cs
+public class AbpDistributedEventBusOptions
+{
+    public ITypeList<IEventHandler> Handlers { get; }
+    public OutboxConfigDictionary Outboxes { get; }
+    public InboxConfigDictionary Inboxes { get; }
+
+    public AbpDistributedEventBusOptions()
+    {
+        Handlers = new TypeList<IEventHandler>();
+        Outboxes = new OutboxConfigDictionary();
+        Inboxes  = new InboxConfigDictionary();
+    }
+}
+```
+
+## AbpDistributedEntityEventOptions
+
+Controls which entities get auto-published as distributed events and how their ETO (Event Transfer Object) shapes are mapped from domain entities.
+
+```csharp
+// framework/src/Volo.Abp.Ddd.Domain.Shared/Volo/Abp/Domain/Entities/Events/Distributed/
+// AbpDistributedEntityEventOptions.cs
+public class AbpDistributedEntityEventOptions
+{
+    public IAutoEntityDistributedEventSelectorList AutoEventSelectors { get; }
+    public IAutoEntityDistributedEventSelectorList IgnoredEventSelectors { get; }
+    public EtoMappingDictionary EtoMappings { get; set; }
+}
+```
+
+## AbpClockOptions
+
+One knob: the `DateTimeKind` that `IClock.Now` returns. `Utc` is the recommended value for modern services; the default is `Unspecified` for backwards compatibility.
+
+```csharp
+// framework/src/Volo.Abp.Timing/Volo/Abp/Timing/AbpClockOptions.cs
+public class AbpClockOptions
+{
+    /// <summary> Default: <see cref="DateTimeKind.Unspecified"/> </summary>
+    public DateTimeKind Kind { get; set; }
+
+    public AbpClockOptions()
+    {
+        Kind = DateTimeKind.Unspecified;
+    }
+}
+```
+
+```csharp
+Configure<AbpClockOptions>(options =>
+{
+    options.Kind = DateTimeKind.Utc;
+});
+```
+
+See [`/core/timing`](/core/timing) for the `IClock` consumer side.
+
+## AbpDistributedCacheOptions
+
+The cache prefix (so multiple deployments can share one Redis), the error-swallowing flag, the default TTL, and a list of per-cache configurators.
+
+```csharp
+// framework/src/Volo.Abp.Caching/Volo/Abp/Caching/AbpDistributedCacheOptions.cs
+public class AbpDistributedCacheOptions
+{
+    public bool HideErrors { get; set; } = true;
+    public string KeyPrefix { get; set; }
+    public DistributedCacheEntryOptions GlobalCacheEntryOptions { get; set; }
+    public List<Func<string, DistributedCacheEntryOptions?>> CacheConfigurators { get; set; }
+    // …
+}
+```
+
+```csharp
+Configure<AbpDistributedCacheOptions>(options =>
+{
+    options.KeyPrefix = "MyApp:";
+    options.GlobalCacheEntryOptions = new DistributedCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(20)
+    };
+});
+```
+
+## AbpAntiForgeryOptions
+
+Anti-forgery token cookie, auth-cookie scheme name, and the auto-validation predicate.
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AntiForgery/AbpAntiForgeryOptions.cs
+public class AbpAntiForgeryOptions
+{
+    /// <summary> Default cookie name: "XSRF-TOKEN". </summary>
+    public CookieBuilder TokenCookie { get; }
+
+    /// <summary> Default: "Identity.Application". </summary>
+    public string? AuthCookieSchemaName { get; set; }
+
+    /// <summary> Default: true. </summary>
+    public bool AutoValidate { get; set; } = true;
+
+    public Predicate<Type> AutoValidateFilter { get; set; }
+    // …
+}
+```
+
+See [`/security/csrf-anti-forgery`](/security/csrf-anti-forgery) for the validation pipeline.
+
+## AbpEndpointRouterOptions
+
+A list of `Action<EndpointRouteBuilderContext>` callbacks that ABP runs against the endpoint route builder. Used by modules that contribute endpoints (the `account` module adds OpenIddict endpoints this way, for example).
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore/Microsoft/AspNetCore/Routing/AbpEndpointRouterOptions.cs
+public class AbpEndpointRouterOptions
+{
+    public List<Action<EndpointRouteBuilderContext>> EndpointConfigureActions { get; }
+}
+```
+
+```csharp
+Configure<AbpEndpointRouterOptions>(options =>
+{
+    options.EndpointConfigureActions.Add(ctx =>
+    {
+        ctx.Endpoints.MapHealthChecks("/health");
+    });
+});
+```
+
+## AbpAspNetCoreContentOptions
+
+Owns the MIME-type map used by the [virtual file system](/core/volo-abp-core) when serving embedded static files, plus an opt-in allowlist for extra physical folders/extensions:
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/VirtualFileSystem/AbpAspNetCoreContentOptions.cs
+public class AbpAspNetCoreContentOptions
+{
+    public Dictionary<string, string> ContentTypeMaps { get; }
+    public List<string> AllowedExtraWebContentFolders { get; }
+    public List<string> AllowedExtraWebContentFileExtensions { get; }
+    // ctor seeds ContentTypeMaps with hundreds of extension→MIME entries
+}
+```
+
+## AbpAspNetCoreMvcOptions
+
+The single biggest options class in the MVC integration. Controls conventional controllers, integration-service exposure, model validation, and the API-explorer group-name override.
+
+```csharp
+// framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcOptions.cs
+public class AbpAspNetCoreMvcOptions
+{
+    public bool? MinifyGeneratedScript { get; set; }
+
+    public AbpConventionalControllerOptions ConventionalControllers { get; }
+
+    public HashSet<Type> IgnoredControllersOnModelExclusion { get; }
+    public HashSet<Type> ControllersToRemove { get; }
+
+    public bool ExposeIntegrationServices { get; set; } = false;
+    public bool ExposeClientProxyServices { get; set; } = false;
+
+    public bool AutoModelValidation { get; set; }
+    public bool ChangeControllerModelApiExplorerGroupName { get; set; }
+    // ctor sets AutoModelValidation = true, ChangeControllerModelApiExplorerGroupName = true
+}
+```
+
+The very common `PreConfigure<>` pattern that templates ship with:
+
+```csharp
+PreConfigure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers.Create(typeof(MyProjectNameApplicationModule).Assembly);
+});
+```
+
+## AbpDistributedLockOptions
+
+A key prefix so multiple ABP deployments can share one lock backend.
+
+```csharp
+// framework/src/Volo.Abp.DistributedLocking.Abstractions/Volo/Abp/DistributedLocking/
+// AbpDistributedLockOptions.cs
+public class AbpDistributedLockOptions
+{
+    public string KeyPrefix { get; set; }
+
+    public AbpDistributedLockOptions()
+    {
+        KeyPrefix = "";
+    }
+}
+```
+
+## AbpHttpClientBuilderOptions
+
+Hooks that run *while the typed HttpClient is being built* for each dynamic-proxy client. Modules typically `.Add(...)` to these lists to inject a handler or configure a base address.
+
+```csharp
+// framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/AbpHttpClientBuilderOptions.cs
+public class AbpHttpClientBuilderOptions
+{
+    public List<Action<string, IHttpClientBuilder>> ProxyClientBuildActions { get; }
+    internal HashSet<string> ConfiguredProxyClients { get; }
+    public List<Action<string, IServiceProvider, HttpClient>> ProxyClientActions { get; }
+    public List<Action<string, IServiceProvider, HttpClientHandler>> ProxyClientHandlerActions { get; }
+}
+```
+
+## AbpHttpClientOptions
+
+The registered dynamic-proxy clients (one entry per remote-service consumer) plus the pre-send action map.
+
+```csharp
+// framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/AbpHttpClientOptions.cs
+public class AbpHttpClientOptions
+{
+    public Dictionary<Type, HttpClientProxyConfig> HttpClientProxies { get; set; }
+    public Dictionary<string, List<Action<HttpClientProxyConfig, ClientProxyRequestContext, HttpClient>>>
+        ProxyHttpClientPreSendActions { get; }
+
+    public AbpHttpClientOptions AddPreSendAction(string remoteServiceName,
+        Action<HttpClientProxyConfig, ClientProxyRequestContext, HttpClient> action)
+    {
+        ProxyHttpClientPreSendActions
+            .GetOrAdd(remoteServiceName, () => new List<…>())
+            .Add(action);
+        return this;
+    }
+}
+```
+
+## AbpRemoteServiceOptions
+
+The dictionary of *named remote services* that dynamic HTTP proxies dispatch to. Templates bind this from `appsettings.json`:
+
+```csharp
+// framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/AbpRemoteServiceOptions.cs
+public class AbpRemoteServiceOptions
+{
+    public RemoteServiceConfigurationDictionary RemoteServices { get; set; }
+}
+```
+
+```csharp
+Configure<AbpRemoteServiceOptions>(configuration.GetSection("RemoteServices"));
+```
+
+```json
+// appsettings.json
+{
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://localhost:44305/"
+    }
+  }
+}
+```
+
+## AbpIdentityOptions
+
+The single knob exposed by the Identity domain module: the external-login provider dictionary used by the account flow.
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/AbpIdentityOptions.cs
+public class AbpIdentityOptions
+{
+    public ExternalLoginProviderDictionary ExternalLoginProviders { get; }
+
+    public AbpIdentityOptions()
+    {
+        ExternalLoginProviders = new ExternalLoginProviderDictionary();
+    }
+}
+```
+
+Note that the *ASP.NET Core Identity* options (`IdentityOptions`, with password rules, lockout windows, etc.) are surfaced through `ISettingProvider` and edited at runtime, not through this class. See [`/security/settings`](/security/settings).
+
+## AbpLocalizationOptions
+
+Localization resources, language list, and the resource-fallback strategy.
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpLocalizationOptions.cs
+public class AbpLocalizationOptions
+{
+    public LocalizationResourceDictionary Resources { get; }
+    public Type? DefaultResourceType { get; set; }
+    public ITypeList<ILocalizationResourceContributor> GlobalContributors { get; }
+    public List<LanguageInfo> Languages { get; }
+    public Dictionary<string, List<NameValue>> LanguagesMap { get; }
+    public Dictionary<string, List<NameValue>> LanguageFilesMap { get; }
+    public bool TryToGetFromBaseCulture { get; set; }
+    public bool TryToGetFromDefaultCulture { get; set; }
+}
+```
+
+```csharp
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Add<MyProjectNameResource>("en")
+        .AddBaseTypes(typeof(AbpUiResource))
+        .AddVirtualJson("/Localization/MyProjectName");
+
+    options.Languages.Add(new LanguageInfo("en", "en", "English"));
+    options.Languages.Add(new LanguageInfo("tr", "tr", "Türkçe"));
+});
+```
+
+## AbpPermissionOptions
+
+The framework-level registration shape for permissions. Lists are populated by `IPermissionDefinitionProvider` discovery — modules rarely need to touch them directly, but they can mark deleted-permission ids to scrub historical grants.
+
+```csharp
+// framework/src/Volo.Abp.Authorization.Abstractions/Volo/Abp/Authorization/Permissions/
+// AbpPermissionOptions.cs
+public class AbpPermissionOptions
+{
+    public ITypeList<IPermissionDefinitionProvider> DefinitionProviders { get; }
+    public ITypeList<IPermissionValueProvider> ValueProviders { get; }
+    public HashSet<string> DeletedPermissions { get; }
+    public HashSet<string> DeletedPermissionGroups { get; }
+}
+```
+
+See [`/security/permissions`](/security/permissions) for the consumer side.
+
+## AbpSettingOptions
+
+The mirror of `AbpPermissionOptions` for the settings system. Notable extra knob: `ReturnOriginalValueIfDecryptFailed`.
+
+```csharp
+// framework/src/Volo.Abp.Settings/Volo/Abp/Settings/AbpSettingOptions.cs
+public class AbpSettingOptions
+{
+    public ITypeList<ISettingDefinitionProvider> DefinitionProviders { get; }
+    public ITypeList<ISettingValueProvider> ValueProviders { get; }
+    public HashSet<string> DeletedSettings { get; }
+
+    /// <summary>
+    /// Default: true. Useful when you change SettingDefinition.IsEncrypted to true
+    /// and don't want to lose the original (plaintext) value already stored.
+    /// </summary>
+    public bool ReturnOriginalValueIfDecryptFailed { get; set; }
+}
+```
+
+See [`/config/settings-system`](/config/settings-system) for the value-provider order and [`/security/settings`](/security/settings) for the full chain.
+
+## AbpFeatureOptions
+
+The feature-system mirror of `AbpPermissionOptions`.
+
+```csharp
+// framework/src/Volo.Abp.Features/Volo/Abp/Features/AbpFeatureOptions.cs
+public class AbpFeatureOptions
+{
+    public ITypeList<IFeatureDefinitionProvider> DefinitionProviders { get; }
+    public ITypeList<IFeatureValueProvider> ValueProviders { get; }
+    public HashSet<string> DeletedFeatures { get; }
+    public HashSet<string> DeletedFeatureGroups { get; }
+}
+```
+
+See [`/security/features`](/security/features).
+
+## AbpMultiTenancyOptions
+
+The two-knob class that decides whether the tenant-resolution pipeline runs at all and how to interpret tenant connection strings.
+
+```csharp
+// framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/AbpMultiTenancyOptions.cs
+public class AbpMultiTenancyOptions
+{
+    /// <summary> A central point to enable/disable multi-tenancy. Default: false. </summary>
+    public bool IsEnabled { get; set; }
+
+    /// <summary> Database style for tenants. Default: Hybrid. </summary>
+    public MultiTenancyDatabaseStyle DatabaseStyle { get; set; } = MultiTenancyDatabaseStyle.Hybrid;
+}
+```
+
+```csharp
+Configure<AbpMultiTenancyOptions>(options =>
+{
+    options.IsEnabled = MultiTenancyConsts.IsEnabled;
+});
+```
+
+## Patterns that cut across the catalogue
+
+A few patterns appear over and over in the table above.
+
+<AccordionGroup>
+  <Accordion title="Lists of typed providers (ITypeList<T>)">
+    `AbpPermissionOptions`, `AbpSettingOptions`, `AbpFeatureOptions`, `AbpDistributedEventBusOptions`, and `AbpLocalizationOptions` all carry one or more `ITypeList<T>` collections. Modules `Add<TProvider>()` to these lists during `ConfigureServices`; ABP discovery picks them up at runtime.
+
+    ```csharp
+    Configure<AbpSettingOptions>(options =>
+    {
+        options.DefinitionProviders.Add<MyProjectNameSettingDefinitionProvider>();
+    });
+    ```
+  </Accordion>
+  <Accordion title="Deleted-name hash sets">
+    `AbpPermissionOptions.DeletedPermissions`, `AbpSettingOptions.DeletedSettings`, and `AbpFeatureOptions.DeletedFeatures` let you *retire* an identifier — useful when you remove a permission/setting from your definition provider but want the framework to clean up historical grants/values during DB seeding.
+  </Accordion>
+  <Accordion title="Dictionaries with named entries (Containers / RemoteServices / Inboxes)">
+    `AbpBlobStoringOptions.Containers`, `AbpRemoteServiceOptions.RemoteServices`, `AbpDistributedEventBusOptions.Outboxes` and `.Inboxes`, and `AbpDistributedEntityEventOptions.EtoMappings` are all dictionaries keyed by a logical name. They map cleanly onto `appsettings.json` objects when you bind them via `configuration.GetSection(...)`.
+  </Accordion>
+  <Accordion title="Boolean master-switches">
+    `AbpMultiTenancyOptions.IsEnabled`, `AbpAuditingOptions.IsEnabled`, `AbpAntiForgeryOptions.AutoValidate`. Use these to turn a subsystem off (almost) entirely for a single deployment without removing the module.
+  </Accordion>
+  <Accordion title="HideErrors flags">
+    `AbpAuditingOptions.HideErrors` (defaults `true`) and `AbpDistributedCacheOptions.HideErrors` (defaults `true`) tell the subsystem to *log and swallow* internal errors instead of bubbling them. Flip to `false` in tests so failures aren't silent.
+  </Accordion>
+</AccordionGroup>
+
+## Where this fits
+
+<CardGroup cols={2}>
+  <Card title="Options-pattern internals" icon="gears" href="/core/options-and-configuration">
+    The mechanics of `Configure<>`, `PreConfigure<>`, `PostConfigure<>`, and `AbpOptionsFactory<T>`.
+  </Card>
+  <Card title="Configuration overview" icon="map" href="/config/overview">
+    The three-layer model: `IConfiguration`, `IOptions<T>`, `ISettingProvider`.
+  </Card>
+  <Card title="Sample appsettings.json" icon="file-code" href="/config/appsettings">
+    Real excerpts from the ABP template projects (Web, HttpApi.Host, AuthServer, Blazor.Server, DbMigrator).
+  </Card>
+  <Card title="Settings bridge" icon="bridge" href="/config/settings-system">
+    How `ConfigurationSettingValueProvider` exposes `Settings:*` from `appsettings.json` to `ISettingProvider`.
+  </Card>
+</CardGroup>

@@ -1,0 +1,311 @@
+---
+title: "Single-Project (No-Layers) Angular Template"
+description: "Tour of templates/app-nolayers/angular/ — the Angular SPA workspace paired with the no-layers ASP.NET Core backend."
+---
+
+The workspace under [`templates/app-nolayers/angular/`](https://github.com/abpframework/abp/tree/dev/templates/app-nolayers/angular) is what [`abp new`](/cli/new-command) extracts when you combine `-t app-nolayers` with `-u angular`. It is **almost identical** to the [layered Angular template](/templates/app-template-angular) — same Angular CLI version, same `@abp/ng.*` packages, same `provideAbpCore` + `provideAbpOAuth` configuration. The only differences are the backend port it targets and (depending on the version) the default theme.
+
+This page focuses on the file paths and the points where the no-layers workspace diverges from the layered one.
+
+```
+templates/app-nolayers/angular/
+├── README.md
+├── angular.json
+├── karma.conf.js
+├── package.json
+├── start.ps1
+├── tsconfig.app.json
+├── tsconfig.json
+├── tsconfig.spec.json
+└── src/
+    ├── app/
+    │   ├── app.component.ts
+    │   ├── app.config.ts
+    │   ├── app.routes.ts
+    │   ├── route.provider.ts
+    │   ├── home/
+    │   └── shared/
+    ├── assets/
+    ├── environments/
+    │   ├── environment.ts
+    │   └── environment.prod.ts
+    ├── favicon.ico
+    ├── index.html
+    ├── main.ts
+    ├── polyfills.ts
+    ├── styles.scss
+    └── test.ts
+```
+
+## What's the same as the layered template
+
+- **Bootstrap.** `main.ts` calls `bootstrapApplication(AppComponent, appConfig)`.
+- **`AppComponent`.** Standalone, hosts `<abp-loader-bar />`, `<abp-dynamic-layout />`, `<abp-internet-status />`.
+- **`app.config.ts`.** Same set of `provideAbpCore`, `provideAbpOAuth`, `provideAbpThemeShared`, `provideSettingManagementConfig`, etc.
+- **Routing.** Same `loadChildren: () => import('@abp/ng.identity').then(m => m.createRoutes())` pattern for every ABP feature module.
+- **`route.provider.ts`.** Same `APP_INITIALIZER` registering a single "Home" menu entry against `RoutesService`.
+
+The Angular code you write — components, pages, services — looks the same in both templates. If you migrate later, you're moving the backend, not the SPA.
+
+## What's different from the layered template
+
+### 1. The backend port
+
+Layered template's `environment.ts` points at `https://localhost:44305` (the `HttpApi.HostWithIds` port). No-layers points at `https://localhost:44300` — the single host project that does both API and identity:
+
+```ts templates/app-nolayers/angular/src/environments/environment.ts
+import { Environment } from '@abp/ng.core';
+
+const baseUrl = 'http://localhost:4200';
+
+export const environment = {
+  production: false,
+  application: {
+    baseUrl,
+    name: 'MyProjectName',
+    logoUrl: '',
+  },
+  oAuthConfig: {
+    issuer: 'https://localhost:44300/',
+    redirectUri: baseUrl,
+    clientId: 'MyProjectName_App',
+    responseType: 'code',
+    scope: 'offline_access MyProjectName',
+    requireHttps: true,
+  },
+  apis: {
+    default: {
+      url: 'https://localhost:44300',
+      rootNamespace: 'MyCompanyName.MyProjectName',
+    },
+  },
+} as Environment;
+```
+
+If you generated your backend with `--no-ui -d ef`, the surviving `MyCompanyName.MyProjectName.Host` host listens on this port. The Angular workspace assumes that.
+
+### 2. The default theme
+
+Open `package.json` for both templates and compare the `@abp/ng.theme.*` entries:
+
+```jsonc templates/app-nolayers/angular/package.json
+{
+  "name": "MyProjectName",
+  "version": "0.0.0",
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve --open",
+    "build": "ng build",
+    "build:prod": "ng build --configuration production",
+    "watch": "ng build --watch --configuration development",
+    "test": "ng test",
+    "lint": "ng lint"
+  },
+  "private": true,
+  "dependencies": {
+    "@abp/ng.account": "~10.0.1",
+    "@abp/ng.components": "~10.0.1",
+    "@abp/ng.core": "~10.0.1",
+    "@abp/ng.identity": "~10.0.1",
+    "@abp/ng.oauth": "~10.0.1",
+    "@abp/ng.setting-management": "~10.0.1",
+    "@abp/ng.tenant-management": "~10.0.1",
+    "@abp/ng.theme.basic": "~10.0.1",
+    "@abp/ng.theme.shared": "~10.0.1",
+    "@angular/animations": "~20.0.0",
+    "@angular/common": "~20.0.0"
+    /* … */
+  }
+}
+```
+
+The no-layers template ships with `@abp/ng.theme.basic`. The layered template ships with `@abp/ng.theme.lepton-x` + `@abp/ng.theme.lepton-x` layouts.
+
+<Info>
+The "basic" theme matches the open-source MVC `LeptonXLite` theme. You can swap it for the LeptonX commercial theme by replacing the `provideThemeLeptonX()` / `provideSideMenuLayout()` lines and updating the `package.json` dependency.
+</Info>
+
+### 3. (Sometimes) no `--tiered` story
+
+The layered template documents `--tiered` and `--separate-auth-server` topologies. The no-layers template doesn't — the backend is a single host, so there's nothing to "tier". Everything in this Angular workspace assumes the API and identity endpoints are on the **same origin**.
+
+## `app.config.ts` — verbatim
+
+```ts templates/app-nolayers/angular/src/app/app.config.ts
+import { ApplicationConfig } from '@angular/core';
+import { provideAnimations } from '@angular/platform-browser/animations';
+import { provideRouter } from '@angular/router';
+import { appRoutes } from './app.routes';
+import { APP_ROUTE_PROVIDER } from './route.provider';
+import { provideAbpCore, withOptions } from '@abp/ng.core';
+import { environment } from '../environments/environment';
+import { registerLocale } from '@abp/ng.core/locale';
+import { provideAbpOAuth } from '@abp/ng.oauth';
+import { provideAbpThemeShared, provideLogo, withEnvironmentOptions} from '@abp/ng.theme.shared';
+import { provideSettingManagementConfig } from '@abp/ng.setting-management/config';
+import { provideAccountConfig } from '@abp/ng.account/config';
+import { provideIdentityConfig } from '@abp/ng.identity/config';
+import { provideTenantManagementConfig } from '@abp/ng.tenant-management/config';
+import { provideFeatureManagementConfig } from '@abp/ng.feature-management';
+import { provideThemeLeptonX } from '@abp/ng.theme.lepton-x';
+import { provideSideMenuLayout } from '@abp/ng.theme.lepton-x/layouts';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(appRoutes),
+    APP_ROUTE_PROVIDER,
+    provideAbpCore(
+      withOptions({
+        environment,
+        registerLocaleFn: registerLocale(),
+      })
+    ),
+    provideThemeLeptonX(),
+    provideSideMenuLayout(),
+    provideAbpOAuth(),
+    provideAbpThemeShared(),
+    provideSettingManagementConfig(),
+    provideAccountConfig(),
+    provideIdentityConfig(),
+    provideTenantManagementConfig(),
+    provideFeatureManagementConfig(),
+    provideAnimations(),
+    provideLogo(withEnvironmentOptions(environment)),
+  ],
+};
+```
+
+The set of providers is unchanged from the layered template. The configuration of the no-layers backend (single host, no separate auth server) is invisible to the SPA — OpenIddict still emits standards-compliant tokens, and `provideAbpOAuth` doesn't care whether the issuer and the API share an origin.
+
+## Routing and menu
+
+```ts templates/app-nolayers/angular/src/app/app.routes.ts
+export const appRoutes: Routes = [
+  {
+    path: '',
+    pathMatch: 'full',
+    loadChildren: () => import('./home/home.routes').then(m => m.homeRoutes),
+  },
+  {
+    path: 'account',
+    loadChildren: () => import('@abp/ng.account').then(m => m.createRoutes()),
+  },
+  {
+    path: 'identity',
+    loadChildren: () => import('@abp/ng.identity').then(m => m.createRoutes()),
+  },
+  {
+    path: 'tenant-management',
+    loadChildren: () =>
+      import('@abp/ng.tenant-management').then(m => m.createRoutes()),
+  },
+  {
+    path: 'setting-management',
+    loadChildren: () =>
+      import('@abp/ng.setting-management').then(m => m.createRoutes()),
+  },
+];
+```
+
+Same five lazy chunks as the layered template — `account`, `identity`, `tenant-management`, `setting-management`, plus your own `home` page. If you turn off multi-tenancy on the backend, the `tenant-management` route is still reachable but its pages return empty datasets.
+
+## `src/app/shared/`
+
+A `SharedModule` (or `shared.module.ts` re-export file) is provided as a parking spot for cross-page imports. Standalone components don't need it; ABP keeps it for parity with the layered template and for teams that prefer NgModules.
+
+## `src/app/home/`
+
+Same starter "home" route as the layered template. Read `home.routes.ts` to see a single-route lazy chunk with `data: { layout: eLayoutType.application }`.
+
+## `angular.json`
+
+Same `@angular/build:application` builder, same `allowedCommonJsDependencies` for `chart.js` and `js-sha256`, same `dist/MyProjectName` output path. Diff against the layered `angular.json` and the only differences are whitespace and the project name token.
+
+## End-to-end workflow
+
+<Steps>
+  <Step title="Generate the no-layers backend with Angular UI">
+    ```bash
+    abp new Acme.Internal -t app-nolayers -u angular -d ef
+    ```
+    Produces two folders: `aspnet-core/` (single host project) and `angular/` (this workspace).
+  </Step>
+  <Step title="Migrate and seed">
+    ```powershell
+    cd aspnet-core
+    ./migrate-database.ps1
+    ```
+    Same dual-mode `Program.cs` trick as the [no-layers ASP.NET Core template](/templates/app-nolayers-aspnet-core#programcs--note-the-dualmode-trick) — passes `--migrate-database` to the host.
+  </Step>
+  <Step title="Start the backend">
+    ```bash
+    dotnet run --project src/Acme.Internal.Host
+    ```
+    Backend listens on `https://localhost:44300` (matches `environment.ts`).
+  </Step>
+  <Step title="Install Angular deps and serve">
+    ```bash
+    cd ../angular
+    npm install
+    npm start
+    ```
+    Opens `http://localhost:4200`, redirects to `https://localhost:44300/connect/authorize` for login, returns with a code, and exchanges it for an access token.
+  </Step>
+</Steps>
+
+## When you outgrow this template
+
+Same questions as the no-layers ASP.NET Core page:
+
+- Do you want to host the SPA on a different origin than the API for **production**? → still fine, just adjust CORS on the backend.
+- Do you need a **mobile** client that also calls the same API? → keep the no-layers backend, generate a [MAUI client](/templates/maui-template) or roll your own.
+- Do you need an **isolated OpenIddict server**? → graduate to the layered backend and pair it with the [layered Angular template](/templates/app-template-angular).
+
+## Files you'll edit first
+
+<CardGroup cols={2}>
+  <Card title="environment.ts" icon="gear">
+    Replace `https://localhost:44300` with your real API/auth origin before deploying.
+  </Card>
+  <Card title="route.provider.ts" icon="bars">
+    Add menu entries for new features.
+  </Card>
+  <Card title="app.routes.ts" icon="signs-post">
+    Add `loadChildren` entries for each feature folder you create under `src/app/`.
+  </Card>
+  <Card title="src/app/home/" icon="house">
+    Replace the placeholder with a dashboard fit for your product.
+  </Card>
+</CardGroup>
+
+## Production build
+
+```bash
+npm run build:prod
+```
+
+Outputs `dist/MyProjectName/` with hashed asset filenames. Two settings to update before you deploy:
+
+1. **`src/environments/environment.prod.ts`** — change the `oAuthConfig.issuer` and `apis.default.url` from `https://localhost:44300` to your production origin.
+2. **`oAuthConfig.requireHttps`** — leave `true` in production; only flip to `false` if you're behind a TLS-terminating proxy *and* the issuer URL itself is `http://`.
+
+<Warning>
+The OpenIddict client registration on the backend must list your production `redirectUri` and `postLogoutRedirectUri`. Otherwise the authorization endpoint returns `invalid_redirect_uri`. ABP's `OpenIddictDataSeedContributor` seeds these from `appsettings.json` — update the backend before deploying the SPA.
+</Warning>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="No-layers backend" icon="cube" href="/templates/app-nolayers-aspnet-core">
+    The ASP.NET Core project this SPA talks to.
+  </Card>
+  <Card title="Layered Angular" icon="angular" href="/templates/app-template-angular">
+    The richer template if you outgrow this one.
+  </Card>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    `-t app-nolayers -u angular` flag combinations.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    NPM install, `migrate-database.ps1`, host startup order.
+  </Card>
+</CardGroup>

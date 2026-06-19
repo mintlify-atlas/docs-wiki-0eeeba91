@@ -1,0 +1,625 @@
+---
+title: "Permission Management Domain Layer Internal Reference"
+sidebarTitle: "Domain"
+description: "PermissionGrant entity, IPermissionGrantRepository, PermissionStore cache, PermissionManager, and User/Role/Client PermissionManagementProvider chain."
+---
+
+The domain layer of **ABP's Permission Management module** lives in two NuGet packages: `Volo.Abp.PermissionManagement.Domain.Shared` (constants, DB property class, localization resource, the `IsGrantedRequest` / `IsGrantedResponse` integration contracts) and `Volo.Abp.PermissionManagement.Domain` (the entities, repositories, and the `PermissionStore` / `PermissionManager` services that implement the read / write paths). Two satellite domain packages — `Volo.Abp.PermissionManagement.Domain.Identity` and `Volo.Abp.PermissionManagement.Domain.OpenIddict` — add the subject-specific `PermissionManagementProvider` for users, roles, and OpenIddict client applications.
+
+Everything below is wired together by `AbpPermissionManagementDomainModule` in [`Volo/Abp/PermissionManagement/AbpPermissionManagementDomainModule.cs`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/AbpPermissionManagementDomainModule.cs), which depends on `AbpAuthorizationModule`, `AbpDddDomainModule`, `AbpPermissionManagementDomainSharedModule`, `AbpCachingModule`, and `AbpJsonModule`.
+
+## Source layout
+
+<Tabs>
+  <Tab title="Domain.Shared">
+    `modules/permission-management/src/Volo.Abp.PermissionManagement.Domain.Shared/Volo/Abp/PermissionManagement/`
+    - `AbpPermissionManagementDbProperties.cs` — `DbTablePrefix`, `DbSchema`, `ConnectionStringName = "AbpPermissionManagement"`
+    - `PermissionGrantConsts.cs` — `MaxProviderNameLength = 64`, `MaxProviderKeyLength = 64`
+    - `PermissionDefinitionRecordConsts.cs` / `PermissionGroupDefinitionRecordConsts.cs` — field length limits
+    - `IsGrantedRequest.cs` / `IsGrantedResponse.cs` — DTOs for the cross-process `IPermissionIntegrationService`
+    - `IPermissionFinder.cs` — abstraction the auth pipeline calls
+    - `DynamicPermissionDefinitionsChangedEto.cs` — distributed event ETO
+    - `Localization/AbpPermissionManagementResource.cs`
+  </Tab>
+  <Tab title="Domain">
+    `modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/`
+    - `PermissionGrant.cs`, `IPermissionGrantRepository.cs`
+    - `PermissionDefinitionRecord.cs`, `PermissionGroupDefinitionRecord.cs`
+    - `IPermissionDefinitionRecordRepository.cs`, `IPermissionGroupDefinitionRecordRepository.cs`
+    - `PermissionStore.cs` (the `IPermissionStore` implementation)
+    - `PermissionManager.cs` / `IPermissionManager.cs`
+    - `PermissionGrantCacheItem.cs`, `PermissionGrantCacheItemInvalidator.cs`
+    - `PermissionManagementProvider.cs` / `IPermissionManagementProvider.cs`
+    - `PermissionManagementOptions.cs`
+    - `PermissionDataSeeder.cs` / `PermissionDataSeedContributor.cs`
+    - `StaticPermissionSaver.cs` / `IStaticPermissionSaver.cs`
+    - `DynamicPermissionDefinitionStore.cs` + in-memory cache
+    - `PermissionFinder.cs` (in-process `IPermissionFinder`)
+  </Tab>
+  <Tab title="Domain.Identity">
+    `modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/`
+    - `AbpPermissionManagementDomainIdentityModule.cs`
+    - `UserPermissionManagementProvider.cs`
+    - `RolePermissionManagementProvider.cs`
+  </Tab>
+  <Tab title="Domain.OpenIddict">
+    `modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict/Volo/Abp/PermissionManagement/OpenIddict/`
+    - `AbpPermissionManagementDomainOpenIddictModule.cs`
+    - `ApplicationPermissionManagementProvider.cs`
+  </Tab>
+</Tabs>
+
+## `PermissionGrant` — the persisted entity
+
+`PermissionGrant` (in [`PermissionGrant.cs`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionGrant.cs)) is the only row that records "subject X has permission Y". It is an `Entity<Guid>` and an `IMultiTenant`:
+
+```csharp
+public class PermissionGrant : Entity<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+
+    [NotNull]  public virtual string Name { get; protected set; }
+    [NotNull]  public virtual string ProviderName { get; protected set; }
+    [CanBeNull] public virtual string ProviderKey { get; protected internal set; }
+
+    public PermissionGrant(
+        Guid id,
+        [NotNull] string name,
+        [NotNull] string providerName,
+        [CanBeNull] string providerKey,
+        Guid? tenantId = null)
+    {
+        Id = id;
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+        ProviderName = Check.NotNullOrWhiteSpace(providerName, nameof(providerName));
+        ProviderKey = providerKey;
+        TenantId = tenantId;
+    }
+}
+```
+
+The table is mapped by `AbpPermissionManagementDbContextModelBuilderExtensions.ConfigurePermissionManagement` (EF Core side) to `AbpPermissionGrants` with the unique index `(TenantId, Name, ProviderName, ProviderKey)`. `ProviderName` and `ProviderKey` are constrained by `PermissionGrantConsts.MaxProviderNameLength` and `PermissionGrantConsts.MaxProviderKeyLength` (both 64) from `Domain.Shared`.
+
+<Note>
+There is intentionally **no `IsGranted` column**. A grant simply existing means *granted*. Revoking a permission deletes the row — see `PermissionManagementProvider.RevokeAsync` below.
+</Note>
+
+## `IPermissionGrantRepository`
+
+```csharp
+public interface IPermissionGrantRepository : IBasicRepository<PermissionGrant, Guid>
+{
+    Task<PermissionGrant> FindAsync(string name, string providerName, string providerKey,
+                                    CancellationToken cancellationToken = default);
+
+    Task<List<PermissionGrant>> GetListAsync(string providerName, string providerKey,
+                                             CancellationToken cancellationToken = default);
+
+    Task<List<PermissionGrant>> GetListAsync(string[] names, string providerName, string providerKey,
+                                             CancellationToken cancellationToken = default);
+}
+```
+
+The two `GetListAsync` overloads are tuned to the two access patterns that matter at runtime:
+
+1. **`GetListAsync(providerName, providerKey)`** — used by `PermissionStore.SetCacheItemsAsync` on a cache miss to load *all* of a subject's grants in one shot, so it can prime the cache for every defined permission.
+2. **`GetListAsync(names, providerName, providerKey)`** — used by `PermissionManagementProvider.CheckAsync` and by `PermissionStore`'s multi-name path when *some* keys are already cached.
+
+Implementations: `EfCorePermissionGrantRepository` in `Volo.Abp.PermissionManagement.EntityFrameworkCore`, `MongoPermissionGrantRepository` in `Volo.Abp.PermissionManagement.MongoDB` — see [the EF Core & MongoDB page](/modules/permission-management/efcore-mongodb).
+
+## `PermissionGrantCacheItem` — the cached value
+
+The store keeps one item per `(providerName, providerKey, name)`, not per row in the table. Cache keys are formatted by `PermissionGrantCacheItem`:
+
+```csharp
+[Serializable]
+public class PermissionGrantCacheItem
+{
+    private const string CacheKeyFormat = "pn:{0},pk:{1},n:{2}";
+
+    public bool IsGranted { get; set; }
+
+    public PermissionGrantCacheItem(bool isGranted) { IsGranted = isGranted; }
+
+    public static string CalculateCacheKey(string name, string providerName, string providerKey)
+        => string.Format(CacheKeyFormat, providerName, providerKey, name);
+
+    public static string GetPermissionNameFormCacheKeyOrNull(string cacheKey)
+    {
+        var result = FormattedStringValueExtracter.Extract(cacheKey, CacheKeyFormat, true);
+        return result.IsMatch ? result.Matches.Last().Value : null;
+    }
+}
+```
+
+The format chooses provider name first so that all entries for one subject collide on the same Redis key prefix, which makes bulk reads via `Cache.GetManyAsync` cheap.
+
+### `PermissionGrantCacheItemInvalidator`
+
+Invalidation is event-driven, not TTL-driven. `PermissionGrantCacheItemInvalidator` (in [`PermissionGrantCacheItemInvalidator.cs`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionGrantCacheItemInvalidator.cs)) is a `ILocalEventHandler<EntityChangedEventData<PermissionGrant>>` that runs on every insert/update/delete of a grant:
+
+```csharp
+public virtual async Task HandleEventAsync(EntityChangedEventData<PermissionGrant> eventData)
+{
+    var cacheKey = CalculateCacheKey(eventData.Entity.Name,
+                                     eventData.Entity.ProviderName,
+                                     eventData.Entity.ProviderKey);
+    using (CurrentTenant.Change(eventData.Entity.TenantId))
+    {
+        await Cache.RemoveAsync(cacheKey, considerUow: true);
+    }
+}
+```
+
+`considerUow: true` means the eviction is deferred until the surrounding unit of work commits — readers never see a stale `IsGranted=false` after a successful write.
+
+## `PermissionStore` — the `IPermissionStore` implementation
+
+`PermissionStore` ([`PermissionStore.cs`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionStore.cs)) is the read side. The authorization pipeline (`AbpPermissionChecker`) resolves `IPermissionStore` from DI and calls one of two methods:
+
+```csharp
+public class PermissionStore : IPermissionStore, ITransientDependency
+{
+    protected IPermissionGrantRepository PermissionGrantRepository { get; }
+    protected IPermissionDefinitionManager PermissionDefinitionManager { get; }
+    protected IDistributedCache<PermissionGrantCacheItem> Cache { get; }
+
+    public virtual async Task<bool> IsGrantedAsync(string name, string providerName, string providerKey)
+    {
+        return (await GetCacheItemAsync(name, providerName, providerKey)).IsGranted;
+    }
+
+    public virtual async Task<MultiplePermissionGrantResult> IsGrantedAsync(
+        string[] names, string providerName, string providerKey) { /* … */ }
+}
+```
+
+### Single-permission lookup
+
+`GetCacheItemAsync` is the hot path:
+
+```csharp
+protected virtual async Task<PermissionGrantCacheItem> GetCacheItemAsync(
+    string name, string providerName, string providerKey)
+{
+    var cacheKey = CalculateCacheKey(name, providerName, providerKey);
+
+    var cacheItem = await Cache.GetAsync(cacheKey);
+    if (cacheItem != null) { return cacheItem; }
+
+    cacheItem = new PermissionGrantCacheItem(false);
+    await SetCacheItemsAsync(providerName, providerKey, name, cacheItem);
+    return cacheItem;
+}
+```
+
+On a miss, `SetCacheItemsAsync` does the *expensive* work — but only once per `(providerName, providerKey)`:
+
+```csharp
+protected virtual async Task SetCacheItemsAsync(
+    string providerName, string providerKey, string currentName,
+    PermissionGrantCacheItem currentCacheItem)
+{
+    using (PermissionGrantRepository.DisableTracking())
+    {
+        var permissions = await PermissionDefinitionManager.GetPermissionsAsync();
+
+        var grantedPermissionsHashSet = new HashSet<string>(
+            (await PermissionGrantRepository.GetListAsync(providerName, providerKey))
+                .Select(p => p.Name)
+        );
+
+        var cacheItems = new List<KeyValuePair<string, PermissionGrantCacheItem>>();
+        foreach (var permission in permissions)
+        {
+            var isGranted = grantedPermissionsHashSet.Contains(permission.Name);
+            cacheItems.Add(new KeyValuePair<string, PermissionGrantCacheItem>(
+                CalculateCacheKey(permission.Name, providerName, providerKey),
+                new PermissionGrantCacheItem(isGranted)));
+
+            if (permission.Name == currentName) { currentCacheItem.IsGranted = isGranted; }
+        }
+
+        await Cache.SetManyAsync(cacheItems);
+    }
+}
+```
+
+A cache miss on *any* permission for a subject primes the cache for **every** defined permission. Subsequent checks for the same subject are pure cache hits.
+
+### Multi-permission lookup
+
+The `IsGrantedAsync(string[] names, …)` overload uses `Cache.GetManyAsync` and falls through to `SetCacheItemsAsync(providerName, providerKey, notCacheKeys)` for the subset that missed, reconstructing the requested order before returning:
+
+```csharp
+public virtual async Task<MultiplePermissionGrantResult> IsGrantedAsync(
+    string[] names, string providerName, string providerKey)
+{
+    Check.NotNullOrEmpty(names, nameof(names));
+
+    var result = new MultiplePermissionGrantResult();
+    if (names.Length == 1) { /* fast path */ return result; }
+
+    var cacheItems = await GetCacheItemsAsync(names, providerName, providerKey);
+    foreach (var item in cacheItems)
+    {
+        result.Result.Add(GetPermissionNameFormCacheKeyOrNull(item.Key),
+            item.Value != null && item.Value.IsGranted
+                ? PermissionGrantResult.Granted
+                : PermissionGrantResult.Undefined);
+    }
+    return result;
+}
+```
+
+<Warning>
+`PermissionStore` returns `false` for any **undefined** permission name — `SetCacheItemsAsync` only iterates `IPermissionDefinitionManager.GetPermissionsAsync()`, so a name that is not in the definition catalog never gets a cache entry and always falls back to the `new PermissionGrantCacheItem(false)` default. If your code returns `false` from `IsGrantedAsync`, double-check the permission is registered in a `PermissionDefinitionProvider`.
+</Warning>
+
+## `IPermissionManagementProvider` and `PermissionManagementProvider`
+
+Subject-specific behavior is abstracted into providers:
+
+```csharp
+public interface IPermissionManagementProvider : ISingletonDependency
+{
+    string Name { get; }
+
+    Task<PermissionValueProviderGrantInfo> CheckAsync(string name, string providerName, string providerKey);
+    Task<MultiplePermissionValueProviderGrantInfo> CheckAsync(string[] names, string providerName, string providerKey);
+    Task SetAsync(string name, string providerKey, bool isGranted);
+}
+```
+
+The shared base, [`PermissionManagementProvider`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionManagementProvider.cs), implements `SetAsync` as insert-or-delete on `IPermissionGrantRepository`:
+
+```csharp
+public abstract class PermissionManagementProvider : IPermissionManagementProvider
+{
+    public abstract string Name { get; }
+
+    protected IPermissionGrantRepository PermissionGrantRepository { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public virtual Task SetAsync(string name, string providerKey, bool isGranted)
+        => isGranted ? GrantAsync(name, providerKey) : RevokeAsync(name, providerKey);
+
+    protected virtual async Task GrantAsync(string name, string providerKey)
+    {
+        var permissionGrant = await PermissionGrantRepository.FindAsync(name, Name, providerKey);
+        if (permissionGrant != null) { return; }
+
+        permissionGrant = new PermissionGrant(GuidGenerator.Create(), name, Name, providerKey, CurrentTenant.Id);
+        await PermissionGrantRepository.InsertAsync(permissionGrant, true);
+    }
+
+    protected virtual async Task RevokeAsync(string name, string providerKey)
+    {
+        var permissionGrant = await PermissionGrantRepository.FindAsync(name, Name, providerKey);
+        if (permissionGrant == null) { return; }
+
+        await PermissionGrantRepository.DeleteAsync(permissionGrant, true);
+    }
+}
+```
+
+The default `CheckAsync(names, …)` only returns `true` when `providerName == Name` — subclasses override to add cross-provider rules (most importantly: roles answering on behalf of users).
+
+### `UserPermissionManagementProvider`
+
+Located at [`modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/UserPermissionManagementProvider.cs`](https://github.com/abpframework/abp/blob/dev/modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/UserPermissionManagementProvider.cs). It is the simplest subclass — pure pass-through, just naming `Name` after `UserPermissionValueProvider.ProviderName` (`"U"`):
+
+```csharp
+public class UserPermissionManagementProvider : PermissionManagementProvider
+{
+    public override string Name => UserPermissionValueProvider.ProviderName;
+
+    public UserPermissionManagementProvider(
+        IPermissionGrantRepository permissionGrantRepository,
+        IGuidGenerator guidGenerator,
+        ICurrentTenant currentTenant)
+        : base(permissionGrantRepository, guidGenerator, currentTenant) { }
+}
+```
+
+`ProviderKey` for this provider is the `IdentityUser.Id` as a string.
+
+### `RolePermissionManagementProvider`
+
+The interesting one. Located at [`modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/RolePermissionManagementProvider.cs`](https://github.com/abpframework/abp/blob/dev/modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/RolePermissionManagementProvider.cs):
+
+```csharp
+public class RolePermissionManagementProvider : PermissionManagementProvider
+{
+    public override string Name => RolePermissionValueProvider.ProviderName;
+    protected IUserRoleFinder UserRoleFinder { get; }
+
+    public async override Task<MultiplePermissionValueProviderGrantInfo> CheckAsync(
+        string[] names, string providerName, string providerKey)
+    {
+        using (PermissionGrantRepository.DisableTracking())
+        {
+            var multiplePermissionValueProviderGrantInfo = new MultiplePermissionValueProviderGrantInfo(names);
+            var permissionGrants = new List<PermissionGrant>();
+
+            if (providerName == Name)
+            {
+                permissionGrants.AddRange(
+                    await PermissionGrantRepository.GetListAsync(names, providerName, providerKey));
+            }
+
+            if (providerName == UserPermissionValueProvider.ProviderName)
+            {
+                var userId = Guid.Parse(providerKey);
+                var roleNames = await UserRoleFinder.GetRoleNamesAsync(userId);
+
+                foreach (var roleName in roleNames)
+                {
+                    permissionGrants.AddRange(
+                        await PermissionGrantRepository.GetListAsync(names, Name, roleName));
+                }
+            }
+
+            permissionGrants = permissionGrants.Distinct().ToList();
+            // populate multiplePermissionValueProviderGrantInfo and return …
+        }
+    }
+}
+```
+
+When asked about a `User` subject, this provider expands the user to their effective role names via `IUserRoleFinder` (from the Identity module) and ORs in the grants of each role. `ProviderKey` for the role provider itself is the **role name**, not the role id.
+
+### `ApplicationPermissionManagementProvider` (OpenIddict clients)
+
+Located at [`modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict/Volo/Abp/PermissionManagement/OpenIddict/ApplicationPermissionManagementProvider.cs`](https://github.com/abpframework/abp/blob/dev/modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict/Volo/Abp/PermissionManagement/OpenIddict/ApplicationPermissionManagementProvider.cs). Client (= OpenIddict application) permissions are **host-scoped**: client grants do not belong to a tenant. The provider switches into the host before delegating:
+
+```csharp
+public class ApplicationPermissionManagementProvider : PermissionManagementProvider
+{
+    public override string Name => ClientPermissionValueProvider.ProviderName;
+
+    public override Task<PermissionValueProviderGrantInfo> CheckAsync(
+        string name, string providerName, string providerKey)
+    {
+        using (CurrentTenant.Change(null)) { return base.CheckAsync(name, providerName, providerKey); }
+    }
+
+    protected override Task GrantAsync(string name, string providerKey)
+    {
+        using (CurrentTenant.Change(null)) { return base.GrantAsync(name, providerKey); }
+    }
+
+    protected override Task RevokeAsync(string name, string providerKey)
+    {
+        using (CurrentTenant.Change(null)) { return base.RevokeAsync(name, providerKey); }
+    }
+
+    public override Task SetAsync(string name, string providerKey, bool isGranted)
+    {
+        using (CurrentTenant.Change(null)) { return base.SetAsync(name, providerKey, isGranted); }
+    }
+}
+```
+
+`ProviderKey` is the OpenIddict application's `ClientId`. The wrapping `CurrentTenant.Change(null)` makes sure the unique index `(TenantId, Name, ProviderName, ProviderKey)` is consistent across tenant contexts — a single client can be granted a permission only once globally.
+
+<Accordion title="How the providers are registered">
+Each satellite domain module wires its provider into `PermissionManagementOptions.ManagementProviders`:
+
+```csharp
+// AbpPermissionManagementDomainIdentityModule.ConfigureServices
+Configure<PermissionManagementOptions>(options =>
+{
+    options.ManagementProviders.Add<UserPermissionManagementProvider>();
+    options.ManagementProviders.Add<RolePermissionManagementProvider>();
+});
+
+// AbpPermissionManagementDomainOpenIddictModule.ConfigureServices
+Configure<PermissionManagementOptions>(options =>
+{
+    options.ManagementProviders.Add<ApplicationPermissionManagementProvider>();
+});
+```
+
+`PermissionManager` materializes the list lazily via `IServiceProvider.GetRequiredService(c) as IPermissionManagementProvider`, so the order of `DependsOn` declarations decides which provider answers first when `PermissionManager.SetAsync` matches by `provider.Name == providerName`.
+</Accordion>
+
+## `PermissionManager` — the write entry point
+
+`PermissionManager` ([`PermissionManager.cs`](https://github.com/abpframework/abp/blob/dev/modules/permission-management/src/Volo.Abp.PermissionManagement.Domain/Volo/Abp/PermissionManagement/PermissionManager.cs)) implements `IPermissionManager`:
+
+```csharp
+public interface IPermissionManager
+{
+    Task<PermissionWithGrantedProviders> GetAsync(string permissionName, string providerName, string providerKey);
+
+    Task<MultiplePermissionWithGrantedProviders> GetAsync(
+        string[] permissionNames, string provideName, string providerKey);
+
+    Task<List<PermissionWithGrantedProviders>> GetAllAsync(
+        [NotNull] string providerName, [NotNull] string providerKey);
+
+    Task SetAsync(string permissionName, string providerName, string providerKey, bool isGranted);
+
+    Task<PermissionGrant> UpdateProviderKeyAsync(PermissionGrant permissionGrant, string providerKey);
+
+    Task DeleteAsync(string providerName, string providerKey);
+}
+```
+
+`PermissionManager` is `ISingletonDependency`. It is the **only** type that should be used by application code to read the full provider breakdown for a permission, because — unlike `PermissionStore.IsGrantedAsync` — it returns a `PermissionWithGrantedProviders` describing *which* provider granted it:
+
+```csharp
+public class PermissionWithGrantedProviders
+{
+    public string Name { get; }
+    public bool IsGranted { get; set; }
+    public List<PermissionValueProviderInfo> Providers { get; set; }
+}
+```
+
+That information is what the admin UI uses to render check-boxes with a tooltip such as "Granted by role 'Admin'".
+
+### How `SetAsync` works
+
+```csharp
+public virtual async Task SetAsync(string permissionName, string providerName, string providerKey, bool isGranted)
+{
+    var permission = await PermissionDefinitionManager.GetOrNullAsync(permissionName);
+    if (permission == null) { return; }                                  // silently ignore undefined
+
+    if (!permission.IsEnabled || !await SimpleStateCheckerManager.IsEnabledAsync(permission))
+        throw new ApplicationException($"The permission named '{permission.Name}' is disabled!");
+
+    if (permission.Providers.Any() && !permission.Providers.Contains(providerName))
+        throw new ApplicationException($"… not compatible with the provider '{providerName}'");
+
+    if (!permission.MultiTenancySide.HasFlag(CurrentTenant.GetMultiTenancySide()))
+        throw new ApplicationException($"… not compatible with the current multitenancy side …");
+
+    var currentGrantInfo = await GetInternalAsync(permission, providerName, providerKey);
+    if (currentGrantInfo.IsGranted == isGranted) { return; }              // idempotent
+
+    var provider = ManagementProviders.FirstOrDefault(m => m.Name == providerName)
+                   ?? throw new AbpException("Unknown permission management provider: " + providerName);
+
+    await provider.SetAsync(permissionName, providerKey, isGranted);
+}
+```
+
+The check `permission.Providers.Any() && !permission.Providers.Contains(providerName)` is how a permission definition can opt out of being assignable to, say, clients — set `PermissionDefinition.Providers = new[] { "U", "R" }` and `ApplicationPermissionManagementProvider` will reject the attempt.
+
+### How `GetAllAsync` works
+
+`GetAllAsync` is what the admin modal calls to render the entire permission tree. It loops over `ManagementProviders` and merges results:
+
+```csharp
+foreach (var provider in ManagementProviders)
+{
+    var multiplePermissionValueProviderGrantInfo
+        = await provider.CheckAsync(permissionNames, providerName, providerKey);
+
+    foreach (var providerResultDict in multiplePermissionValueProviderGrantInfo.Result)
+    {
+        if (providerResultDict.Value.IsGranted)
+        {
+            var permissionWithGrantedProvider = multiplePermissionWithGrantedProviders.Result
+                .First(x => x.Name == providerResultDict.Key);
+            permissionWithGrantedProvider.IsGranted = true;
+            permissionWithGrantedProvider.Providers.Add(
+                new PermissionValueProviderInfo(provider.Name, providerResultDict.Value.ProviderKey));
+        }
+    }
+}
+```
+
+A permission ends up `IsGranted = true` if **any** provider says yes, and the `Providers` list records each contributor. That is why the Blazor / Razor Pages modal can show "User-granted" *and* "Role: Admin" badges side by side.
+
+### `UpdateProviderKeyAsync` and `DeleteAsync`
+
+`UpdateProviderKeyAsync` is used when an entity's key changes — typically when a role is renamed:
+
+```csharp
+public virtual async Task<PermissionGrant> UpdateProviderKeyAsync(PermissionGrant permissionGrant, string providerKey)
+{
+    using (CurrentTenant.Change(permissionGrant.TenantId))
+    {
+        await Cache.RemoveAsync(
+            PermissionGrantCacheItem.CalculateCacheKey(
+                permissionGrant.Name, permissionGrant.ProviderName, permissionGrant.ProviderKey));
+    }
+
+    permissionGrant.ProviderKey = providerKey;
+    return await PermissionGrantRepository.UpdateAsync(permissionGrant, true);
+}
+```
+
+`DeleteAsync(providerName, providerKey)` clears every grant for a subject — used when a user, role, or client is deleted. It does not touch the cache directly; the `EntityChangedEventData<PermissionGrant>` events emitted during the delete loop are caught by `PermissionGrantCacheItemInvalidator`.
+
+## `PermissionManagementOptions`
+
+```csharp
+public class PermissionManagementOptions
+{
+    public ITypeList<IPermissionManagementProvider> ManagementProviders { get; }
+
+    public Dictionary<string, string> ProviderPolicies { get; }
+
+    public bool SaveStaticPermissionsToDatabase { get; set; } = true;
+
+    public bool IsDynamicPermissionStoreEnabled { get; set; }
+}
+```
+
+- `ManagementProviders` — see the registration accordion above.
+- `ProviderPolicies` — map of `providerName → policy name` consulted by `PermissionAppService.CheckProviderPolicy`. The Identity / OpenIddict modules add their policies, e.g. `"R" → IdentityPermissions.Roles.ManagePermissions`, `"U" → IdentityPermissions.Users.ManagePermissions`.
+- `SaveStaticPermissionsToDatabase` — when `true`, `IStaticPermissionSaver.SaveAsync` runs on app start and copies `PermissionDefinition`s discovered by `PermissionDefinitionProvider`s into `AbpPermissions` + `AbpPermissionGroups` so other apps can see them via the dynamic store.
+- `IsDynamicPermissionStoreEnabled` — when `true`, `DynamicPermissionDefinitionStore` is consulted at runtime, with an in-memory cache (`DynamicPermissionDefinitionStoreInMemoryCache`) refreshed via the `DynamicPermissionDefinitionsChangedEto` distributed event.
+
+## Domain.Identity and Domain.OpenIddict modules
+
+The two satellite modules are very small — they exist purely to register their provider and policies.
+
+<Tabs>
+  <Tab title="Domain.Identity">
+    `modules/identity/src/Volo.Abp.PermissionManagement.Domain.Identity/Volo/Abp/PermissionManagement/Identity/AbpPermissionManagementDomainIdentityModule.cs`
+
+    Depends on `AbpPermissionManagementDomainModule` and `AbpIdentityDomainModule`. Adds `UserPermissionManagementProvider` and `RolePermissionManagementProvider` to `PermissionManagementOptions.ManagementProviders`. Maps `ProviderPolicies["U"]` and `ProviderPolicies["R"]` to the Identity manage-permissions policies. See the [Identity module overview](/modules/identity/overview).
+  </Tab>
+  <Tab title="Domain.OpenIddict">
+    `modules/openiddict/src/Volo.Abp.PermissionManagement.Domain.OpenIddict/Volo/Abp/PermissionManagement/OpenIddict/AbpPermissionManagementDomainOpenIddictModule.cs`
+
+    Depends on `AbpPermissionManagementDomainModule` and `AbpOpenIddictDomainModule`. Adds `ApplicationPermissionManagementProvider` and maps `ProviderPolicies["C"]`. See the [OpenIddict module overview](/modules/openiddict/overview).
+  </Tab>
+</Tabs>
+
+## Domain flow at a glance
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as Caller (App service / UI)
+    participant Mgr as PermissionManager
+    participant DefMgr as IPermissionDefinitionManager
+    participant Prov as IPermissionManagementProvider<br/>(User / Role / Client)
+    participant Repo as IPermissionGrantRepository
+    participant Cache as IDistributedCache&lt;PermissionGrantCacheItem&gt;
+    participant Invalidator as PermissionGrantCacheItemInvalidator
+
+    Caller->>Mgr: SetAsync("UserMgmt.Edit", "R", "Admin", true)
+    Mgr->>DefMgr: GetOrNullAsync("UserMgmt.Edit")
+    DefMgr-->>Mgr: PermissionDefinition (IsEnabled, Providers, MultiTenancySide)
+    Mgr->>Mgr: validate (state checker, providers, MT side)
+    Mgr->>Prov: GrantAsync("UserMgmt.Edit", "Admin")
+    Prov->>Repo: FindAsync(name, "R", "Admin")
+    Repo-->>Prov: null
+    Prov->>Repo: InsertAsync(new PermissionGrant(...))
+    Repo-->>Invalidator: EntityChangedEventData<PermissionGrant>
+    Invalidator->>Cache: RemoveAsync("pn:R,pk:Admin,n:UserMgmt.Edit", considerUow:true)
+```
+
+The same arrow chain runs in reverse on a *revoke*: the only difference is `RevokeAsync` deletes the row instead of inserting one.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Application layer" icon="layer-group" href="/modules/permission-management/application">
+    `PermissionAppService.GetAsync` / `UpdateAsync` and how they feed `PermissionManager`.
+  </Card>
+  <Card title="EF Core / Mongo repositories" icon="database" href="/modules/permission-management/efcore-mongodb">
+    `EfCorePermissionGrantRepository`, `MongoPermissionGrantRepository`, and the `AbpPermissionGrants` mapping.
+  </Card>
+  <Card title="Permission system" icon="key" href="/security/permissions">
+    `PermissionDefinition`, `IPermissionDefinitionProvider`, and how `IPermissionDefinitionManager` builds the catalog.
+  </Card>
+  <Card title="Authorization" icon="shield-halved" href="/security/authorization">
+    The `IPermissionChecker` consumer that calls `PermissionStore.IsGrantedAsync` for every `[Authorize("X")]` evaluation.
+  </Card>
+  <Card title="Identity module" icon="user" href="/modules/identity/overview">
+    `IUserRoleFinder`, `IdentityUser`, `IdentityRole` — the entities behind the `"U"` and `"R"` providers.
+  </Card>
+  <Card title="OpenIddict module" icon="lock" href="/modules/openiddict/overview">
+    `OpenIddictApplication` — the entity behind the `"C"` provider.
+  </Card>
+</CardGroup>

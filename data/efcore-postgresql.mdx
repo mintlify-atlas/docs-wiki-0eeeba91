@@ -1,0 +1,314 @@
+---
+title: "EF Core PostgreSQL Adapter: UseNpgsql and Probe Logic"
+sidebarTitle: "EF Core: PostgreSQL"
+description: "Volo.Abp.EntityFrameworkCore.PostgreSql adapter: UseNpgsql extension, sequential-as-string GUID strategy, and the NpgsqlConnectionStringChecker."
+---
+
+`Volo.Abp.EntityFrameworkCore.PostgreSql` is ABP's PostgreSQL adapter. Like the SQL Server adapter it is intentionally minimal — one module, one options extension, one model‑builder helper, one connection‑string checker. The heavy lifting (DbContext, repository, UoW glue) lives in [`Volo.Abp.EntityFrameworkCore`](/data/entityframeworkcore). Source: `framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/`.
+
+## Package contents
+
+```
+framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/
+├── Microsoft/EntityFrameworkCore/
+│   └── AbpPostgreSqlModelBuilderExtensions.cs
+└── Volo/Abp/EntityFrameworkCore/
+    ├── AbpDbContextConfigurationContextPostgreSqlExtensions.cs
+    ├── AbpDbContextOptionsPostgreSqlExtensions.cs
+    ├── ConnectionStrings/NpgsqlConnectionStringChecker.cs
+    └── PostgreSql/AbpEntityFrameworkCorePostgreSqlModule.cs
+```
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/Volo/Abp/EntityFrameworkCore/PostgreSql/AbpEntityFrameworkCorePostgreSqlModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCorePostgreSqlModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+Two settings:
+
+- **`SequentialGuidType.SequentialAsString`** — PostgreSQL stores `uuid` as a 16‑byte value but its sort order is lexical when used as a clustering proxy via `bytea`/`text`. `SequentialAsString` keeps prefix bytes monotonically increasing in their *string* representation, which matches PostgreSQL's btree ordering. Compare with SQL Server's `SequentialAtEnd` (see [`/data/efcore-sqlserver`](/data/efcore-sqlserver)).
+- **`UseDbFunction = true`** — ABP emits soft‑delete + multi‑tenant filters as DB functions for better query‑plan caching.
+
+## UseNpgsql extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsPostgreSqlExtensions.cs
+public static class AbpDbContextOptionsPostgreSqlExtensions
+{
+    [Obsolete("Use 'UseNpgsql(...)' method instead. This will be removed in future versions.")]
+    public static void UsePostgreSql(
+        [NotNull] this AbpDbContextOptions options,
+        Action<NpgsqlDbContextOptionsBuilder>? postgreSqlOptionsAction = null)
+    {
+        options.Configure(context => context.UseNpgsql(postgreSqlOptionsAction));
+    }
+
+    public static void UseNpgsql(
+        [NotNull] this AbpDbContextOptions options,
+        Action<NpgsqlDbContextOptionsBuilder>? postgreSqlOptionsAction = null)
+    {
+        options.Configure(context => context.UseNpgsql(postgreSqlOptionsAction));
+    }
+
+    public static void UseNpgsql<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<NpgsqlDbContextOptionsBuilder>? postgreSqlOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context => context.UseNpgsql(postgreSqlOptionsAction));
+    }
+}
+```
+
+<Note>
+The historical `UsePostgreSql(...)` overloads are obsolete; prefer `UseNpgsql(...)` everywhere. The string `Npgsql.EntityFrameworkCore.PostgreSQL` is also the `Database.ProviderName` value that `AbpDbContext.GetDatabaseProviderOrNull` matches to return `EfCoreDatabaseProvider.PostgreSql`.
+</Note>
+
+## The connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/Volo/Abp/EntityFrameworkCore/ConnectionStrings/NpgsqlConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class NpgsqlConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new NpgsqlConnectionStringBuilder(connectionString) { Timeout = 1 };
+
+            var oldDatabaseName = connString.Database;
+            connString.Database = "postgres";
+
+            await using var conn = new NpgsqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName!);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Same pattern as SQL Server's checker: connect to the always‑present admin DB (`postgres`) with a 1‑second timeout, then switch to the requested DB. The two booleans on `AbpConnectionStringCheckResult` distinguish "server unreachable" from "server up but DB missing", which the SaaS / DbMigrator host uses to decide between create / migrate.
+
+## Module wiring
+
+```xml
+<PackageReference Include="Volo.Abp.EntityFrameworkCore.PostgreSql" Version="..." />
+```
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCorePostgreSqlModule)
+)]
+public class MyAppEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseNpgsql(b => b.MigrationsAssembly("MyApp.EntityFrameworkCore"));
+        });
+
+        context.Services.AddAbpDbContext<MyAppDbContext>(opts =>
+        {
+            opts.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+}
+```
+
+`appsettings.json`:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Host=localhost;Port=5432;Database=MyApp;Username=postgres;Password=postgres"
+  }
+}
+```
+
+## Provider-specific tips
+
+<AccordionGroup>
+  <Accordion title="Case sensitivity & quoting">
+    PostgreSQL folds identifiers to lower case unless quoted. ABP's table names go through `[Table("AbpUsers")]` (mixed‑case) — Npgsql quotes them. If you query the DB by hand, use `"AbpUsers"` not `AbpUsers`.
+  </Accordion>
+  <Accordion title="jsonb for ExtraProperties">
+    `ConfigureExtraProperties()` configures `ExtraProperties` as `text` by default. If you want `jsonb`, override the value converter:
+    ```csharp
+    b.Property(x => x.ExtraProperties).HasColumnType("jsonb");
+    ```
+  </Accordion>
+  <Accordion title="Database functions">
+    `UseDbFunction = true` requires Npgsql 7+ for the `EF.Functions` mappings ABP emits. If you compile against an older Npgsql, set `Configure<AbpEfCoreGlobalFilterOptions>(o => o.UseDbFunction = false)`.
+  </Accordion>
+  <Accordion title="Schema separation">
+    `b.ToTable("AbpUsers", "identity")` works as expected; ABP's modeling helpers do not pin a schema.
+  </Accordion>
+</AccordionGroup>
+
+## End-to-end: from `UseNpgsql` to a row
+
+A complete Books module on PostgreSQL:
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCorePostgreSqlModule),
+    typeof(BooksDomainModule)
+)]
+public class BooksEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseNpgsql<BooksDbContext>(b =>
+            {
+                b.CommandTimeout(30);
+                b.MigrationsAssembly("MyCompany.Books.EntityFrameworkCore");
+            });
+        });
+
+        context.Services.AddAbpDbContext<BooksDbContext>(opts =>
+        {
+            opts.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+}
+```
+
+```csharp
+[ConnectionStringName(BooksDbProperties.ConnectionStringName)]
+public class BooksDbContext : AbpDbContext<BooksDbContext>
+{
+    public DbSet<Book> Books { get; set; }
+
+    public BooksDbContext(DbContextOptions<BooksDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.Entity<Book>(b =>
+        {
+            b.ToTable(BooksDbProperties.DbTablePrefix + "Books");
+            b.ConfigureByConvention();
+            b.Property(x => x.Name).IsRequired().HasMaxLength(128);
+            // Optional: store extra properties as jsonb
+            b.Property(x => x.ExtraProperties).HasColumnType("jsonb");
+        });
+    }
+}
+```
+
+## Running migrations
+
+`dotnet ef migrations add Books_Initial -p MyCompany.Books.EntityFrameworkCore` works exactly as on SQL Server — Npgsql generates Postgres‑flavoured DDL (`CREATE TABLE "BooksBooks" ...`). The ABP DbMigrator console (`MyCompany.MyApp.DbMigrator`) calls `Database.MigrateAsync()` once per module DbContext and then `IDataSeeder.SeedAsync()` per tenant.
+
+<Tip>
+Set `MigrationsHistoryTable("__EFMigrationsHistory", "abp")` if you want all framework migration history rows in their own schema rather than `public`. Override per DbContext:
+```csharp
+options.UseNpgsql<BooksDbContext>(b => b.MigrationsHistoryTable("__EFMigrationsHistory", "books"));
+```
+</Tip>
+
+## Production tips
+
+<AccordionGroup>
+  <Accordion title="Use connection pooling carefully">
+    Npgsql ships its own connection pool tuned for ASP.NET Core. Don't disable it (`Pooling=false`) in production — `EfCoreRepository` requests connections through EF Core, which expects pooling.
+  </Accordion>
+  <Accordion title="SequentialAsString and bytea storage">
+    `SequentialGuidType.SequentialAsString` is right for ABP's default Guid mapping (`uuid` columns). If you store Guids as `bytea` via custom converters, switch to `SequentialAsBinary` for index‑friendly clustering.
+  </Accordion>
+  <Accordion title="Timezone handling">
+    PostgreSQL distinguishes `timestamptz` from `timestamp`. ABP's `IClock` returns UTC. Map `DateTime` columns to `timestamp with time zone` (the Npgsql default) — `b.Property(x => x.CreationTime).HasColumnType("timestamptz")` — to preserve UTC kind through round‑trips.
+  </Accordion>
+  <Accordion title="DB function filters require Npgsql 7+">
+    `AbpEfCoreGlobalFilterOptions.UseDbFunction = true` relies on the `EF.Functions` translation introduced in Npgsql 7. Older versions silently fall back to expression‑inlined filters, which inflates the query plan cache.
+  </Accordion>
+</AccordionGroup>
+
+## File index
+
+| File                                                                                    | Role                                          |
+| --------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `PostgreSql/AbpEntityFrameworkCorePostgreSqlModule.cs`                                  | Module: sets SequentialAsString, UseDbFunction.|
+| `AbpDbContextOptionsPostgreSqlExtensions.cs`                                            | `UseNpgsql`/`UsePostgreSql` (obsolete).        |
+| `AbpDbContextConfigurationContextPostgreSqlExtensions.cs`                               | Configuration-context extensions.              |
+| `ConnectionStrings/NpgsqlConnectionStringChecker.cs`                                    | Live probe via `postgres` DB.                  |
+| `Microsoft/EntityFrameworkCore/AbpPostgreSqlModelBuilderExtensions.cs`                  | Model-builder convenience extensions.          |
+
+Same five‑file shape as every other EF Core adapter — see [`/data/efcore-sqlserver`](/data/efcore-sqlserver) for comparison.
+
+## What this adapter does **not** do
+
+<Warning>
+This package is **only** a provider adapter. It contains no repository, no DbContext, no model. The base classes live in `Volo.Abp.EntityFrameworkCore`. Behavior changes (auditing, soft delete, multi‑tenant filter) belong on [`/data/entityframeworkcore`](/data/entityframeworkcore).
+</Warning>
+
+## When PostgreSQL is the right pick
+
+<AccordionGroup>
+  <Accordion title="Open-source by default">
+    No license cost, runs everywhere from Raspberry Pi to managed cloud (Azure Database for PostgreSQL, RDS, Cloud SQL).
+  </Accordion>
+  <Accordion title="Excellent jsonb support">
+    Pair with `b.Property(x => x.ExtraProperties).HasColumnType("jsonb")` and you get indexable JSON for ABP's extra properties dictionary.
+  </Accordion>
+  <Accordion title="Geospatial and full-text">
+    `Npgsql.EntityFrameworkCore.PostgreSQL.NetTopologySuite` adds PostGIS; `Npgsql` has built-in full-text query operators.
+  </Accordion>
+  <Accordion title="Generous DDL semantics">
+    Online migrations: `ADD COLUMN ... NULL` is metadata-only; `ALTER TABLE ... USING` lets you cast types in place. EF Core's PostgreSQL migrations exploit both.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    The base implementation everything sits on.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    How `NpgsqlConnectionStringChecker` plugs into the resolver chain.
+  </Card>
+  <Card title="SQL Server adapter" icon="server" href="/data/efcore-sqlserver">
+    Same shape, sequential‑at‑end GUIDs.
+  </Card>
+  <Card title="MySQL adapter" icon="dolphin" href="/data/efcore-mysql">
+    Two MySQL provider variants.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The domain‑facing repository abstraction.
+  </Card>
+  <Card title="UoW transaction flow" icon="diagram-project" href="/flows/unit-of-work-lifecycle">
+    The commit narrative.
+  </Card>
+</CardGroup>

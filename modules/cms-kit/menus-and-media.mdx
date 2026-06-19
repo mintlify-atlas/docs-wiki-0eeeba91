@@ -1,0 +1,374 @@
+---
+title: "Menus & Media"
+description: "Two CMS Kit capabilities: hierarchical MenuItem tree with MenuItemManager (with Page → URL synchronization), and MediaDescriptor / MediaContainer for file uploads backed by ABP's Blob Storing module."
+---
+
+Menus and media are independent capabilities but pair often: a menu item points to a page or external URL, and a page or blog post embeds media (cover image, inline images). Both live next to each other under [`modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/`](https://github.com/abpframework/abp/tree/dev/modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit).
+
+## Menus
+
+### Folder contents
+
+```
+Menus/
+├── MenuItem.cs                          # aggregate root: ParentId, DisplayName, Url, Order
+├── MenuItemManager.cs                   # tree reorder, page-url binding
+├── IMenuItemRepository.cs
+└── PageChangedHandler.cs                # local event handler: keeps URLs in sync
+```
+
+### `MenuItem` aggregate
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/MenuItem.cs
+public class MenuItem : AuditedAggregateRoot<Guid>, IMultiTenant
+{
+    /// <summary>
+    /// Presents another <see cref="MenuItem"/> Id.
+    /// If it's <see langword="null"/>, then it's a root menu item.
+    /// </summary>
+    public virtual Guid? ParentId { get; set; }
+
+    [NotNull] public virtual string DisplayName { get; protected set; }
+    public virtual bool IsActive { get; set; }
+    [NotNull] public virtual string Url { get; protected set; }
+    public virtual string Icon { get; set; }
+    public virtual int Order { get; set; }
+    public virtual string Target { get; set; }
+    public virtual string ElementId { get; set; }
+    public virtual string CssClass { get; set; }
+    public virtual Guid? PageId { get; protected set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string RequiredPermissionName { get; set; }
+
+    public MenuItem(
+        Guid id,
+        [NotNull] string displayName,
+        [NotNull] string url,
+        bool isActive = true,
+        [CanBeNull] Guid? parentId = null,
+        [CanBeNull] string icon = null,
+        int order = 0,
+        [CanBeNull] string target = null,
+        [CanBeNull] string elementId = null,
+        [CanBeNull] string cssClass = null,
+        [CanBeNull] Guid? tenantId = null,
+        [CanBeNull] string requiredPermissionName = null) : base(id)
+    {
+        SetDisplayName(displayName);
+        IsActive = isActive;
+        ParentId = parentId;
+        SetUrl(url);
+        Icon = icon;
+        Order = order;
+        Target = target;
+        ElementId = elementId;
+        CssClass = cssClass;
+        TenantId = tenantId;
+        RequiredPermissionName = requiredPermissionName;
+    }
+
+    public void SetDisplayName([NotNull] string displayName)
+        => DisplayName = Check.NotNullOrEmpty(displayName, nameof(displayName), MenuItemConsts.MaxDisplayNameLength);
+
+    public void SetUrl([NotNull] string url)
+        => Url = Check.NotNullOrEmpty(url, nameof(url), MenuItemConsts.MaxUrlLength);
+
+    internal void SetPageId(Guid? pageId)
+    {
+        PageId = pageId;
+    }
+}
+```
+
+### Field semantics
+
+| Field | Notes |
+| --- | --- |
+| `ParentId` | Null → root menu item; otherwise points to another `MenuItem.Id`. |
+| `DisplayName` | Localizable label shown to users. |
+| `Url` | The href. Either a literal external URL (`https://...`) or a slug for an internal page (`/about`). |
+| `PageId` | Optional foreign key to `Page.Id`. When set, `Url` is auto-synced from the page's slug. |
+| `Order` | Sibling ordering within the same `ParentId`. |
+| `Icon`, `Target`, `ElementId`, `CssClass` | UI hints — rendered as-is into the `<a>` tag. |
+| `RequiredPermissionName` | If non-null, the menu item is only shown to users with that permission. |
+| `IsActive` | Soft-hide without deleting. |
+
+`SetPageId` is `internal` — it can only be set by `MenuItemManager.SetPageUrl`.
+
+### `MenuItemManager`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/MenuItemManager.cs
+public class MenuItemManager : CmsKitDomainServiceBase
+{
+    protected IMenuItemRepository MenuItemRepository { get; }
+
+    public MenuItemManager(IMenuItemRepository menuRepository)
+    {
+        MenuItemRepository = menuRepository;
+    }
+
+    public virtual void SetPageUrl(MenuItem menuItem, Page page)
+    {
+        menuItem.SetPageId(page.Id);
+        menuItem.SetUrl(page.Slug.EnsureStartsWith('/'));
+    }
+
+    public virtual void SetPageUrl(MenuItem menuItem, string url)
+    {
+        menuItem.SetPageId(null);
+        menuItem.SetUrl(url);
+    }
+
+    [UnitOfWork]
+    public virtual async Task MoveAsync(Guid menuItemId, Guid? newParentMenuItemId, int position = 0)
+    {
+        var menuItems = await MenuItemRepository.GetListAsync();
+
+        var movedMenuItem = menuItems.FirstOrDefault(x => x.Id == menuItemId)
+                       ?? throw new EntityNotFoundException(typeof(MenuItem), menuItemId);
+
+        if (newParentMenuItemId.HasValue && !menuItems.Any(a => a.Id == newParentMenuItemId.Value))
+        {
+            throw new EntityNotFoundException(typeof(MenuItem), newParentMenuItemId);
+        }
+
+        movedMenuItem.ParentId = newParentMenuItemId;
+        movedMenuItem.Order = position;
+
+        OrganizeTreeOrderForMenuItem(menuItems, movedMenuItem);
+
+        await MenuItemRepository.UpdateManyAsync(menuItems);
+    }
+
+    public virtual void OrganizeTreeOrderForMenuItem(List<MenuItem> items, MenuItem menuItem)
+    {
+        var sameTree = items.Where(x => x.ParentId == menuItem.ParentId).OrderBy(x => x.Order).ToList();
+        sameTree.Remove(menuItem); // Remove if exists to prevent misordering with same order number
+        sameTree.Insert(menuItem.Order, menuItem);
+
+        for (int i = 0; i < sameTree.Count; i++)
+        {
+            sameTree[i].Order = i;
+        }
+    }
+}
+```
+
+Three operations:
+
+**1. `SetPageUrl(MenuItem, Page)`** — bind the item to a CMS page. The URL becomes the page slug prefixed with `/`. `PageId` is stored so the sync handler can find this item later.
+
+**2. `SetPageUrl(MenuItem, string)`** — un-bind from any page and set an explicit URL.
+
+**3. `MoveAsync`** — atomic tree reorder. The whole list is loaded, the moved item's `ParentId` and `Order` are updated, siblings are re-numbered so `Order` is contiguous (0, 1, 2, …), and everything is saved through `UpdateManyAsync`. `[UnitOfWork]` ensures all updates land in a single transaction.
+
+### Page → URL synchronization
+
+`PageChangedHandler` is a local event handler that listens for `EntityUpdatedEventData<Page>` (raised automatically by ABP when a `Page` is saved) and updates any `MenuItem.Url` that was bound to that page.
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/Menus/PageChangedHandler.cs
+public class PageChangedHandler :
+    ILocalEventHandler<EntityUpdatedEventData<Page>>,
+    ITransientDependency
+{
+    public async Task HandleEventAsync(EntityUpdatedEventData<Page> eventData)
+    {
+        if (!GlobalFeatureManager.Instance.IsEnabled<MenuFeature>()) return;
+        if (!await FeatureChecker.IsEnabledAsync(CmsKitFeatures.MenuEnable)) return;
+
+        var allMenuItems = await MenuRepository.GetListAsync();
+        var affectedMenuItems = allMenuItems
+            .Where(x => x.PageId == eventData.Entity.Id)
+            .ToArray();
+
+        if (affectedMenuItems.IsNullOrEmpty()) return;
+
+        foreach (var menuItem in affectedMenuItems)
+        {
+            MenuManager.SetPageUrl(menuItem, eventData.Entity);
+        }
+
+        await MenuRepository.UpdateManyAsync(affectedMenuItems);
+    }
+}
+```
+
+So if an admin renames a page's slug from `/about` to `/about-us`, every menu item that links to that page is silently updated. The handler short-circuits if the Menu feature is disabled either globally or for the current tenant.
+
+### Repository
+
+```csharp
+// IMenuItemRepository
+public interface IMenuItemRepository : IBasicRepository<MenuItem, Guid>
+{
+    Task<List<MenuItem>> GetOrderedListAsync(bool includeDetails = false, CancellationToken = default);
+    Task<int> GetHighestMenuOrderAsync(Guid? parentId = null, CancellationToken = default);
+}
+```
+
+`GetOrderedListAsync` returns items already sorted by `ParentId` then `Order` — the public navbar component just iterates the list. `GetHighestMenuOrderAsync` is used by the admin "add item at end" path.
+
+---
+
+## Media Descriptors
+
+### Folder contents
+
+```
+MediaDescriptors/
+├── MediaDescriptor.cs                          # aggregate: name, mime, size, entity type
+├── MediaDescriptorManager.cs                   # creation + definition check
+├── MediaContainer.cs                           # IBlobContainer<MediaContainer> marker
+├── MediaDescriptorDefinition.cs                # PolicySpecifiedDefinition subclass
+├── MediaDescriptorChecks.cs                    # filename validation
+├── IMediaDescriptorRepository.cs
+├── IMediaDescriptorDefinitionStore.cs
+├── DefaultMediaDescriptorDefinitionStore.cs
+├── CmsKitMediaOptions.cs
+├── EntityCantHaveMediaException.cs
+└── InvalidMediaDescriptorNameException.cs
+```
+
+### Separation of metadata and bytes
+
+CMS Kit only stores **metadata** about uploaded files. The bytes themselves are streamed to a separate `IBlobContainer<MediaContainer>` — whose underlying provider (filesystem, Azure Blob, S3, database) is configured by the host via the [Blob Storing Database](/modules/blob-storing-database/overview) module (or any other `BlobStoringProvider`).
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/MediaDescriptors/MediaContainer.cs
+[BlobContainerName("cms-kit-media")]
+public class MediaContainer
+{
+}
+```
+
+The container name `cms-kit-media` is what hosts target when configuring storage:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.Configure<MediaContainer>(c =>
+    {
+        c.UseDatabase(); // from Blob Storing Database module
+    });
+});
+```
+
+### `MediaDescriptor` aggregate
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/MediaDescriptors/MediaDescriptor.cs
+public class MediaDescriptor : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string EntityType { get; protected set; }
+    public virtual string Name { get; protected set; }
+    public virtual string MimeType { get; protected set; }
+    public virtual long Size { get; protected set; }
+
+    internal MediaDescriptor(Guid id, string entityType, string name, string mimeType, long size, Guid? tenantId = null) : base(id)
+    {
+        TenantId = tenantId;
+        EntityType = Check.NotNullOrEmpty(entityType, nameof(entityType), MediaDescriptorConsts.MaxEntityTypeLength);
+        MimeType = Check.NotNullOrWhiteSpace(mimeType, nameof(name), MediaDescriptorConsts.MaxMimeTypeLength);
+        Size = size;
+        SetName(name);
+    }
+
+    public void SetName(string name)
+    {
+        if (!MediaDescriptorChecks.IsValidMediaFileName(name))
+        {
+            throw new InvalidMediaDescriptorNameException(name);
+        }
+        Name = name;
+    }
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `EntityType` | What kind of thing this media belongs to: `"BlogPost"`, `"Page"`, `"Product"`. Must be registered. |
+| `Name` | Original filename (sanitized through `MediaDescriptorChecks.IsValidMediaFileName`). The blob key in `IBlobContainer<MediaContainer>` is `Id.ToString()` — *not* `Name` — so two files with the same name don't collide. |
+| `MimeType` | Used to set `Content-Type` when streaming the file back out. |
+| `Size` | Bytes. Stored for quick "this is a 3 MB image" rendering without reading the blob. |
+
+### `MediaDescriptorManager`
+
+```csharp
+// modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/MediaDescriptors/MediaDescriptorManager.cs
+public class MediaDescriptorManager : DomainService
+{
+    protected IMediaDescriptorDefinitionStore MediaDescriptorDefinitionStore { get; }
+
+    public MediaDescriptorManager(IMediaDescriptorDefinitionStore mediaDescriptorDefinitionStore)
+    {
+        MediaDescriptorDefinitionStore = mediaDescriptorDefinitionStore;
+    }
+
+    public virtual async Task<MediaDescriptor> CreateAsync(string entityType, string name, string mimeType, long size)
+    {
+        if (!await MediaDescriptorDefinitionStore.IsDefinedAsync(entityType))
+        {
+            throw new EntityCantHaveMediaException(entityType);
+        }
+
+        return new MediaDescriptor(
+            GuidGenerator.Create(),
+            entityType, name, mimeType, size,
+            CurrentTenant.Id);
+    }
+}
+```
+
+The manager only constructs the metadata row. The app service handles the blob upload around it:
+
+```csharp
+// pseudo: MediaDescriptorAdminAppService.CreateAsync
+var descriptor = await Manager.CreateAsync(entityType, fileName, mimeType, length);
+await DescriptorRepository.InsertAsync(descriptor);
+await BlobContainer.SaveAsync(descriptor.Id.ToString(), stream);
+return ObjectMapper.Map<MediaDescriptor, MediaDescriptorDto>(descriptor);
+```
+
+### Registering types that can own media
+
+```csharp
+Configure<CmsKitMediaOptions>(options =>
+{
+    options.EntityTypes.Add(new MediaDescriptorDefinition("BlogPost"));
+    options.EntityTypes.Add(new MediaDescriptorDefinition("Page"));
+    options.EntityTypes.Add(new MediaDescriptorDefinition(
+        entityType: "Product",
+        createPolicies: new[] { "MyApp.Products.Upload" }));
+});
+```
+
+`MediaDescriptorDefinition` extends [`PolicySpecifiedDefinition`](/modules/cms-kit/domain#policyspecifieddefinition), so uploads can be permission-gated per entity type.
+
+### Linkage with blog posts
+
+`BlogPost.CoverImageMediaId` is a `Guid?` referencing `MediaDescriptor.Id`. There is no FK constraint — the link is logical:
+
+```csharp
+// in BlogPost.cs
+public Guid? CoverImageMediaId { get; set; }
+```
+
+The public reader fetches the image via the Common HTTP API route `GET /api/cms-kit/media/{id}` — see [HTTP API](/modules/cms-kit/http-api). The route returns the blob stream with `Content-Type` from the descriptor.
+
+### Inline images in `Page` / `BlogPost` content
+
+The WYSIWYG editor in the Admin UI uploads inline images through the same `MediaDescriptorAdminAppService.CreateAsync` and embeds the resulting `<img src="/api/cms-kit/media/{id}" />` URL into `Content`. No special parsing is needed — the URL works against any tenant because the blob container is tenant-scoped.
+
+## Cross-references
+
+- **Menu items can link to pages** — see [Pages](/modules/cms-kit/pages). The `PageChangedHandler` keeps URLs in sync automatically.
+- **Blog posts use media for cover images** — see [Blogs](/modules/cms-kit/blogs).
+- **Storage backend** — configure via [Blob Storing Database](/modules/blob-storing-database/overview) (or any other `BlobStoringProvider` — filesystem, Azure, S3).
+- **Localizing menu item display names** — `DisplayName` is stored as a single string but typically holds a localization key like `"Menu:About"`, resolved by the renderer. For richer translation, use [Multi-lingual objects](/localization/multi-lingual-objects).
+- **Admin endpoints** — `MenuItemAdminAppService`, `MediaDescriptorAdminAppService` in [Admin Application](/modules/cms-kit/admin-application).
+- **Public endpoints** — `MenuItemPublicAppService` and the Common-layer `MediaDescriptorController` in [Public Application](/modules/cms-kit/public-application) / [HTTP API](/modules/cms-kit/http-api).
+- **Razor view components** — the public navbar and the page/post media renderers live in [Web UI](/modules/cms-kit/web-ui).

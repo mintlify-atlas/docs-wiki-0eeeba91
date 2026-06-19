@@ -1,0 +1,315 @@
+---
+title: "EF Core Oracle Adapters: ODP.NET and Devart Variants"
+sidebarTitle: "EF Core: Oracle"
+description: "Volo.Abp.EntityFrameworkCore.Oracle (ODP.NET) and .Oracle.Devart (dotConnect): UseOracle extensions, GUID strategy and connection checkers."
+---
+
+ABP ships **two** Oracle Database adapters: `Volo.Abp.EntityFrameworkCore.Oracle` (using Oracle's official ODP.NET via `Oracle.EntityFrameworkCore`) and `Volo.Abp.EntityFrameworkCore.Oracle.Devart` (using Devart's commercial `dotConnect for Oracle`). They are independent NuGet packages — pick one. Sources are at `framework/src/Volo.Abp.EntityFrameworkCore.Oracle/` and `framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart/`.
+
+Both adapters are tiny — module, `UseOracle` extension, model‑builder helper, connection‑string checker. The substantial behavior lives in [`Volo.Abp.EntityFrameworkCore`](/data/entityframeworkcore). This page covers both side by side.
+
+## Why two packages?
+
+| Adapter package                                  | EF Core provider                                | `Database.ProviderName`               | Notes                                                              |
+| ------------------------------------------------ | ----------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------ |
+| `Volo.Abp.EntityFrameworkCore.Oracle`             | `Oracle.EntityFrameworkCore` (Oracle ODP.NET)   | `Oracle.EntityFrameworkCore`           | Vendor‑official, royalty‑free, widely deployed.                     |
+| `Volo.Abp.EntityFrameworkCore.Oracle.Devart`      | `Devart.Data.Oracle.Entity.EFCore` (dotConnect) | `Devart.Data.Oracle.Entity.EFCore`     | Commercial; supports advanced Devart features (data sources, etc.). |
+
+`AbpDbContext.GetDatabaseProviderOrNull` recognizes both provider names as `EfCoreDatabaseProvider.Oracle`:
+
+```csharp
+case "Oracle.EntityFrameworkCore":
+case "Devart.Data.Oracle.Entity.EFCore":
+    return EfCoreDatabaseProvider.Oracle;
+```
+
+## ODP.NET adapter (`Volo.Abp.EntityFrameworkCore.Oracle`)
+
+### Module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle/Volo/Abp/EntityFrameworkCore/Oracle/AbpEntityFrameworkCoreOracleModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreOracleModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsBinary;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+`SequentialGuidType.SequentialAsBinary` is chosen because Oracle stores GUIDs as `RAW(16)` — raw binary, sorted by byte. Sequential bytes at the high end → better clustering on the PK.
+
+### UseOracle extension
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsOracleExtensions.cs
+public static class AbpDbContextOptionsOracleExtensions
+{
+    public static void UseOracle(
+        [NotNull] this AbpDbContextOptions options,
+        Action<OracleDbContextOptionsBuilder>? oracleOptionsAction = null)
+    {
+        options.Configure(context =>
+        {
+            context.UseOracle(oracleOptionsAction);
+        });
+    }
+
+    public static void UseOracle<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<OracleDbContextOptionsBuilder>? oracleOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseOracle(oracleOptionsAction);
+        });
+    }
+}
+```
+
+`OracleDbContextOptionsBuilder` is from `Oracle.EntityFrameworkCore.Infrastructure` — ODP.NET's options builder.
+
+### Connection-string checker
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle/Volo/Abp/EntityFrameworkCore/ConnectionStrings/OracleConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class OracleConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new OracleConnectionStringBuilder(connectionString)
+            {
+                ConnectionTimeout = 1
+            };
+
+            await using var conn = new OracleConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+<Note>
+Notice this checker sets `DatabaseExists = true` whenever it can open the connection — Oracle doesn't have a "database" concept comparable to SQL Server's; what you're connecting to is the *service / SID*. If you can open it, the user's default schema is implicit. So the SaaS host only uses the `Connected` flag for Oracle.
+</Note>
+
+## Devart adapter (`Volo.Abp.EntityFrameworkCore.Oracle.Devart`)
+
+### Module
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart/Volo/Abp/EntityFrameworkCore/Oracle/Devart/AbpEntityFrameworkCoreOracleDevartModule.cs
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreOracleDevartModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsBinary;
+            }
+        });
+
+        Configure<AbpEfCoreGlobalFilterOptions>(options =>
+        {
+            options.UseDbFunction = true;
+        });
+    }
+}
+```
+
+Same GUID strategy and DB function filter setting as ODP.NET.
+
+### UseOracle extension (Devart)
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart/Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsOracleDevartExtensions.cs
+public static class AbpDbContextOptionsOracleDevartExtensions
+{
+    public static void UseOracle(
+        [NotNull] this AbpDbContextOptions options,
+        Action<OracleDbContextOptionsBuilder>? oracleOptionsAction = null,
+        bool useExistingConnectionIfAvailable = false)
+    {
+        options.Configure(context =>
+        {
+            context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable);
+        });
+    }
+
+    public static void UseOracle<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        Action<OracleDbContextOptionsBuilder>? oracleOptionsAction = null,
+        bool useExistingConnectionIfAvailable = false)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context =>
+        {
+            context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable);
+        });
+    }
+}
+```
+
+Three differences from the ODP.NET version:
+
+- `OracleDbContextOptionsBuilder` is the **Devart** options builder (`Devart.Data.Oracle.Entity`).
+- The signature takes a `useExistingConnectionIfAvailable` flag — Devart's stack supports reusing an existing ADO.NET connection.
+- The underlying extension is Devart's `UseOracle(...)`.
+
+### Connection-string checker (Devart)
+
+```csharp
+// framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart/Volo/Abp/EntityFrameworkCore/ConnectionStrings/OracleDevartConnectionStringChecker.cs
+[Dependency(ReplaceServices = true)]
+public class OracleDevartConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            var connString = new OracleConnectionStringBuilder(connectionString)
+            {
+                ConnectionTimeout = 1
+            };
+
+            await using var conn = new OracleConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Uses `Devart.Data.Oracle.OracleConnection` instead of ODP.NET's. Same probe shape.
+
+<Warning>
+Like the MySQL story, you **cannot** install both Oracle adapter packages in the same project. Both expose `UseOracle(this AbpDbContextOptions)` and both register an `IConnectionStringChecker` with `ReplaceServices = true`. Pick one.
+</Warning>
+
+## Module wiring
+
+ODP.NET:
+
+```xml
+<PackageReference Include="Volo.Abp.EntityFrameworkCore.Oracle" Version="..." />
+```
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreOracleModule))]
+public class MyAppEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseOracle();
+        });
+
+        context.Services.AddAbpDbContext<MyAppDbContext>(opts =>
+        {
+            opts.AddDefaultRepositories(includeAllEntities: true);
+        });
+    }
+}
+```
+
+Devart: swap module + package name.
+
+`appsettings.json` (ODP.NET TNS‑less):
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Data Source=//db:1521/XEPDB1;User Id=APP;Password=...;"
+  }
+}
+```
+
+## Notes and pitfalls
+
+<AccordionGroup>
+  <Accordion title="Identifier length limit">
+    Pre‑12.2 Oracle limits identifiers to 30 characters. ABP module tables (e.g. `AbpPermissionManagement_PermissionGroups`) can exceed that — verify your target Oracle version supports 128‑char identifiers, or override table names in `OnModelCreating`.
+  </Accordion>
+  <Accordion title="Boolean columns">
+    Oracle has no `BOOLEAN` SQL type for columns. ABP's `IsDeleted`, `IsActive` etc. are stored as `NUMBER(1)`. EF Core's Oracle providers do the conversion automatically.
+  </Accordion>
+  <Accordion title="Sequences vs identity">
+    Oracle 12c+ supports `IDENTITY` but ABP entities mostly use `Guid` keys generated client‑side by `IGuidGenerator`, so sequences are rarely needed for the framework's own tables.
+  </Accordion>
+  <Accordion title="Connect timeout vs the checker">
+    The checker sets `ConnectionTimeout = 1` (1 second). On a slow VPN this can yield false negatives. Override the checker by registering your own `IConnectionStringChecker` with `[Dependency(ReplaceServices = true)]` if you need a longer probe.
+  </Accordion>
+</AccordionGroup>
+
+## Choosing between the two
+
+<AccordionGroup>
+  <Accordion title="Pick ODP.NET (Volo.Abp.EntityFrameworkCore.Oracle) if...">
+    - You want the vendor‑official driver maintained by Oracle.
+    - No license cost beyond Oracle DB itself.
+    - You're integrating with Oracle Cloud or RAC features that ODP.NET supports natively.
+  </Accordion>
+  <Accordion title="Pick Devart (Volo.Abp.EntityFrameworkCore.Oracle.Devart) if...">
+    - You already license dotConnect across your portfolio.
+    - You need Devart‑specific features (Direct mode without an Oracle Client install, advanced auditing, sophisticated EF Core extensions).
+    - Cross‑platform deployment without an Oracle Instant Client matters.
+  </Accordion>
+  <Accordion title="Do NOT install both">
+    Both register `UseOracle(this AbpDbContextOptions)` and both `[Dependency(ReplaceServices = true)]` an `IConnectionStringChecker`. Pick one per project.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="EF Core core" icon="elephant" href="/data/entityframeworkcore">
+    What both adapters layer onto.
+  </Card>
+  <Card title="Connection strings" icon="link" href="/data/connection-strings">
+    Where the two connection checkers slot in.
+  </Card>
+  <Card title="MySQL adapter" icon="dolphin" href="/data/efcore-mysql">
+    Same dual‑adapter pattern.
+  </Card>
+  <Card title="SQL Server adapter" icon="server" href="/data/efcore-sqlserver">
+    Single‑adapter reference.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    Provider‑agnostic domain API.
+  </Card>
+  <Card title="UoW transaction flow" icon="diagram-project" href="/flows/unit-of-work-lifecycle">
+    End‑to‑end commit narrative.
+  </Card>
+</CardGroup>

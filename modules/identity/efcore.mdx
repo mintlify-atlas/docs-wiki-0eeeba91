@@ -1,0 +1,401 @@
+---
+title: "EF Core Provider — DbContext, Repositories, ConfigureIdentity"
+sidebarTitle: "EF Core"
+description: "Entity Framework Core provider for Identity: IdentityDbContext, IIdentityDbContext, ConfigureIdentity model builder, and the EfCore* repository family."
+---
+
+The Entity Framework Core provider for the Identity module is the canonical persistence implementation. It ships in **`Volo.Abp.Identity.EntityFrameworkCore`** and provides a self‑contained `DbContext` plus repository implementations for every Identity aggregate. You can use it as‑is (the DbContext is mapped directly), or — far more commonly — you let your application's main DbContext **implement `IIdentityDbContext`** and call `builder.ConfigureIdentity()` from its `OnModelCreating`, which is how every ABP solution template wires it.
+
+This page walks the project file by file: the DbContext, the marker interface, the model builder extension that does all the mapping, the seven `EfCore*Repository` classes, and the module that wires them up. Every type referenced here lives under `modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/`.
+
+<Info>
+**Source root:** [`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/`](https://github.com/abpframework/abp/tree/dev/modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore). The same aggregates are mapped to MongoDB in [`Volo.Abp.Identity.MongoDB`](/modules/identity/mongodb).
+</Info>
+
+## Layout
+
+```mermaid
+flowchart TB
+    subgraph Domain["Volo.Abp.Identity.Domain"]
+        E[Entities & Aggregates]
+        IRepos["IIdentityUserRepository<br/>IIdentityRoleRepository<br/>IOrganizationUnitRepository<br/>IIdentityClaimTypeRepository<br/>IIdentitySecurityLogRepository<br/>IIdentityLinkUserRepository<br/>IIdentitySessionRepository<br/>IIdentityUserDelegationRepository"]
+    end
+
+    subgraph EFC["Volo.Abp.Identity.EntityFrameworkCore"]
+        DbCtx[IdentityDbContext]
+        IDb[IIdentityDbContext]
+        Model[IdentityDbContextModelBuilderExtensions<br/>ConfigureIdentity()]
+        Repos["EfCoreIdentityUserRepository<br/>EfCoreIdentityRoleRepository<br/>EfCoreOrganizationUnitRepository<br/>EfCoreIdentityClaimTypeRepository<br/>EfCoreIdentitySecurityLogRepository<br/>EfCoreIdentityLinkUserRepository<br/>EfCoreIdentitySessionRepository<br/>EfCoreIdentityUserDelegationRepository"]
+        Q[IdentityEfCoreQueryableExtensions]
+        Mod[AbpIdentityEntityFrameworkCoreModule]
+    end
+
+    DbCtx -- implements --> IDb
+    DbCtx -- "OnModelCreating" --> Model
+    Repos -- "EfCoreRepository&lt;IIdentityDbContext, ...&gt;" --> IDb
+    Repos -- implement --> IRepos
+    Mod -- AddAbpDbContext --> DbCtx
+    Mod -- AddRepository --> Repos
+    Repos -- uses --> Q
+```
+
+The repositories are typed against the **interface** `IIdentityDbContext`, not the concrete `IdentityDbContext`. That's the seam that lets your application's main DbContext play the role of "the Identity DbContext" — the repositories don't care which concrete type satisfies the interface.
+
+## `AbpIdentityEntityFrameworkCoreModule`
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/AbpIdentityEntityFrameworkCoreModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpIdentityDomainModule),
+    typeof(AbpUsersEntityFrameworkCoreModule))]
+public class AbpIdentityEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<IdentityDbContext>(options =>
+        {
+            options.AddRepository<IdentityUser, EfCoreIdentityUserRepository>();
+            options.AddRepository<IdentityRole, EfCoreIdentityRoleRepository>();
+            options.AddRepository<IdentityClaimType, EfCoreIdentityClaimTypeRepository>();
+            options.AddRepository<OrganizationUnit, EfCoreOrganizationUnitRepository>();
+            options.AddRepository<IdentitySecurityLog, EfCoreIdentitySecurityLogRepository>();
+            options.AddRepository<IdentityLinkUser, EfCoreIdentityLinkUserRepository>();
+            options.AddRepository<IdentityUserDelegation, EfCoreIdentityUserDelegationRepository>();
+            options.AddRepository<IdentitySession, EfCoreIdentitySessionRepository>();
+        });
+    }
+}
+```
+
+`AddAbpDbContext<IdentityDbContext>` registers the DbContext as a singleton mapping target, registers `IIdentityDbContext` as a service that resolves to whatever concrete DbContext implements it, and registers each custom repository against its interface (`IIdentityUserRepository` → `EfCoreIdentityUserRepository`, etc).
+
+`AbpUsersEntityFrameworkCoreModule` is the dependency that maps the upstream `IUserData` abstraction. If you forget to depend on it, the user lookup service still resolves users by id but row‑level extra properties from `Volo.Abp.Users` won't be hydrated.
+
+## `IdentityDbContext`
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/IdentityDbContext.cs`:
+
+```csharp
+[ConnectionStringName(AbpIdentityDbProperties.ConnectionStringName)]
+public class IdentityDbContext : AbpDbContext<IdentityDbContext>, IIdentityDbContext
+{
+    public DbSet<IdentityUser> Users { get; set; }
+    public DbSet<IdentityRole> Roles { get; set; }
+    public DbSet<IdentityClaimType> ClaimTypes { get; set; }
+    public DbSet<OrganizationUnit> OrganizationUnits { get; set; }
+    public DbSet<IdentitySecurityLog> SecurityLogs { get; set; }
+    public DbSet<IdentityLinkUser> LinkUsers { get; set; }
+    public DbSet<IdentityUserDelegation> UserDelegations { get; set; }
+    public DbSet<IdentitySession> Sessions { get; set; }
+
+    public IdentityDbContext(DbContextOptions<IdentityDbContext> options)
+        : base(options)
+    {
+    }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.ConfigureIdentity();
+    }
+}
+```
+
+`[ConnectionStringName("AbpIdentity")]` — the constant comes from `AbpIdentityDbProperties.ConnectionStringName` in `modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/AbpIdentityDbProperties.cs`. That tells ABP's connection string resolver to use `"ConnectionStrings:AbpIdentity"` first, falling back to `"ConnectionStrings:Default"`.
+
+`AbpDbContext<T>` is the base from `Volo.Abp.EntityFrameworkCore` — it adds soft delete, multi‑tenancy filters, auto audit property setting, distributed event publishing, and `IUnitOfWork` integration.
+
+## `IIdentityDbContext`
+
+The interface in `modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/IIdentityDbContext.cs` is what the repositories are typed against:
+
+```csharp
+[ConnectionStringName(AbpIdentityDbProperties.ConnectionStringName)]
+public interface IIdentityDbContext : IEfCoreDbContext
+{
+    DbSet<IdentityUser> Users { get; }
+    DbSet<IdentityRole> Roles { get; }
+    DbSet<IdentityClaimType> ClaimTypes { get; }
+    DbSet<OrganizationUnit> OrganizationUnits { get; }
+    DbSet<IdentitySecurityLog> SecurityLogs { get; }
+    DbSet<IdentityLinkUser> LinkUsers { get; }
+    DbSet<IdentityUserDelegation> UserDelegations { get; }
+    DbSet<IdentitySession> Sessions { get; }
+}
+```
+
+In a standard ABP solution, the host application's `AppDbContext` typically `implements IIdentityDbContext` (and `IPermissionManagementDbContext`, `ISettingManagementDbContext`, ...) so a single DbContext owns all the module tables. `services.AddAbpDbContext<AppDbContext>` then calls `options.ReplaceDbContext<IIdentityDbContext>()` to redirect the registration here at `IdentityDbContext` to `AppDbContext`.
+
+## `ConfigureIdentity` — the model builder
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/IdentityDbContextModelBuilderExtensions.cs` is the single source of truth for the relational schema. It maps every Identity aggregate from `Volo.Abp.Identity.Domain` ([entities](/modules/identity/entities)) to a table.
+
+```csharp
+public static class IdentityDbContextModelBuilderExtensions
+{
+    public static void ConfigureIdentity([NotNull] this ModelBuilder builder)
+    {
+        Check.NotNull(builder, nameof(builder));
+
+        builder.Entity<IdentityUser>(b =>
+        {
+            b.ToTable(AbpIdentityDbProperties.DbTablePrefix + "Users", AbpIdentityDbProperties.DbSchema);
+
+            b.ConfigureByConvention();
+            b.ConfigureAbpUser();
+
+            b.Property(u => u.NormalizedUserName).IsRequired()
+                .HasMaxLength(IdentityUserConsts.MaxNormalizedUserNameLength)
+                .HasColumnName(nameof(IdentityUser.NormalizedUserName));
+            b.Property(u => u.NormalizedEmail).IsRequired()
+                .HasMaxLength(IdentityUserConsts.MaxNormalizedEmailLength)
+                .HasColumnName(nameof(IdentityUser.NormalizedEmail));
+            b.Property(u => u.PasswordHash).HasMaxLength(IdentityUserConsts.MaxPasswordHashLength)
+                .HasColumnName(nameof(IdentityUser.PasswordHash));
+            b.Property(u => u.SecurityStamp).IsRequired().HasMaxLength(IdentityUserConsts.MaxSecurityStampLength)
+                .HasColumnName(nameof(IdentityUser.SecurityStamp));
+            b.Property(u => u.TwoFactorEnabled).HasDefaultValue(false)
+                .HasColumnName(nameof(IdentityUser.TwoFactorEnabled));
+            b.Property(u => u.LockoutEnabled).HasDefaultValue(false)
+                .HasColumnName(nameof(IdentityUser.LockoutEnabled));
+
+            b.Property(u => u.IsExternal).IsRequired().HasDefaultValue(false)
+                .HasColumnName(nameof(IdentityUser.IsExternal));
+
+            b.Property(u => u.AccessFailedCount)
+                .If(!builder.IsUsingOracle(), p => p.HasDefaultValue(0))
+                .HasColumnName(nameof(IdentityUser.AccessFailedCount));
+
+            b.HasMany(u => u.Claims).WithOne().HasForeignKey(uc => uc.UserId).IsRequired();
+            b.HasMany(u => u.Logins).WithOne().HasForeignKey(ul => ul.UserId).IsRequired();
+            b.HasMany(u => u.Roles).WithOne().HasForeignKey(ur => ur.UserId).IsRequired();
+            b.HasMany(u => u.Tokens).WithOne().HasForeignKey(ur => ur.UserId).IsRequired();
+            b.HasMany(u => u.OrganizationUnits).WithOne().HasForeignKey(ur => ur.UserId).IsRequired();
+
+            b.HasIndex(u => u.NormalizedUserName);
+            b.HasIndex(u => u.NormalizedEmail);
+            b.HasIndex(u => u.UserName);
+            b.HasIndex(u => u.Email);
+
+            b.ApplyObjectExtensionMappings();
+        });
+        // ... maps IdentityUserClaim, IdentityUserRole, IdentityUserLogin,
+        //     IdentityUserToken, IdentityRole, IdentityRoleClaim,
+        //     IdentityClaimType, OrganizationUnit, OrganizationUnitRole,
+        //     IdentityUserOrganizationUnit, IdentitySecurityLog,
+        //     IdentityLinkUser, IdentityUserDelegation, IdentitySession
+
+        builder.TryConfigureObjectExtensions<IdentityDbContext>();
+    }
+}
+```
+
+A few key conventions used throughout the method:
+
+- `b.ConfigureByConvention()` is the ABP base configurator — it wires soft delete (`IsDeleted`), audit fields (`CreatorId`, `LastModificationTime`, ...), concurrency stamp, tenant id, and extra properties.
+- `b.ConfigureAbpUser()` (from `Volo.Abp.Users.EntityFrameworkCore`) maps the upstream `AbpUserBase` columns (`Name`, `Surname`, `Email`, `PhoneNumber`, etc.) that `IdentityUser` inherits.
+- `b.ApplyObjectExtensionMappings()` projects custom properties registered with `ObjectExtensionManager.Instance.AddOrUpdateProperty<T, TProp>(...)` into real EF columns when the registration supplies a `WithMaxLength(...)` / `HasColumnType(...)` mapping attribute.
+- `AbpIdentityDbProperties.DbTablePrefix + "Users"` lets a host change the prefix in `Startup` — `AbpIdentityDbProperties.DbTablePrefix = "MyApp_";` renames every Identity table at startup.
+- `builder.IsHostDatabase()` gates the host‑only tables (`AbpClaimTypes`, `AbpLinkUsers`) so a tenant‑specific DbContext doesn't create them.
+
+### Tables mapped
+
+| C# entity | Table (default prefix `Abp`) | Notes |
+| --- | --- | --- |
+| `IdentityUser` | `AbpUsers` | Self‑contained user; not Microsoft.AspNetCore.Identity's `IdentityUser`. |
+| `IdentityUserClaim` | `AbpUserClaims` | `Id ValueGeneratedNever`. |
+| `IdentityUserRole` | `AbpUserRoles` | Composite key `(UserId, RoleId)`. |
+| `IdentityUserLogin` | `AbpUserLogins` | Composite key `(UserId, LoginProvider)`. |
+| `IdentityUserToken` | `AbpUserTokens` | Composite key `(UserId, LoginProvider, Name)`. |
+| `IdentityRole` | `AbpRoles` | |
+| `IdentityRoleClaim` | `AbpRoleClaims` | |
+| `IdentityClaimType` | `AbpClaimTypes` | Host‑only. |
+| `OrganizationUnit` | `AbpOrganizationUnits` | Self‑referencing tree via `ParentId`. |
+| `OrganizationUnitRole` | `AbpOrganizationUnitRoles` | Composite key `(OrganizationUnitId, RoleId)`. |
+| `IdentityUserOrganizationUnit` | `AbpUserOrganizationUnits` | Composite key `(OrganizationUnitId, UserId)`. |
+| `IdentitySecurityLog` | `AbpSecurityLogs` | Indexed by `(TenantId, Identity)`, `(TenantId, Action)`, `(TenantId, UserId)`. |
+| `IdentityLinkUser` | `AbpLinkUsers` | Host‑only; unique index over `(SourceUserId, SourceTenantId, TargetUserId, TargetTenantId)`. |
+| `IdentityUserDelegation` | `AbpUserDelegations` | |
+| `IdentitySession` | `AbpSessions` | Indexed by `SessionId`, `Device`, `(TenantId, UserId)`. |
+
+### `ApplyObjectExtensionMappings` and `TryConfigureObjectExtensions`
+
+The final line of `ConfigureIdentity` calls `builder.TryConfigureObjectExtensions<IdentityDbContext>()`. Together with the per‑entity `b.ApplyObjectExtensionMappings()` this is what turns extension properties registered via `ObjectExtensionManager.Instance.AddOrUpdateProperty<IdentityUser, T>(p => p.MapEfCore(m => m.HasMaxLength(...)))` into real columns on `AbpUsers` — no manual migration code needed beyond running `dotnet ef migrations add`.
+
+## Repository family
+
+### `EfCoreIdentityUserRepository`
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/EfCoreIdentityUserRepository.cs`:
+
+```csharp
+public class EfCoreIdentityUserRepository
+    : EfCoreRepository<IIdentityDbContext, IdentityUser, Guid>, IIdentityUserRepository
+{
+    public EfCoreIdentityUserRepository(IDbContextProvider<IIdentityDbContext> dbContextProvider)
+        : base(dbContextProvider)
+    {
+    }
+
+    public virtual async Task<IdentityUser> FindByNormalizedUserNameAsync(
+        string normalizedUserName,
+        bool includeDetails = true,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .IncludeDetails(includeDetails)
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                u => u.NormalizedUserName == normalizedUserName,
+                GetCancellationToken(cancellationToken)
+            );
+    }
+    // ... GetRoleNamesAsync, GetRoleNamesInOrganizationUnitAsync,
+    //     GetListAsync, GetCountAsync, GetUsersInOrganizationUnitAsync, etc.
+}
+```
+
+`EfCoreRepository<IIdentityDbContext, IdentityUser, Guid>` is the ABP generic EF Core repository — it implements `IRepository<IdentityUser, Guid>` (insert / update / delete / find / list) and adds `GetDbContextAsync()` / `GetDbSetAsync()` helpers.
+
+A representative custom query — `GetRoleNamesAsync` unions direct user roles with roles inherited through the OU membership:
+
+```csharp
+public virtual async Task<List<string>> GetRoleNamesAsync(
+    Guid id,
+    CancellationToken cancellationToken = default)
+{
+    var dbContext = await GetDbContextAsync();
+    var query = from userRole in dbContext.Set<IdentityUserRole>()
+                join role in dbContext.Roles on userRole.RoleId equals role.Id
+                where userRole.UserId == id
+                select role.Name;
+
+    var organizationUnitIds = dbContext.Set<IdentityUserOrganizationUnit>()
+        .Where(q => q.UserId == id).Select(q => q.OrganizationUnitId).ToArray();
+
+    var organizationRoleIds = await (
+        from ouRole in dbContext.Set<OrganizationUnitRole>()
+        join ou in dbContext.Set<OrganizationUnit>() on ouRole.OrganizationUnitId equals ou.Id
+        where organizationUnitIds.Contains(ouRole.OrganizationUnitId)
+        select ouRole.RoleId
+    ).ToListAsync(GetCancellationToken(cancellationToken));
+
+    var orgUnitRoleNameQuery = dbContext.Roles.Where(r => organizationRoleIds.Contains(r.Id)).Select(n => n.Name);
+    var resultQuery = query.Union(orgUnitRoleNameQuery);
+    return await resultQuery.ToListAsync(GetCancellationToken(cancellationToken));
+}
+```
+
+This is the canonical "what roles does this user effectively have?" query — used by `IdentityDynamicClaimsPrincipalContributor` (see [Domain](/modules/identity/domain)) when building the role claim set for the current principal.
+
+### `EfCoreIdentityRoleRepository`
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/EfCoreIdentityRoleRepository.cs` shows the same pattern. Notable methods:
+
+- `FindByNormalizedNameAsync(string normalizedRoleName, ...)` — used by `IdentityRoleManager`.
+- `GetListWithUserCountAsync(...)` — joins to `IdentityUserRole` and groups by `RoleId` to count members. Used by the Pro role list grid; the open‑source list grid uses `GetListAsync`.
+- `GetDefaultRolesAsync()` and `GetDefaultOnesAsync()` — return the roles flagged `IsDefault`, which `IdentityUserManager.CreateAsync` assigns automatically.
+
+### Other repositories
+
+| File | Aggregate | Notable methods |
+| --- | --- | --- |
+| `EfCoreOrganizationUnitRepository.cs` | `OrganizationUnit` | `GetChildrenAsync(parentId)`, `GetAllChildrenWithParentCodeAsync(code, parentId)`, `GetLastChildOrNullAsync(parentId)`. Tree queries are powered by the `Code` prefix LIKE pattern. |
+| `EfCoreIdentityClaimTypeRepository.cs` | `IdentityClaimType` | `FindByNameAsync(name)`. Backed by `AbpClaimTypes`. |
+| `EfCoreIdentitySecurityLogRepository.cs` | `IdentitySecurityLog` | `GetListAsync(...)` with filters for action, identity, application name, IP, date range. |
+| `EfCoreIdentitySessionRepository.cs` | `IdentitySession` | `FindAsync(sessionId)`, `RevokeAsync(sessionId)`, `GetListAsync(userId, ...)`. |
+| `EfCoreIdentityLinkUserRepository.cs` | `IdentityLinkUser` | `FindAsync(IdentityLinkUserInfo, IdentityLinkUserInfo)` for the two‑way lookup; `GetListAsync(IdentityLinkUserInfo)` for "all accounts linked to this one". |
+| `EfCoreIdentityUserDelegationRepository.cs` | `IdentityUserDelegation` | `GetActiveDelegationsAsync(userId)`, `FindActiveDelegationByIdAsync(id)`. Used by `IdentityUserDelegationManager`. |
+
+All of them follow the same shape: `: EfCoreRepository<IIdentityDbContext, TEntity, Guid>`, override methods virtual for extension, and return queryables through `await GetDbSetAsync()` so unit‑of‑work scope is respected.
+
+## `IdentityEfCoreQueryableExtensions`
+
+`modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/IdentityEfCoreQueryableExtensions.cs` provides eager‑load helpers used everywhere:
+
+```csharp
+public static IQueryable<IdentityUser> IncludeDetails(this IQueryable<IdentityUser> queryable, bool include = true)
+{
+    if (!include)
+    {
+        return queryable;
+    }
+
+    return queryable
+        .Include(x => x.Roles)
+        .Include(x => x.Logins)
+        .Include(x => x.Claims)
+        .Include(x => x.Tokens)
+        .Include(x => x.OrganizationUnits);
+}
+```
+
+Every repository read method that returns a fully‑hydrated `IdentityUser` flows through this — that's why `await UserManager.GetByIdAsync(id)` already has `user.Roles`, `user.Claims`, etc. populated without a second query.
+
+There's a matching overload for `IQueryable<IdentityRole>` that includes its claims.
+
+## How a host wires this in
+
+In the standard ABP application template, the host's `AppDbContext` implements `IIdentityDbContext` and the entity framework module call reads:
+
+```csharp
+services.AddAbpDbContext<AppDbContext>(options =>
+{
+    options.ReplaceDbContext<IIdentityDbContext>();
+    options.ReplaceDbContext<IPermissionManagementDbContext>();
+    // ... other modules
+
+    options.UseSqlServer();
+});
+```
+
+`ReplaceDbContext<IIdentityDbContext>()` is what re‑routes every repository `IDbContextProvider<IIdentityDbContext>` resolution from `IdentityDbContext` to `AppDbContext`. Then the app's `OnModelCreating` adds:
+
+```csharp
+protected override void OnModelCreating(ModelBuilder builder)
+{
+    base.OnModelCreating(builder);
+
+    builder.ConfigureIdentity();
+    builder.ConfigurePermissionManagement();
+    // ... other modules
+}
+```
+
+After that, a single `dotnet ef migrations add Initial` will produce a migration containing every Identity table, indexed and prefixed as configured.
+
+## Configuring table prefix / schema
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    AbpIdentityDbProperties.DbTablePrefix = "MyApp_";   // tables become MyApp_Users, MyApp_Roles, ...
+    AbpIdentityDbProperties.DbSchema = "identity";       // schema becomes "identity" instead of "dbo"
+}
+```
+
+Both are static settings consumed by every `b.ToTable(...)` call in `ConfigureIdentity`. Change them **before** the EF Core module's `OnModelCreating` runs (i.e. in `PreConfigureServices`) — they're captured at model build time and any later change has no effect.
+
+## Migrations
+
+Generate the schema:
+
+```bash
+dotnet ef migrations add Added_Identity_Module --project src/MyApp.EntityFrameworkCore
+dotnet ef database update --project src/MyApp.EntityFrameworkCore
+```
+
+The migration adds every table in the section above. For an upgrade — when a new ABP version introduces a column or index — generate a fresh migration from the same DbContext; ABP packages the new column metadata in `ConfigureIdentity`, EF Core will diff it against the current snapshot.
+
+## Related pages
+
+- [Identity overview](/modules/identity/overview)
+- [Entities](/modules/identity/entities) — the aggregates these tables persist.
+- [Managers](/modules/identity/managers) and [Domain](/modules/identity/domain) — the consumers of `IIdentity*Repository`.
+- [Application layer](/modules/identity/application) and [HTTP API](/modules/identity/http-api) — sit two layers above this one.
+- [MongoDB provider](/modules/identity/mongodb) — the non‑relational alternative.
+- [ASP.NET Core integration](/modules/identity/aspnetcore-integration) — Microsoft.AspNetCore.Identity wiring on top of these stores.
+- [Permission management](/security/permissions) — permissions table joins live in `Volo.Abp.PermissionManagement.Domain.Identity`.
+- [OpenIddict](/modules/openiddict/overview) and [Account](/modules/account/overview) — module siblings that share the connection string.

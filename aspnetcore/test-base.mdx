@@ -1,0 +1,224 @@
+---
+title: "ASP.NET Core Test Base — WebApplicationFactory Wiring"
+sidebarTitle: "Test Base"
+description: "Volo.Abp.AspNetCore.TestBase — AbpWebApplicationFactoryIntegratedTest and the legacy AbpAspNetCoreIntegratedTestBase for in-process integration tests."
+---
+
+`Volo.Abp.AspNetCore.TestBase` ships the base classes that integration tests use to spin up a complete ABP Web host in‑process and hit it with an `HttpClient`. It provides two flavours: the modern `AbpWebApplicationFactoryIntegratedTest<TProgram>` built on Microsoft's `WebApplicationFactory<T>`, and the legacy `AbpAspNetCoreIntegratedTestBase<TStartupModule>` that uses `Host.CreateDefaultBuilder` directly.
+
+Module path: `framework/src/Volo.Abp.AspNetCore.TestBase/Volo/Abp/AspNetCore/TestBase/`.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `AbpAspNetCoreTestBaseModule.cs` | Marker module that test hosts include. Registers `ITestServerAccessor`. |
+| `AbpWebApplicationFactoryIntegratedTest.cs` | Modern base class — extends `WebApplicationFactory<TProgram>`. |
+| `AbpAspNetCoreIntegratedTestBase.cs` | Legacy base class — `[Obsolete]` but still in active codebases. |
+| `AbpAspNetCoreAsyncIntegratedTestBase.cs` | Async variant of the legacy base that supports `IAsyncLifetime` (xUnit). |
+| `ITestServerAccessor.cs` / `TestServerAccessor.cs` | Holds a static reference to the running `TestServer` so test hooks can resolve `IServiceProvider`. |
+| `TestStartup.cs` | A stand‑in `Startup` class used when the test module is itself an `AbpModule` (not a Startup). |
+| `TestNoopHostLifetime.cs` / `AbpNoopHostLifetime.cs` | Replaces the default console lifetime so tests don't block waiting for Ctrl+C. |
+| `WebApplicationBuilderExtensions.cs` | `AddAppSettingsSecretsJson()` test helper. |
+| `WebHostBuilderExtensions.cs` | `UseAbpTestServer()` test helper. |
+| `WebProjectPatchHelper.cs` | Resolves the project's content root from the test project directory. |
+| `DynamicProxying/` | Test‑side variants of the dynamic proxy registrar used by test modules that exercise client proxies. |
+
+## `AbpWebApplicationFactoryIntegratedTest<TProgram>`
+
+```csharp
+public abstract class AbpWebApplicationFactoryIntegratedTest<TProgram> : WebApplicationFactory<TProgram>
+    where TProgram : class
+{
+    protected HttpClient Client { get; set; }
+
+    protected IServiceProvider ServiceProvider => Services;
+
+    protected AbpWebApplicationFactoryIntegratedTest()
+    {
+        Client = CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+    }
+
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        builder
+            .AddAppSettingsSecretsJson()
+            .ConfigureServices(ConfigureServices);
+        return base.CreateHost(builder);
+    }
+
+    protected virtual T? GetService<T>() => Services.GetService<T>();
+    protected virtual T GetRequiredService<T>() where T : notnull => Services.GetRequiredService<T>();
+
+    protected virtual T? GetKeyedServices<T>(object? serviceKey)
+        => ServiceProvider.GetKeyedService<T>(serviceKey);
+
+    protected virtual T GetRequiredKeyedService<T>(object? serviceKey) where T : notnull
+        => ServiceProvider.GetRequiredKeyedService<T>(serviceKey);
+
+    protected virtual void ConfigureServices(IServiceCollection services) { }
+}
+```
+
+Highlights:
+
+- Inherits from `WebApplicationFactory<TProgram>` so it gets the entire ASP.NET Core minimal‑hosting + `IClassFixture` story for free.
+- Disables auto‑redirect on the `HttpClient` so tests assert on 302 statuses (the OIDC and tenant resolve middlewares depend on this).
+- Pushes the running `TestServer` into `ITestServerAccessor.Server` so any code resolved via DI inside a test can hit the in‑process server.
+- Overrides `CreateHost` to call `AddAppSettingsSecretsJson()` — a helper that adds a per‑project `appsettings.secrets.json` file from the user secrets store, so CI machines and developer machines pick up the same secret set.
+
+### Usage in xUnit
+
+```csharp
+public class MyApi_Tests : AbpWebApplicationFactoryIntegratedTest<Program>
+{
+    [Fact]
+    public async Task Should_Return_Forbidden_When_Anonymous()
+    {
+        var response = await Client.GetAsync("/api/identity/users");
+        response.StatusCode.ShouldBe(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task Should_Resolve_Current_Tenant_From_Cookie()
+    {
+        Client.DefaultRequestHeaders.Add("Cookie", "__tenant=acme");
+        var response = await Client.GetAsync("/api/abp/application-configuration");
+        var json = await response.Content.ReadAsStringAsync();
+        json.ShouldContain("acme");
+    }
+}
+```
+
+`TProgram` is the host's `Program` class (or `Startup`) — same as Microsoft's standard `WebApplicationFactory<T>` pattern.
+
+## `AbpAspNetCoreIntegratedTestBase<TStartupModule>` (legacy)
+
+```csharp
+[Obsolete("Use AbpWebApplicationFactoryIntegratedTest instead.")]
+public abstract class AbpAspNetCoreIntegratedTestBase<TStartupModule> : AbpTestBaseWithServiceProvider, IDisposable
+    where TStartupModule : class
+{
+    protected TestServer Server { get; }
+    protected HttpClient Client { get; }
+
+    private readonly IHost _host;
+
+    protected AbpAspNetCoreIntegratedTestBase()
+    {
+        var builder = CreateHostBuilder();
+        _host = builder.Build();
+        _host.Start();
+
+        Server = _host.GetTestServer();
+        Client = _host.GetTestClient();
+        ServiceProvider = Server.Services;
+
+        ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+    }
+
+    protected virtual IHostBuilder CreateHostBuilder()
+    {
+        return Host.CreateDefaultBuilder()
+            .AddAppSettingsSecretsJson()
+            .ConfigureWebHostDefaults(webBuilder =>
+            {
+                if (typeof(TStartupModule).IsAssignableTo<IAbpModule>())
+                {
+                    webBuilder.UseStartup<TestStartup<TStartupModule>>();
+                }
+                else
+                {
+                    webBuilder.UseStartup<TStartupModule>();
+                }
+                webBuilder.UseAbpTestServer();
+            })
+            .UseAutofac()
+            .ConfigureServices(ConfigureServices);
+    }
+}
+```
+
+Key differences from the modern variant:
+
+| Concern | `AbpAspNetCoreIntegratedTestBase` | `AbpWebApplicationFactoryIntegratedTest` |
+| --- | --- | --- |
+| Host builder | `Host.CreateDefaultBuilder()` | `WebApplicationFactory<T>` |
+| Test server | `Microsoft.AspNetCore.TestHost.TestServer` | Same, but managed by `WebApplicationFactory` |
+| DI container | Forces `UseAutofac()` | Inherits from the production host (typically also Autofac) |
+| Startup | Detects `IAbpModule` and wraps with `TestStartup<TStartupModule>` | Uses production `Program.cs` directly |
+| Fixture sharing | No | Yes — implements `IClassFixture`/`IAsyncLifetime` automatically |
+
+`AbpAspNetCoreAsyncIntegratedTestBase` adds `IAsyncLifetime` so async setup (e.g. seeding data) can happen before the first test method.
+
+## `TestStartup<TStartupModule>`
+
+When the legacy base receives an `AbpModule` rather than a Startup class, it wraps the module in a generated Startup at runtime. This is how `Volo.Abp.Identity.HttpApi.Tests` can pass the test module type as `TStartupModule` and still benefit from `UseStartup<T>()` semantics.
+
+## `ITestServerAccessor`
+
+```csharp
+public interface ITestServerAccessor
+{
+    TestServer Server { get; set; }
+}
+```
+
+The test host module registers a singleton implementation. Code anywhere in the application graph can resolve `ITestServerAccessor` and call `Server.CreateClient()` to issue additional HTTP requests inside the same test process. This is how `Volo.Abp.Http.Client.IntegrationTests.HttpApiClient` makes its real‑HTTP calls during tests — the HTTP client factory is patched to use the test server's pipeline.
+
+## `UseAbpTestServer()` and `AbpNoopHostLifetime`
+
+Together they make the host start without blocking:
+
+- `UseAbpTestServer()` (extension in `WebHostBuilderExtensions.cs`) calls `webBuilder.UseTestServer()` then registers `AbpNoopHostLifetime` as `IHostLifetime`.
+- `AbpNoopHostLifetime` returns `Task.CompletedTask` from `WaitForStartAsync` and `StopAsync` — so `_host.Start()` returns immediately and the test process keeps running.
+
+## `WebProjectPatchHelper`
+
+Test projects don't share the content root of the host. `WebProjectPatchHelper.PatchPath(...)` finds the host project on disk (via `*.csproj` lookup) and sets `IWebHostEnvironment.ContentRootPath` so embedded views, `appsettings.json` and `wwwroot/libs` resolve relative to the host, not relative to the test bin folder.
+
+## Patterns in module integration tests
+
+```csharp
+public class MyModuleTestBase : AbpWebApplicationFactoryIntegratedTest<Program>
+{
+    protected override void ConfigureServices(IServiceCollection services)
+    {
+        services.Replace(ServiceDescriptor.Singleton<IEmailSender, FakeEmailSender>());
+    }
+}
+
+public class UsersAppService_Tests : MyModuleTestBase
+{
+    private readonly IUsersAppService _usersAppService;
+
+    public UsersAppService_Tests()
+    {
+        _usersAppService = GetRequiredService<IUsersAppService>();
+    }
+    // ...
+}
+```
+
+The `ConfigureServices` override is the canonical place to swap real infrastructure with test doubles — e.g. replace `IEmailSender` with an in‑memory fake.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="Host module" icon="server" href="/aspnetcore/host-module">
+    The host module these tests boot — `AbpAspNetCoreModule` and friends.
+  </Card>
+  <Card title="MVC module" icon="cube" href="/aspnetcore/mvc-module">
+    The auto‑generated controllers and filters that integration tests exercise.
+  </Card>
+  <Card title="Multi‑tenancy" icon="building-user" href="/aspnetcore/multi-tenancy-middleware">
+    Tests typically set `__tenant` cookie / header to exercise tenant scopes — see the `CookieTenantResolveContributor` example above.
+  </Card>
+  <Card title="HTTP request pipeline" icon="route" href="/flows/http-request-pipeline">
+    The full request flow tests verify end‑to‑end with `HttpClient`.
+  </Card>
+</CardGroup>

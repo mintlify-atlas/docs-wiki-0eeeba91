@@ -1,0 +1,375 @@
+---
+title: "Volo.Abp.AspNetCore.Components.Server"
+sidebarTitle: "Blazor Server host"
+description: "Server-side Blazor wiring: AddServerSideBlazor, MapBlazorHub, the global bundle, AbpBlazorMessageLocalizerHelper, and the lookup-API request service."
+---
+
+`Volo.Abp.AspNetCore.Components.Server` and `Volo.Abp.AspNetCore.Components.Server.Theming` are the host adapter for **Blazor Server**. Blazor Server renders Razor Components on the server and pushes UI diffs to the browser over a SignalR hub at `/_blazor`. ABP's job here is to plug into that hub, wire up the application module, register host-specific replacements for shared abstractions, and bridge the global script/style bundles produced by the MVC bundling pipeline.
+
+<Info>
+**Packages**: [`framework/src/Volo.Abp.AspNetCore.Components.Server/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore.Components.Server) and [`framework/src/Volo.Abp.AspNetCore.Components.Server.Theming/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.AspNetCore.Components.Server.Theming)
+</Info>
+
+## Module wiring
+
+[`AbpAspNetCoreComponentsServerModule`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server/Volo/Abp/AspNetCore/Components/Server/AbpAspNetCoreComponentsServerModule.cs) is the host module. It chains the SignalR module, the HTTP client module, and the shared Web layer; then it registers the lookup-API HTTP client, calls `AddServerSideBlazor(...)`, exempts `/_blazor` from the UoW and auditing middlewares, and (in classic non-Blazor-Web-App mode) maps the SignalR hub plus a fallback to `/_Host`:
+
+```csharp
+[DependsOn(
+    typeof(AbpHttpClientModule),
+    typeof(AbpAspNetCoreComponentsWebModule),
+    typeof(AbpAspNetCoreSignalRModule),
+    typeof(AbpEventBusModule),
+    typeof(AbpAspNetCoreMvcContractsModule)
+    )]
+public class AbpAspNetCoreComponentsServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient(nameof(BlazorServerLookupApiRequestService))
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AutomaticDecompression = DecompressionMethods.All
+            });
+
+        var serverSideBlazorBuilder = context.Services.AddServerSideBlazor(options =>
+        {
+            if (context.Services.GetHostingEnvironment().IsDevelopment())
+            {
+                options.DetailedErrors = true;
+            }
+        });
+        context.Services.ExecutePreConfiguredActions(serverSideBlazorBuilder);
+
+        Configure<AbpAspNetCoreUnitOfWorkOptions>(options =>
+        {
+            options.IgnoredUrls.AddIfNotContains("/_blazor");
+        });
+
+        Configure<AbpAspNetCoreAuditingOptions>(options =>
+        {
+            options.IgnoredUrls.AddIfNotContains("/_blazor");
+        });
+
+        if (!context.Services.ExecutePreConfiguredActions<AbpAspNetCoreComponentsWebOptions>().IsBlazorWebApp)
+        {
+            var preConfigureActions = context.Services.GetPreConfigureActions<HttpConnectionDispatcherOptions>();
+            Configure<AbpEndpointRouterOptions>(options =>
+            {
+                options.EndpointConfigureActions.Add(endpointContext =>
+                {
+                    endpointContext.Endpoints.MapBlazorHub(httpConnectionDispatcherOptions =>
+                    {
+                        preConfigureActions.Configure(httpConnectionDispatcherOptions);
+                    });
+                    endpointContext.Endpoints.MapFallbackToPage("/_Host");
+                });
+            });
+        }
+    }
+}
+```
+
+Several details are worth calling out:
+
+- **`AddServerSideBlazor`** is called for you; `DetailedErrors = true` is enabled in `Development` so server-side exceptions surface in the browser.
+- **`ExecutePreConfiguredActions(serverSideBlazorBuilder)`** lets other ABP modules customize the `IServerSideBlazorBuilder` via `PreConfigureServices<IServerSideBlazorBuilder>(...)` without having to know the order of module dependencies.
+- **`/_blazor` is excluded from auditing and unit-of-work** — the hub is a long-lived bidirectional connection, not a one-shot HTTP request, so wrapping it would corrupt the UoW lifecycle.
+- **The `IsBlazorWebApp` gate** means the same package can be used both for a classic standalone Blazor Server app and inside a Blazor Web App that hosts the Server render mode through its own pipeline. When `IsBlazorWebApp = true` (set during `PreConfigureServices`), the module skips `MapBlazorHub`/`MapFallbackToPage` and lets the Web App's `AddInteractiveServerRenderMode()` handle endpoint mapping.
+
+## Application configuration cache reset
+
+[`BlazorServerCurrentApplicationConfigurationCacheResetService`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server/Volo/Abp/AspNetCore/Components/Server/Configuration/BlazorServerCurrentApplicationConfigurationCacheResetService.cs) replaces the null default and broadcasts a local event so every per-circuit cache refreshes its `ApplicationConfigurationDto` after a permission, feature, or setting change:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class BlazorServerCurrentApplicationConfigurationCacheResetService :
+    ICurrentApplicationConfigurationCacheResetService,
+    ITransientDependency
+{
+    private readonly ILocalEventBus _localEventBus;
+
+    public BlazorServerCurrentApplicationConfigurationCacheResetService(
+        ILocalEventBus localEventBus)
+    {
+        _localEventBus = localEventBus;
+    }
+
+    public async Task ResetAsync()
+    {
+        await _localEventBus.PublishAsync(
+            new CurrentApplicationConfigurationCacheResetEventData()
+        );
+    }
+}
+```
+
+A circuit subscribes to `CurrentApplicationConfigurationCacheResetEventData` and re-fetches `IAbpApplicationConfigurationAppService` on the next call. This is how the **Identity** module's "permissions changed" notification reaches every active connection.
+
+## Lookup-API requests (tiered and non-tiered)
+
+The Blazorise `ExtensionPropertyComponent` family supports remote lookup dropdowns — pick a country from a list served by another API, for example. On Blazor Server those requests originate inside the circuit, not the browser, so ABP needs a host-aware HTTP client. [`BlazorServerLookupApiRequestService`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server/Volo/Abp/AspNetCore/Components/Server/Extensibility/BlazorServerLookupApiRequestService.cs) handles both tiered (separate HTTP API host) and non-tiered (same host) deployments:
+
+```csharp
+public async Task<string> SendAsync(string url)
+{
+    var client = HttpClientFactory.CreateClient(nameof(BlazorServerLookupApiRequestService));
+    var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
+
+    var uri = new Uri(url, UriKind.RelativeOrAbsolute);
+    if (!uri.IsAbsoluteUri)
+    {
+        var remoteServiceConfig = await RemoteServiceConfigurationProvider
+            .GetConfigurationOrDefaultOrNullAsync("Default");
+
+        if (remoteServiceConfig != null)
+        {
+            // Blazor tiered mode
+            var baseUrl = remoteServiceConfig.BaseUrl;
+            client.BaseAddress = new Uri(baseUrl);
+            AddHeaders(requestMessage);
+            await HttpClientAuthenticator.Authenticate(
+                new RemoteServiceHttpClientAuthenticateContext(
+                    client, requestMessage,
+                    new RemoteServiceConfiguration(baseUrl),
+                    string.Empty));
+        }
+        else
+        {
+            // Blazor server mode
+            client.BaseAddress = new Uri(NavigationManager.BaseUri);
+            foreach (var header in HttpContextAccessor.HttpContext!.Request.Headers)
+            {
+                requestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+            }
+        }
+    }
+
+    var response = await client.SendAsync(requestMessage);
+    return await response.Content.ReadAsStringAsync();
+}
+```
+
+When a `RemoteServices:Default:BaseUrl` is configured, the service treats the request as a cross-host call and routes it through `IRemoteServiceHttpClientAuthenticator` — the same authenticator covered in [/http/http-client](/http/http-client). When no remote configuration is found, it falls back to "in-process" mode and copies the inbound `HttpContext` headers (including the auth cookie) onto the outbound request.
+
+The `AddHeaders` helper forwards the current tenant id and `Accept-Language`:
+
+```csharp
+protected virtual void AddHeaders(HttpRequestMessage requestMessage)
+{
+    if (CurrentTenant.Id.HasValue)
+    {
+        requestMessage.Headers.Add(TenantResolverConsts.DefaultTenantKey,
+                                   CurrentTenant.Id.Value.ToString());
+    }
+
+    var currentCulture = CultureInfo.CurrentUICulture.Name ?? CultureInfo.CurrentCulture.Name;
+    if (!currentCulture.IsNullOrEmpty())
+    {
+        requestMessage.Headers.AcceptLanguage.Add(new(currentCulture));
+    }
+}
+```
+
+## Cookie-auth + introspection helper
+
+For tiered Blazor Server hosts that authenticate against an external OpenIddict/IdentityServer authority, [`CookieAuthenticationOptionsExtensions.IntrospectAccessToken`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server/Microsoft/AspNetCore/Authentication/Cookies/CookieAuthenticationOptionsExtensions.cs) wires the cookie scheme's `OnValidatePrincipal` event to introspect the cached access token on every request:
+
+```csharp
+public static CookieAuthenticationOptions IntrospectAccessToken(
+    this CookieAuthenticationOptions options,
+    string oidcAuthenticationScheme = "oidc")
+{
+    options.Events.OnValidatePrincipal = async principalContext =>
+    {
+        // ...
+        var accessToken = principalContext.Properties.GetTokenValue("access_token");
+        if (!accessToken.IsNullOrWhiteSpace())
+        {
+            var openIdConnectOptions = await GetOpenIdConnectOptions(principalContext, oidcAuthenticationScheme);
+            var response = await openIdConnectOptions.Backchannel.IntrospectTokenAsync(
+                new TokenIntrospectionRequest
+                {
+                    Address = openIdConnectOptions.Configuration?.IntrospectionEndpoint
+                              ?? openIdConnectOptions.Authority!.EnsureEndsWith('/') + "connect/introspect",
+                    ClientId = openIdConnectOptions.ClientId!,
+                    // ...
+                });
+            // reject principal if response.IsActive is false
+        }
+    };
+    return options;
+}
+```
+
+You opt in from `ConfigureServices`:
+
+```csharp
+services.AddAuthentication(...)
+    .AddCookie("Cookies", options =>
+    {
+        options.IntrospectAccessToken("oidc");
+    })
+    .AddOpenIdConnect("oidc", options => { ... });
+```
+
+This is how a long-lived Blazor circuit detects that its remote access token has been revoked and forces a re-login.
+
+## Global script and style bundles
+
+[`AbpAspNetCoreComponentsServerThemingModule`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server.Theming/AbpAspNetCoreComponentsServerThemingModule.cs) layers on the **bundling** half of the host. It depends on `AbpAspNetCoreMvcUiBundlingModule` (the runtime bundling pipeline used by MVC) and registers two bundles named after constants on `BlazorStandardBundles`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsServerModule),
+    typeof(AbpAspNetCoreMvcUiPackagesModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpAspNetCoreMvcUiBundlingModule)
+    )]
+public class AbpAspNetCoreComponentsServerThemingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options
+                .StyleBundles
+                .Add(BlazorStandardBundles.Styles.Global, bundle =>
+                {
+                    bundle.AddContributors(typeof(BlazorGlobalStyleContributor));
+                });
+
+            options
+                .ScriptBundles
+                .Add(BlazorStandardBundles.Scripts.Global, bundle =>
+                {
+                    bundle.AddContributors(typeof(BlazorGlobalScriptContributor));
+                });
+        });
+    }
+}
+```
+
+The bundle names are:
+
+```csharp
+public class BlazorStandardBundles
+{
+    public static class Styles  { public static string Global = "Blazor.Global"; }
+    public static class Scripts { public static string Global = "Blazor.Global"; }
+}
+```
+
+`_Host.cshtml` typically renders these bundles using `<abp-style-bundle name="@BlazorStandardBundles.Styles.Global" />` and `<abp-script-bundle name="@BlazorStandardBundles.Scripts.Global" />`. Because Blazor Server reuses the MVC bundling pipeline, the existing minification, hashing, and `wwwroot` fallback behavior covered in [/aspnetcore/mvc-ui-bundling](/aspnetcore/mvc-ui-bundling) applies unchanged.
+
+### Component bundle manager
+
+[`BlazorServerComponentBundleManager`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Server.Theming/Bundling/BlazorServerComponentBundleManager.cs) is the implementation of the shared `IComponentBundleManager` abstraction:
+
+```csharp
+public class BlazorServerComponentBundleManager : IComponentBundleManager, ITransientDependency
+{
+    protected IBundleManager BundleManager { get; }
+
+    public BlazorServerComponentBundleManager(IBundleManager bundleManager)
+    {
+        BundleManager = bundleManager;
+    }
+
+    public virtual async Task<IReadOnlyList<string>> GetStyleBundleFilesAsync(string bundleName)
+    {
+        return (await BundleManager.GetStyleBundleFilesAsync(bundleName))
+            .Select(f => f.FileName).ToList();
+    }
+
+    public virtual async Task<IReadOnlyList<string>> GetScriptBundleFilesAsync(string bundleName)
+    {
+        return (await BundleManager.GetScriptBundleFilesAsync(bundleName))
+            .Select(f => f.FileName).ToList();
+    }
+}
+```
+
+On Server, the implementation simply forwards to the MVC `IBundleManager` and strips the `BundleFile.FileName` from each result. The `AbpScripts.razor` / `AbpStyles.razor` components (from `Volo.Abp.AspNetCore.Components.Web.Theming.Bundling`) call this and render the resolved files as `<script>` / `<link>` tags.
+
+## AbpBlazorMessageLocalizerHelper
+
+Although it is declared in `Volo.Abp.AspNetCore.Components.Web`, the [`AbpBlazorMessageLocalizerHelper<T>`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.AspNetCore.Components.Web/Volo/Abp/AspNetCore/Components/Web/AbpBlazorMessageLocalizerHelper.cs) helper lights up first on Server. It is registered as a singleton in `AbpBlazoriseUIModule`:
+
+```csharp
+context.Services.AddSingleton(typeof(AbpBlazorMessageLocalizerHelper<>));
+```
+
+…and consumed by Blazorise's dialog and notification stack to localize the canned `Ok`/`Cancel`/`Confirm` strings. The helper performs a two-pass localization: it first tries to resolve `DisplayName:{argument}` (so a field name like `UserName` is rendered using the existing field localization key); only if that misses does it fall back to `{argument}` directly:
+
+```csharp
+private IEnumerable<object> LocalizeMessageArguments(List<string> arguments)
+{
+    foreach (var argument in arguments)
+    {
+        var localization = stringLocalizer[$"DisplayName:{argument}"];
+        if (localization.ResourceNotFound)
+        {
+            localization = stringLocalizer[argument];
+        }
+        yield return localization;
+    }
+}
+```
+
+On Server, where there is exactly one set of localization resources per request, this is straightforward. On WebAssembly the same singleton is used but the underlying `IStringLocalizer` is fed by the cached `ApplicationConfigurationDto.Localization.Resources`.
+
+## Host project shape
+
+A typical Blazor Server host built with ABP has three pieces:
+
+<Steps>
+  <Step title="Host module">
+    A class deriving from `AbpModule` annotated with `[DependsOn(typeof(AbpAspNetCoreComponentsServerThemingModule), typeof(MyApplicationModule), typeof(MyHttpApiClientModule))]`. The module sets `options.AppAssembly = typeof(MyHostModule).Assembly` on `AbpRouterOptions` so the `<Router>` can find routable components.
+  </Step>
+  <Step title="`_Host.cshtml`">
+    A Razor Page that emits the HTML scaffolding (`<head>`, `<body>`), invokes `<abp-style-bundle name="@BlazorStandardBundles.Styles.Global" />` and `<abp-script-bundle name="@BlazorStandardBundles.Scripts.Global" />`, and renders `<component type="typeof(App)" render-mode="ServerPrerendered" />`. `MapFallbackToPage("/_Host")` makes every unmapped URL render `_Host.cshtml`.
+  </Step>
+  <Step title="`App.razor`">
+    A top-level component using `<Router AppAssembly="@_options.Value.AppAssembly" AdditionalAssemblies="@_options.Value.AdditionalAssemblies">` and `<RouteView DefaultLayout="@typeof(MainLayout)" />`. `MainLayout` typically resolves at runtime via `IThemeManager.CurrentTheme.GetLayout(StandardLayouts.Application)`.
+  </Step>
+</Steps>
+
+## Blazor Web App mode
+
+To run inside a .NET 8+ Blazor Web App you set `IsBlazorWebApp = true` on `AbpAspNetCoreComponentsWebOptions` during `PreConfigureServices`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<AbpAspNetCoreComponentsWebOptions>(options =>
+    {
+        options.IsBlazorWebApp = true;
+    });
+}
+```
+
+The Server module then skips `MapBlazorHub` and lets `app.MapRazorComponents<App>().AddInteractiveServerRenderMode()` handle endpoint mapping. The bundles, lookup-API service, and Localizer helper are unaffected.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Shared Web components" icon="cube" href="/blazor/components-web">
+    The `AbpComponentBase`, layout, and toolbar primitives this host depends on.
+  </Card>
+  <Card title="WebAssembly host" icon="browser" href="/blazor/components-webassembly">
+    The same module shape, but with `AddApplicationAsync<TModule>` instead of `MapBlazorHub`.
+  </Card>
+  <Card title="MVC UI bundling" icon="boxes-stacked" href="/aspnetcore/mvc-ui-bundling">
+    The runtime `IBundleManager` Server's `BlazorServerComponentBundleManager` forwards to.
+  </Card>
+  <Card title="HTTP client" icon="cloud" href="/http/http-client">
+    Where `IRemoteServiceConfigurationProvider` and `IRemoteServiceHttpClientAuthenticator` are documented.
+  </Card>
+  <Card title="ASP.NET Core host module" icon="globe" href="/aspnetcore/host-module">
+    The shared MVC host module that Blazor Server cooperates with.
+  </Card>
+  <Card title="SignalR module" icon="bolt" href="/aspnetcore/signalr">
+    `AbpAspNetCoreSignalRModule`, brought in transitively.
+  </Card>
+</CardGroup>

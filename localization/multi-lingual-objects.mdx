@@ -1,0 +1,613 @@
+---
+title: "Resources, JSON dictionaries, and multi-lingual entities"
+sidebarTitle: "Resources & Entities"
+description: "AbpLocalizationOptions, LocalizationResource, JSON virtual-file contributors, AbpStringLocalizerFactory caching, and IMultiLingualObject<TTranslation>."
+---
+
+This page covers the runtime that `Volo.Abp.Localization.Abstractions` only sketches: the options object that holds every resource, the JSON loader that produces dictionaries from virtual files, the `IStringLocalizerFactory` replacement that wires both together, and — adjacent but related — the `Volo.Abp.MultiLingualObjects` package for entities that carry their own per-language rows.
+
+## Source layout
+
+```
+framework/src/Volo.Abp.Localization/Volo/Abp/Localization/
+├── AbpLocalizationModule.cs
+├── AbpLocalizationOptions.cs
+├── AbpLocalizationOptionsExtensions.cs
+├── LocalizationResource.cs
+├── LocalizationResourceBase.cs
+├── LocalizationResourceDictionary.cs
+├── LocalizationResourceContributorList.cs
+├── LocalizationResourceExtensions.cs            # AddVirtualJson, AddBaseTypes, AddDynamic
+├── AbpStringLocalizerFactory.cs                 # IStringLocalizerFactory replacement
+├── AbpDictionaryBasedStringLocalizer.cs
+├── DefaultResource.cs                           # the fallback resource
+├── DefaultLanguageProvider.cs
+├── Json/
+│   ├── JsonLocalizationDictionaryBuilder.cs
+│   └── JsonLocalizationFile.cs
+└── VirtualFiles/
+    ├── VirtualFileLocalizationResourceContributorBase.cs
+    └── Json/JsonVirtualFileLocalizationResourceContributor.cs
+
+framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/
+├── AbpMultiLingualObjectsModule.cs
+├── IMultiLingualObject.cs
+├── IObjectTranslation.cs
+├── IMultiLingualObjectManager.cs
+└── MultiLingualObjectManager.cs
+```
+
+## `AbpLocalizationModule`
+
+The module is small and worth reading top to bottom — it shows the three things the localization runtime does at startup:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpLocalizationModule.cs
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpSettingsModule),
+    typeof(AbpLocalizationAbstractionsModule),
+    typeof(AbpThreadingModule)
+    )]
+public class AbpLocalizationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        AbpStringLocalizerFactory.Replace(context.Services);
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpLocalizationModule>("Volo.Abp", "Volo/Abp");
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources.Add<DefaultResource>("en");
+            options.Resources
+                .Add<AbpLocalizationResource>("en")
+                .AddVirtualJson("/Localization/Resources/AbpLocalization");
+        });
+    }
+}
+```
+
+`AbpStringLocalizerFactory.Replace(...)` swaps the framework's `ResourceManagerStringLocalizerFactory` for ABP's version in the DI container. From then on, every `IStringLocalizer<T>` resolution goes through ABP.
+
+## `AbpLocalizationOptions`
+
+This is the only options class the localization runtime reads. Every public surface — resources, languages, fallback flags — sits on it.
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpLocalizationOptions.cs
+public class AbpLocalizationOptions
+{
+    public LocalizationResourceDictionary Resources { get; }
+
+    /// <summary>
+    /// Used as the default resource when resource was not specified on a localization operation.
+    /// </summary>
+    public Type? DefaultResourceType { get; set; }
+
+    public ITypeList<ILocalizationResourceContributor> GlobalContributors { get; }
+
+    public List<LanguageInfo> Languages { get; }
+
+    public Dictionary<string, List<NameValue>> LanguagesMap { get; }
+
+    public Dictionary<string, List<NameValue>> LanguageFilesMap { get; }
+
+    public bool TryToGetFromBaseCulture { get; set; }
+
+    public bool TryToGetFromDefaultCulture { get; set; }
+
+    public AbpLocalizationOptions()
+    {
+        Resources = new LocalizationResourceDictionary();
+        GlobalContributors = new TypeList<ILocalizationResourceContributor>();
+        Languages = new List<LanguageInfo>();
+        LanguagesMap = new Dictionary<string, List<NameValue>>();
+        LanguageFilesMap = new Dictionary<string, List<NameValue>>();
+        TryToGetFromBaseCulture = true;
+        TryToGetFromDefaultCulture = true;
+    }
+}
+```
+
+| Property                     | Purpose                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `Resources`                  | Every resource type the host or its dependencies have registered. Keyed by **resource name**. |
+| `DefaultResourceType`        | Used by `LocalizableString` when no resource is specified — the "anywhere fallback".          |
+| `GlobalContributors`         | Contributors added to **every** resource (e.g. an in-memory store applied app-wide).          |
+| `Languages`                  | Returned by `DefaultLanguageProvider`. The set the UI's language switcher shows.              |
+| `LanguagesMap`               | Per-package alias map for language codes (e.g. ABP `zh-Hans` ↔ some package's `zh-CN`).       |
+| `LanguageFilesMap`           | Per-package alias map for **file names** when the package uses a different file-naming scheme.|
+| `TryToGetFromBaseCulture`    | If `true`, `tr-TR` falls back to `tr` (defaults `true`).                                      |
+| `TryToGetFromDefaultCulture` | If `true`, missing keys fall back to the resource's `DefaultCultureName` (defaults `true`).   |
+
+## `LocalizationResource` and `LocalizationResourceBase`
+
+A resource is *a named bag of contributors plus base-resource pointers*. Look at the base type first:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/LocalizationResourceBase.cs
+public abstract class LocalizationResourceBase
+{
+    [NotNull] public string ResourceName { get; }
+    public List<string> BaseResourceNames { get; }
+    public string? DefaultCultureName { get; set; }
+    [NotNull] public LocalizationResourceContributorList Contributors { get; }
+
+    public LocalizationResourceBase(
+        [NotNull] string resourceName,
+        string? defaultCultureName = null,
+        ILocalizationResourceContributor? initialContributor = null)
+    {
+        ResourceName = Check.NotNullOrWhiteSpace(resourceName, nameof(resourceName));
+        DefaultCultureName = defaultCultureName;
+        Contributors = new LocalizationResourceContributorList();
+        BaseResourceNames = new();
+        if (initialContributor != null)
+            Contributors.Add(initialContributor);
+    }
+}
+```
+
+The typed `LocalizationResource` adds the marker `Type` and automatically picks up base resources declared with `[InheritResource(typeof(OtherResource))]`:
+
+```csharp
+// LocalizationResource.cs
+public class LocalizationResource : LocalizationResourceBase
+{
+    [NotNull] public Type ResourceType { get; }
+
+    public LocalizationResource(
+        [NotNull] Type resourceType,
+        string? defaultCultureName = null,
+        ILocalizationResourceContributor? initialContributor = null)
+        : base(
+            LocalizationResourceNameAttribute.GetName(resourceType),
+            defaultCultureName,
+            initialContributor)
+    {
+        ResourceType = Check.NotNull(resourceType, nameof(resourceType));
+        AddBaseResourceTypes();
+    }
+
+    protected virtual void AddBaseResourceTypes()
+    {
+        var descriptors = ResourceType
+            .GetCustomAttributes(true)
+            .OfType<IInheritedResourceTypesProvider>();
+
+        foreach (var descriptor in descriptors)
+            foreach (var baseResourceType in descriptor.GetInheritedResourceTypes())
+                BaseResourceNames.AddIfNotContains(
+                    LocalizationResourceNameAttribute.GetName(baseResourceType));
+    }
+}
+```
+
+`NonTypedLocalizationResource` exists for resources identified by **name only** (the dynamic / saas scenario where there is no marker class).
+
+### Adding a resource
+
+`LocalizationResourceDictionary.Add<T>` is the entry point used in `Configure<AbpLocalizationOptions>`:
+
+```csharp
+public LocalizationResource Add<TResource>(string? defaultCultureName = null)
+    => Add(typeof(TResource), defaultCultureName);
+
+public LocalizationResource Add(Type resourceType, string? defaultCultureName = null)
+{
+    var resourceName = LocalizationResourceNameAttribute.GetName(resourceType);
+    if (ContainsKey(resourceName))
+        throw new AbpException("This resource is already added before: " + resourceType.AssemblyQualifiedName);
+
+    var resource = new LocalizationResource(resourceType, defaultCultureName);
+    this[resourceName] = resource;
+    _resourcesByTypes[resourceType] = resource;
+    return resource;
+}
+```
+
+It returns the resource so you can chain contributor adds — almost always `AddVirtualJson`:
+
+```csharp
+options.Resources
+    .Add<BookStoreResource>("en")
+    .AddVirtualJson("/Localization/BookStore");
+```
+
+## Contributors — `LocalizationResourceContributorList`
+
+A contributor is anything that can fill a per-culture dictionary or answer "do you have key `X` in culture `Y`?":
+
+```csharp
+public interface ILocalizationResourceContributor
+{
+    bool IsDynamic { get; }
+    void Initialize(LocalizationResourceInitializationContext context);
+    LocalizedString? GetOrNull(string cultureName, string name);
+    void Fill(string cultureName, Dictionary<string, LocalizedString> dictionary);
+    Task FillAsync(string cultureName, Dictionary<string, LocalizedString> dictionary);
+    Task<IEnumerable<string>> GetSupportedCulturesAsync();
+}
+```
+
+The contributor list reverses iteration order so that **later** registrations win — that's how a host can override a base module's translation:
+
+```csharp
+// LocalizationResourceContributorList.cs
+public LocalizedString? GetOrNull(
+    string cultureName,
+    string name,
+    bool includeDynamicContributors = true)
+{
+    foreach (var contributor in this.Select(x => x).Reverse())
+    {
+        if (!includeDynamicContributors && contributor.IsDynamic)
+            continue;
+
+        var localString = contributor.GetOrNull(cultureName, name);
+        if (localString != null)
+            return localString;
+    }
+    return null;
+}
+```
+
+## The JSON loader
+
+ABP's canonical contributor is `JsonVirtualFileLocalizationResourceContributor`. It scans a [virtual file system](/ui/virtual-file-system) folder for `.json` files and parses each one with `JsonLocalizationDictionaryBuilder`:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/VirtualFiles/Json/JsonVirtualFileLocalizationResourceContributor.cs
+public class JsonVirtualFileLocalizationResourceContributor : VirtualFileLocalizationResourceContributorBase
+{
+    public JsonVirtualFileLocalizationResourceContributor(string virtualPath) : base(virtualPath) { }
+
+    protected override bool CanParseFile(IFileInfo file)
+        => file.Name.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+
+    protected override ILocalizationDictionary? CreateDictionaryFromFileContent(string jsonString)
+        => JsonLocalizationDictionaryBuilder.BuildFromJsonString(jsonString);
+}
+```
+
+`JsonLocalizationDictionaryBuilder` is the actual parser — it takes the `{ "culture": "...", "texts": { ... } }` schema and produces a flat dictionary, including dotted/object-style nested keys flattened with `__`:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/Json/JsonLocalizationDictionaryBuilder.cs
+public static ILocalizationDictionary? BuildFromJsonString(string jsonString)
+{
+    JsonLocalizationFile? jsonFile;
+    try
+    {
+        jsonFile = JsonSerializer.Deserialize<JsonLocalizationFile>(jsonString, DeserializeOptions);
+    }
+    catch (JsonException ex)
+    {
+        throw new AbpException("Can not parse json string. " + ex.Message);
+    }
+
+    var cultureCode = jsonFile.Culture;
+    if (string.IsNullOrEmpty(cultureCode)) return null;
+
+    var dictionary = new Dictionary<string, LocalizedString>();
+    var duplicateNames = new List<string>();
+
+    foreach (var item in FlattenTexts(jsonFile.Texts))
+    {
+        if (dictionary.GetOrDefault(item.Key) != null)
+            duplicateNames.Add(item.Key);
+        dictionary[item.Key] = new LocalizedString(item.Key, item.Value.NormalizeLineEndings());
+    }
+
+    if (duplicateNames.Count > 0)
+        throw new AbpException(
+            "A dictionary can not contain same key twice. There are some duplicated names: "
+            + duplicateNames.JoinAsString(", "));
+
+    return new StaticLocalizationDictionary(cultureCode, dictionary);
+}
+```
+
+The JSON file is the schema everyone copies:
+
+```json
+{
+  "culture": "en",
+  "texts": {
+    "Welcome": "Welcome to the Book Store",
+    "Menu": {
+      "Books": "Books",
+      "Authors": "Authors"
+    }
+  }
+}
+```
+
+After flattening: `Welcome`, `Menu__Books`, `Menu__Authors`. The deserializer is case-insensitive, allows trailing commas, and skips comments — convenient for hand-edited files.
+
+### `AddVirtualJson`
+
+```csharp
+options.Resources
+    .Add<BookStoreResource>("en")
+    .AddVirtualJson("/Localization/BookStore");
+```
+
+`AddVirtualJson` is an extension on `LocalizationResourceBase` that appends a `JsonVirtualFileLocalizationResourceContributor` for the given virtual path. Combined with `AddEmbedded<TModule>` in `AbpVirtualFileSystemOptions`, this is the entire wiring needed for a module to ship translations as embedded resources.
+
+## `AbpStringLocalizerFactory`
+
+The replacement factory implements both `IStringLocalizerFactory` and `IAbpStringLocalizerFactory`. The cache is keyed by **resource name** (not `Type`) because dynamic / `NonTypedLocalizationResource` paths use the same cache:
+
+```csharp
+// framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpStringLocalizerFactory.cs
+public class AbpStringLocalizerFactory : IStringLocalizerFactory, IAbpStringLocalizerFactory
+{
+    protected internal AbpLocalizationOptions AbpLocalizationOptions { get; }
+    protected ResourceManagerStringLocalizerFactory InnerFactory { get; }
+    protected IServiceProvider ServiceProvider { get; }
+    protected IExternalLocalizationStore ExternalLocalizationStore { get; }
+    protected ConcurrentDictionary<string, StringLocalizerCacheItem> LocalizerCache { get; }
+    protected SemaphoreSlim LocalizerCacheSemaphore { get; } = new(1, 1);
+
+    public AbpStringLocalizerFactory(
+        ResourceManagerStringLocalizerFactory innerFactory,
+        IOptions<AbpLocalizationOptions> abpLocalizationOptions,
+        IServiceProvider serviceProvider,
+        IExternalLocalizationStore externalLocalizationStore)
+    {
+        InnerFactory = innerFactory;
+        ServiceProvider = serviceProvider;
+        ExternalLocalizationStore = externalLocalizationStore;
+        AbpLocalizationOptions = abpLocalizationOptions.Value;
+        LocalizerCache = new ConcurrentDictionary<string, StringLocalizerCacheItem>();
+    }
+
+    public virtual IStringLocalizer Create(Type resourceType)
+        => Create(resourceType, lockCache: true);
+
+    private IStringLocalizer Create(Type resourceType, bool lockCache)
+    {
+        var resource = AbpLocalizationOptions.Resources.GetOrNull(resourceType);
+        if (resource == null)
+            return InnerFactory.Create(resourceType);
+        // ... build AbpDictionaryBasedStringLocalizer, cache it, return
+    }
+}
+```
+
+`Create(Type)` falls through to the original `ResourceManagerStringLocalizerFactory` when the type is not a registered ABP resource — that's how `IStringLocalizer<T>` for a non-resource class keeps working.
+
+The `IAbpStringLocalizerFactory` overloads add:
+
+```csharp
+public virtual IStringLocalizer? CreateDefaultOrNull()
+{
+    return AbpLocalizationOptions.DefaultResourceType == null
+        ? null
+        : Create(AbpLocalizationOptions.DefaultResourceType);
+}
+
+public virtual IStringLocalizer? CreateByResourceNameOrNull(string resourceName)
+{
+    var resource = AbpLocalizationOptions.Resources.GetOrNull(resourceName);
+    return resource == null ? null : CreateInternal(resource);
+}
+```
+
+The localizer it returns, `AbpDictionaryBasedStringLocalizer`, walks the contributor list per culture, then applies the fallback chain controlled by `TryToGetFromBaseCulture` and `TryToGetFromDefaultCulture`.
+
+## `DefaultResource` — the empty fallback
+
+Modules sometimes need to register strings without owning a resource. ABP ships an empty `DefaultResource` that every module's contributors can target — this is what gives you cross-module fallback:
+
+```csharp
+public class DefaultResource { }
+```
+
+It is added in `AbpLocalizationModule.ConfigureServices` and consulted by `LocalizableString.Localize` when the primary resource misses.
+
+## Multi-lingual objects — entities with their own translations
+
+When a *piece of data* (not a label) varies per language — a CMS page title, a blog post body, a tag name — the right shape is "one entity, many translation rows". `Volo.Abp.MultiLingualObjects` formalizes that pattern with two interfaces and a manager.
+
+### `IObjectTranslation` and `IMultiLingualObject<TTranslation>`
+
+```csharp
+// framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IObjectTranslation.cs
+public interface IObjectTranslation
+{
+    string Language { get; set; }
+}
+
+// IMultiLingualObject.cs
+public interface IMultiLingualObject<TTranslation>
+    where TTranslation : class, IObjectTranslation
+{
+    ICollection<TTranslation> Translations { get; set; }
+}
+```
+
+A typical use looks like:
+
+```csharp
+public class Article : AggregateRoot<Guid>, IMultiLingualObject<ArticleTranslation>
+{
+    public string Slug { get; set; }
+    public DateTime PublishedAt { get; set; }
+    public ICollection<ArticleTranslation> Translations { get; set; } = new List<ArticleTranslation>();
+}
+
+public class ArticleTranslation : Entity, IObjectTranslation
+{
+    public string Language { get; set; }       // e.g. "en", "tr-TR"
+    public string Title { get; set; }
+    public string Body { get; set; }
+}
+```
+
+This is the contract that [CMS Kit](/modules/cms-kit/overview) entities (pages, blog posts, tags) implement.
+
+### `IMultiLingualObjectManager`
+
+The manager picks the right translation for the current request, falling back through parent cultures and finally to the application's default language. The interface:
+
+```csharp
+// framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IMultiLingualObjectManager.cs
+public interface IMultiLingualObjectManager
+{
+    Task<TTranslation?> GetTranslationAsync<TMultiLingual, TTranslation>(
+        TMultiLingual multiLingual,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+
+    Task<TTranslation?> GetTranslationAsync<TTranslation>(
+        IEnumerable<TTranslation> translations,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<TTranslation?>> GetBulkTranslationsAsync<TTranslation>(
+        IEnumerable<IEnumerable<TTranslation>> translationsCombined,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<(TMultiLingual entity, TTranslation? translation)>> GetBulkTranslationsAsync<TMultiLingual, TTranslation>(
+        IEnumerable<TMultiLingual> multiLinguals,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+}
+```
+
+### `MultiLingualObjectManager`
+
+The default implementation reads the active culture, then walks the parent culture chain (with a maximum depth), then falls back to the default language **read from settings** (`LocalizationSettingNames.DefaultLanguage`), then finally to the first translation in the list:
+
+```csharp
+// framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs
+public class MultiLingualObjectManager : IMultiLingualObjectManager, ITransientDependency
+{
+    protected ISettingProvider SettingProvider { get; }
+    protected const int MaxCultureFallbackDepth = 5;
+
+    public MultiLingualObjectManager(ISettingProvider settingProvider)
+    {
+        SettingProvider = settingProvider;
+    }
+
+    public virtual async Task<TTranslation?> GetTranslationAsync<TTranslation>(
+        IEnumerable<TTranslation>? translations,
+        string? culture,
+        bool fallbackToParentCultures)
+        where TTranslation : class, IObjectTranslation
+    {
+        culture ??= CultureInfo.CurrentUICulture.Name;
+
+        if (translations == null || !translations.Any())
+            return null;
+
+        var translation = translations.FirstOrDefault(pt => pt.Language == culture);
+        if (translation != null) return translation;
+
+        if (fallbackToParentCultures)
+        {
+            translation = GetTranslationBasedOnCulturalRecursive(
+                CultureInfo.CurrentUICulture.Parent, translations, 0);
+            if (translation != null) return translation;
+        }
+
+        var defaultLanguage = await SettingProvider.GetOrNullAsync(
+            LocalizationSettingNames.DefaultLanguage);
+
+        translation = translations.FirstOrDefault(pt => pt.Language == defaultLanguage);
+        if (translation != null) return translation;
+
+        return translations.FirstOrDefault();
+    }
+
+    protected virtual TTranslation? GetTranslationBasedOnCulturalRecursive<TTranslation>(
+        CultureInfo? culture, IEnumerable<TTranslation>? translations, int currentDepth)
+        where TTranslation : class, IObjectTranslation
+    {
+        if (culture == null ||
+            culture.Name.IsNullOrWhiteSpace() ||
+            translations == null || !translations.Any() ||
+            currentDepth > MaxCultureFallbackDepth)
+            return null;
+
+        var translation = translations.FirstOrDefault(
+            pt => pt.Language.Equals(culture.Name, StringComparison.OrdinalIgnoreCase));
+        return translation
+            ?? GetTranslationBasedOnCulturalRecursive(culture.Parent, translations, currentDepth + 1);
+    }
+}
+```
+
+The bulk overload (`GetBulkTranslationsAsync`) exists so a list view doesn't pay N+1 setting lookups — it resolves `defaultLanguage` once.
+
+### Using it in an application service
+
+```csharp
+public class ArticleAppService : ApplicationService
+{
+    private readonly IRepository<Article, Guid> _repository;
+    private readonly IMultiLingualObjectManager _multiLingual;
+
+    public ArticleAppService(
+        IRepository<Article, Guid> repository,
+        IMultiLingualObjectManager multiLingual)
+    {
+        _repository = repository;
+        _multiLingual = multiLingual;
+    }
+
+    public async Task<ArticleDto> GetAsync(Guid id)
+    {
+        var article = await _repository.GetAsync(id);
+        var translation = await _multiLingual
+            .GetTranslationAsync<Article, ArticleTranslation>(article);
+
+        return new ArticleDto
+        {
+            Id = article.Id,
+            Slug = article.Slug,
+            Title = translation?.Title,
+            Body = translation?.Body
+        };
+    }
+}
+```
+
+### The module
+
+```csharp
+[DependsOn(typeof(AbpLocalizationModule))]
+public class AbpMultiLingualObjectsModule : AbpModule
+{
+}
+```
+
+Nothing else — the manager is registered through the conventional `ITransientDependency` interface.
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Abstractions" icon="cube" href="/localization/abstractions">
+    `ILocalizableString`, `LanguageInfo`, `IAbpStringLocalizerFactory`.
+  </Card>
+  <Card title="Virtual file system" icon="folder-tree" href="/ui/virtual-file-system">
+    How `AddVirtualJson("/Localization/BookStore")` resolves at runtime.
+  </Card>
+  <Card title="CMS Kit" icon="newspaper" href="/modules/cms-kit/overview">
+    A first-party consumer of `IMultiLingualObject<TTranslation>`.
+  </Card>
+</CardGroup>

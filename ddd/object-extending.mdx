@@ -1,0 +1,409 @@
+---
+title: "Volo.Abp.ObjectExtending: Extensible Entities and DTOs"
+sidebarTitle: "Object Extending"
+description: "ObjectExtensionManager, ExtensibleObject, ExtensibleEntityDto, IHasExtraProperties and ExtraPropertyDictionary — ABP's module extension story."
+---
+
+The `Volo.Abp.ObjectExtending` package, located at `framework/src/Volo.Abp.ObjectExtending/`, is ABP's answer to the question "how do you extend an entity or DTO that lives in a reusable module without forking the module's source?". The answer is a property bag — `ExtraPropertyDictionary` — combined with a central registry (`ObjectExtensionManager`) that knows what extra properties exist for each type, plus marker interfaces (`IHasExtraProperties`, the `ExtensibleObject` base class) that opt your classes into the system. This is the foundation that makes `IdentityUser` extensible from the BookStore module, `UserDto` round-trip a `Department` value over HTTP, and admin UIs generate dynamic forms from extension metadata.
+
+This page walks the data types, the manager, the property registration model, the mapper bridge, and the extension hooks used by EF Core / MongoDB.
+
+## Folder map
+
+```
+framework/src/Volo.Abp.ObjectExtending/Volo/Abp/
+├── Data/
+│   ├── ExtraPropertyDictionary.cs
+│   ├── ExtraPropertyDictionaryExtensions.cs
+│   ├── HasExtraPropertiesExtensions.cs
+│   └── IHasExtraProperties.cs
+└── ObjectExtending/
+    ├── AbpObjectExtendingModule.cs
+    ├── ExtensibleObject.cs
+    ├── ExtensibleObjectMapper.cs
+    ├── ExtensibleObjectValidator.cs
+    ├── ExtensionPropertyFeaturePolicyConfiguration.cs
+    ├── ExtensionPropertyGlobalFeaturePolicyConfiguration.cs
+    ├── ExtensionPropertyHelper.cs
+    ├── ExtensionPropertyPermissionPolicyConfiguration.cs
+    ├── ExtensionPropertyPolicyChecker.cs
+    ├── ExtensionPropertyPolicyConfiguration.cs
+    ├── HasExtraPropertiesObjectExtendingExtensions.cs
+    ├── IBasicObjectExtensionPropertyInfo.cs
+    ├── MappingPropertyDefinitionChecks.cs
+    ├── ModuleObjectExtensionManagerExtensions.cs
+    ├── ObjectExtensionInfo.cs
+    ├── ObjectExtensionManager.cs
+    ├── ObjectExtensionManagerExtensions.cs
+    ├── ObjectExtensionPropertyInfo.cs
+    ├── ObjectExtensionPropertyInfoExtensions.cs
+    ├── ObjectExtensionPropertyValidationContext.cs
+    ├── ObjectExtensionValidationContext.cs
+    └── Modularity/ (EntityExtensionConfiguration etc.)
+```
+
+## AbpObjectExtendingModule
+
+```csharp
+// AbpObjectExtendingModule.cs
+[DependsOn(
+    typeof(AbpLocalizationAbstractionsModule),
+    typeof(AbpValidationAbstractionsModule)
+)]
+public class AbpObjectExtendingModule : AbpModule
+{
+}
+```
+
+Just like [Domain.Shared](/ddd/domain-shared), this module only depends on abstraction modules so it's safe to reference from `Application.Contracts`.
+
+## IHasExtraProperties and ExtraPropertyDictionary
+
+```csharp
+// IHasExtraProperties.cs
+public interface IHasExtraProperties
+{
+    ExtraPropertyDictionary ExtraProperties { get; }
+}
+
+// ExtraPropertyDictionary.cs
+[Serializable]
+public class ExtraPropertyDictionary : Dictionary<string, object?>
+{
+    public ExtraPropertyDictionary() { }
+    public ExtraPropertyDictionary(IDictionary<string, object?> dictionary) : base(dictionary) { }
+}
+```
+
+The dictionary is a plain `Dictionary<string, object?>`. Two extensions in `Volo.Abp.Data` make it more pleasant to use:
+
+```csharp
+// ExtraPropertyDictionaryExtensions.cs
+public static T ToEnum<T>(this ExtraPropertyDictionary extraPropertyDictionary, string key) where T : Enum
+{
+    if (extraPropertyDictionary[key]!.GetType() == typeof(T))
+        return (T)extraPropertyDictionary[key]!;
+    extraPropertyDictionary[key] = Enum.Parse(typeof(T), extraPropertyDictionary[key]!.ToString()!, ignoreCase: true);
+    return (T)extraPropertyDictionary[key]!;
+}
+
+public static bool HasSameItems(
+    this ExtraPropertyDictionary dictionary,
+    ExtraPropertyDictionary otherDictionary)
+{
+    if (dictionary.Count != otherDictionary.Count) return false;
+    foreach (var key in dictionary.Keys)
+        if (!otherDictionary.ContainsKey(key) ||
+            dictionary[key]?.ToString() != otherDictionary[key]?.ToString())
+            return false;
+    return true;
+}
+```
+
+## ExtensibleObject
+
+```csharp
+// ExtensibleObject.cs
+[Serializable]
+public class ExtensibleObject : IHasExtraProperties, IValidatableObject
+{
+    public ExtraPropertyDictionary ExtraProperties { get; protected set; }
+
+    public ExtensibleObject() : this(true) { }
+
+    public ExtensibleObject(bool setDefaultsForExtraProperties)
+    {
+        ExtraProperties = new ExtraPropertyDictionary();
+
+        if (setDefaultsForExtraProperties)
+            this.SetDefaultsForExtraProperties(ProxyHelper.UnProxy(this).GetType());
+    }
+
+    public virtual IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+        => ExtensibleObjectValidator.GetValidationErrors(this, validationContext);
+}
+```
+
+`ExtensibleObject` is the canonical base for **DTOs** (`ExtensibleEntityDto`, `ExtensibleAuditedEntityDto`, etc., from [Application.Contracts](/ddd/application-contracts)). Entities use the same plumbing through `AggregateRoot` which also implements `IHasExtraProperties` — see [Entities & Aggregates](/ddd/entities-and-aggregates#aggregateroot). The constructor calls `SetDefaultsForExtraProperties()` so any property registered in `ObjectExtensionManager` is initialised to its default value automatically.
+
+## HasExtraPropertiesExtensions
+
+```csharp
+// HasExtraPropertiesExtensions.cs (excerpts)
+public static bool HasProperty(this IHasExtraProperties source, string name)
+    => source.ExtraProperties.ContainsKey(name);
+
+public static object? GetProperty(this IHasExtraProperties source, string name, object? defaultValue = null)
+    => source.ExtraProperties.GetOrDefault(name) ?? defaultValue;
+
+public static TProperty? GetProperty<TProperty>(this IHasExtraProperties source, string name, TProperty? defaultValue = default)
+    => TypeHelper.ChangeTypePrimitiveExtended<TProperty>(source.GetProperty(name, (object?)defaultValue)) ?? defaultValue;
+
+public static TSource SetProperty<TSource>(this TSource source, string name, object? value, bool validate = true)
+    where TSource : IHasExtraProperties
+{
+    if (validate) ExtensibleObjectValidator.CheckValue(source, name, value);
+    source.ExtraProperties[name] = value;
+    return source;
+}
+
+public static TSource RemoveProperty<TSource>(this TSource source, string name) where TSource : IHasExtraProperties
+{
+    source.ExtraProperties.Remove(name);
+    return source;
+}
+
+public static TSource SetDefaultsForExtraProperties<TSource>(this TSource source, Type? objectType = null)
+    where TSource : IHasExtraProperties
+{
+    objectType ??= typeof(TSource);
+    var properties = ObjectExtensionManager.Instance.GetProperties(objectType);
+
+    foreach (var property in properties)
+    {
+        if (source.HasProperty(property.Name)) continue;
+        source.ExtraProperties[property.Name] = property.GetDefaultValue();
+    }
+
+    return source;
+}
+```
+
+The fluent API — `entity.SetProperty("Department", "Engineering").SetProperty("ManagerId", managerId)` — is what every application service uses to read and write extra fields. The `validate: true` default calls `ExtensibleObjectValidator.CheckValue` to enforce the validation rules registered with the property.
+
+## ObjectExtensionManager
+
+```csharp
+// ObjectExtensionManager.cs
+public class ObjectExtensionManager
+{
+    public static ObjectExtensionManager Instance { get; protected set; } = new ObjectExtensionManager();
+
+    public ConcurrentDictionary<object, object> Configuration { get; }
+    protected ConcurrentDictionary<Type, ObjectExtensionInfo> ObjectsExtensions { get; }
+
+    protected internal ObjectExtensionManager()
+    {
+        ObjectsExtensions = new ConcurrentDictionary<Type, ObjectExtensionInfo>();
+        Configuration = new ConcurrentDictionary<object, object>();
+    }
+
+    public virtual ObjectExtensionManager AddOrUpdate<TObject>(
+        Action<ObjectExtensionInfo>? configureAction = null)
+        => AddOrUpdate(typeof(TObject), configureAction);
+
+    public virtual ObjectExtensionManager AddOrUpdate(Type[] types, Action<ObjectExtensionInfo>? configureAction = null)
+    {
+        foreach (var type in types) AddOrUpdate(type, configureAction);
+        return this;
+    }
+
+    public virtual ObjectExtensionManager AddOrUpdate(Type type, Action<ObjectExtensionInfo>? configureAction = null)
+    {
+        var extensionInfo = ObjectsExtensions.GetOrAdd(type, _ => new ObjectExtensionInfo(type));
+        configureAction?.Invoke(extensionInfo);
+        return this;
+    }
+
+    public virtual ObjectExtensionInfo? GetOrNull<TObject>() => GetOrNull(typeof(TObject));
+    public virtual ObjectExtensionInfo? GetOrNull(Type type) => ObjectsExtensions.GetOrDefault(type);
+    public virtual ImmutableList<ObjectExtensionInfo> GetExtendedObjects() => ObjectsExtensions.Values.ToImmutableList();
+}
+```
+
+Three things to internalise:
+
+1. **It's a static singleton** (`Instance`). The same registry is consulted by entities, DTOs, EF Core configuration, MongoDB mapping and the dynamic API description generator.
+2. **`AddOrUpdate<TObject>(...)`** is how you register an extension. The `ObjectExtensionInfo` carries the per-property metadata (default value, validation, UI hints, etc.).
+3. **`Configuration`** is a free-form bag for additional metadata that other modules attach (think "EF Core ColumnAttribute mirror", "validation summary").
+
+### Registering an extension
+
+```csharp
+// In your module's PreConfigureServices
+ObjectExtensionManager.Instance
+    .AddOrUpdate<IdentityUser>(user =>
+    {
+        user.AddOrUpdateProperty<string>("SocialSecurityNumber", property =>
+        {
+            property.Attributes.Add(new RequiredAttribute());
+            property.Attributes.Add(new StringLengthAttribute(11));
+            property.DefaultValue = "";
+            property.UI.OnTable.IsVisible = true;
+        });
+    });
+```
+
+The `IdentityUser` aggregate root and the `IdentityUserDto` DTO will both expose `SocialSecurityNumber` after this single registration — entities through `ExtraProperties["SocialSecurityNumber"]`, DTOs through the same dictionary on `ExtensibleObject.ExtraProperties`. The validation attribute is automatically enforced.
+
+## ObjectExtensionInfo and ObjectExtensionPropertyInfo
+
+`ObjectExtensionInfo` (in `ObjectExtensionInfo.cs`) holds the per-type metadata. The most useful methods are `AddOrUpdateProperty<TProperty>(name, configure)` and `GetProperty(name)`. Properties become `ObjectExtensionPropertyInfo`:
+
+```csharp
+// ObjectExtensionPropertyInfo.cs (selected)
+public class ObjectExtensionPropertyInfo : IBasicObjectExtensionPropertyInfo
+{
+    public Type Type { get; }
+    public string Name { get; }
+    public Type ObjectType { get; }
+    public ObjectExtensionInfo ObjectExtension { get; }
+
+    public List<Attribute> Attributes { get; protected set; }                  // DataAnnotations validators, etc.
+    public List<Action<ObjectExtensionPropertyValidationContext>> Validators { get; }
+
+    public LocalizedString? DisplayName { get; set; }
+    public ExtensionPropertyApiConfiguration Api { get; set; }
+    public ExtensionPropertyUiConfiguration UI { get; set; }
+    public ExtensionPropertyLookupConfiguration? Lookup { get; set; }
+    public ExtensionPropertyPolicyConfiguration Policy { get; set; }
+
+    public object? DefaultValue { get; set; }
+    public Func<object?>? DefaultValueFactory { get; set; }
+    // ...
+}
+```
+
+The configurations let you control HTTP API exposure, UI rendering on forms/tables, lookup sources for dropdowns, and authorisation policies for individual extra properties.
+
+## ExtensibleObjectValidator
+
+`ExtensibleObjectValidator` is the validator invoked by `ExtensibleObject.Validate` and `HasExtraPropertiesExtensions.SetProperty`. It walks every registered property, checks the configured attributes, runs custom `Validators` actions, and produces `ValidationResult` instances that participate in the standard ASP.NET Core validation pipeline.
+
+## ExtensibleObjectMapper
+
+```csharp
+// ExtensibleObjectMapper.cs (concept)
+public static class ExtensibleObjectMapper
+{
+    public static void MapExtraPropertiesTo<TSource, TDestination>(
+        IDictionary<string, object?> source,
+        IDictionary<string, object?> destination,
+        MappingPropertyDefinitionChecks? definitionChecks = null,
+        string[]? ignoredProperties = null)
+        where TSource : IHasExtraProperties
+        where TDestination : IHasExtraProperties;
+
+    public static void MapExtraPropertiesTo(
+        Type sourceType, Type destinationType,
+        IDictionary<string, object?> source,
+        IDictionary<string, object?> destination,
+        MappingPropertyDefinitionChecks? definitionChecks = null,
+        string[]? ignoredProperties = null);
+}
+```
+
+`ExtensibleObjectMapper` is the bridge used by both [AutoMapper](/ddd/automapper) (`MapExtraProperties` extension) and [Mapperly](/ddd/mapperly) (`[MapExtraProperties]` attribute). It respects three rules:
+
+- **DefinitionChecks** (`MappingPropertyDefinitionChecks`) decides whether a property must be registered on the source, destination, both, or none.
+- **IgnoredProperties** explicitly skips a key by name.
+- **Validation hooks** can still apply if the destination is `IHasExtraProperties` — wrong-typed values are filtered.
+
+## Policy and feature gating
+
+The `ExtensionPropertyPermissionPolicyConfiguration`, `ExtensionPropertyFeaturePolicyConfiguration`, `ExtensionPropertyGlobalFeaturePolicyConfiguration`, and `ExtensionPropertyPolicyChecker` classes let you gate an extra property by permission, feature, or global feature:
+
+```csharp
+property.Policy.Permissions.Add("MyModule.Users.SocialSecurityNumber");
+property.Policy.Features.Add("MyModule.Premium");
+property.Policy.GlobalFeatures.Add("MyModule.SsnTracking");
+```
+
+`ExtensionPropertyPolicyChecker` is the runtime gateway that the dynamic API description model and admin UI consult to hide forbidden fields. See [core/options-and-configuration](/core/options-and-configuration) for ABP feature options.
+
+## Module-level helpers
+
+The `Modularity/` subfolder (`EntityExtensionConfiguration`, `ModuleExtensionConfiguration*`) is the higher-level API ABP Studio and code generation consume:
+
+```csharp
+ObjectExtensionManager.Instance
+    .Modules()
+        .ConfigureIdentity(identity =>
+        {
+            identity.ConfigureUser(user =>
+            {
+                user.AddOrUpdateProperty<string>(
+                    "SocialSecurityNumber",
+                    property => { ... });
+            });
+        });
+```
+
+`Modules()` / `ConfigureIdentity` / `ConfigureUser` are fluent helpers defined on `ModuleObjectExtensionManagerExtensions` and the per-module extension classes. They ultimately delegate to `ObjectExtensionManager.Instance.AddOrUpdate<...>(...)`, but expose a developer-friendly chain you can apply during module bootstrap.
+
+## ExtensibleEntityDto and the DTO family
+
+The DTO family in `framework/src/Volo.Abp.Ddd.Application.Contracts/Volo/Abp/Application/Dtos/` mirrors the entity hierarchy and includes:
+
+- `ExtensibleEntityDto`, `ExtensibleEntityDto<TKey>`
+- `ExtensibleAuditedEntityDto`, `ExtensibleAuditedEntityDto<TKey>`, `ExtensibleAuditedEntityWithUserDto<TKey, TUserDto>`
+- `ExtensibleCreationAuditedEntityDto`, `*WithUser` variants
+- `ExtensibleFullAuditedEntityDto`, `*WithUser` variants
+- `ExtensibleListResultDto<T>`, `ExtensiblePagedResultDto<T>`
+
+All of them inherit `ExtensibleObject`, so they automatically:
+
+- Have an `ExtraProperties` dictionary populated with defaults at construction.
+- Validate through `ExtensibleObjectValidator.GetValidationErrors`.
+- Round-trip extra properties over HTTP (the JSON converter for `ExtraPropertyDictionary` lives alongside ABP's serialization options — see [core/serialization](/core/serialization)).
+
+## Worked example: extending IdentityUser end-to-end
+
+```csharp
+// 1. In your module class
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    OneTimeRunner.Run(() =>
+    {
+        ObjectExtensionManager.Instance.Modules().ConfigureIdentity(identity =>
+        {
+            identity.ConfigureUser(user =>
+            {
+                user.AddOrUpdateProperty<string>("Department", property =>
+                {
+                    property.Attributes.Add(new RequiredAttribute());
+                    property.Attributes.Add(new StringLengthAttribute(64));
+                    property.DefaultValue = "Engineering";
+                    property.UI.OnTable.IsVisible = true;
+                });
+            });
+        });
+    });
+}
+
+// 2. In a domain service
+public async Task AssignAsync(Guid userId, string department)
+{
+    var user = await _users.GetAsync(userId);
+    user.SetProperty("Department", department); // validates against RequiredAttribute/StringLength
+    await _users.UpdateAsync(user);
+}
+
+// 3. In an application service / DTO
+public class IdentityUserExtendedDto : ExtensibleObject
+{
+    public Guid Id { get; set; }
+    public string UserName { get; set; }
+    // Department lives in ExtraProperties; the admin UI binds it dynamically
+}
+```
+
+ABP modules read the same registration when generating EF Core column mappings (so `IdentityUser` actually persists a `Department` column on its table), API descriptions (`SocialSecurityNumber` shows up in Swagger), and admin UI tables (`UI.OnTable.IsVisible = true`).
+
+## Cross-references
+
+- [Application.Contracts](/ddd/application-contracts) — `ExtensibleEntityDto`/`ExtensibleAuditedEntityDto` family.
+- [Entities & Aggregates](/ddd/entities-and-aggregates) — `AggregateRoot` implements `IHasExtraProperties` and calls `SetDefaultsForExtraProperties()` from its constructor.
+- [Object Mapping](/ddd/object-mapping) — `DefaultObjectMapper` works with extensible types when the auto-provider participates.
+- [AutoMapper](/ddd/automapper) — `MapExtraProperties` extension.
+- [Mapperly](/ddd/mapperly) — `[MapExtraProperties]` attribute.
+- [Domain](/ddd/domain) — `AbpDddDomainModule` depends on the auditing module that depends on this one.
+- [data/entityframeworkcore](/data/entityframeworkcore) — extension columns are projected onto database columns via the EF Core conventions.
+- [data/mongodb](/data/mongodb) — `ExtraProperties` becomes a nested BSON document.
+- [core/serialization](/core/serialization) — JSON converters for `ExtraPropertyDictionary`.
+- [core/options-and-configuration](/core/options-and-configuration) — `Configure<AbpExtraPropertiesOptions>` style configuration where applicable.
+- [core/exception-handling](/core/exception-handling) — validation errors raised by `ExtensibleObjectValidator` are surfaced as standard ABP error responses.
+
+<Tip>
+`ObjectExtensionManager.Instance` is the single registry of truth. Configure it **before** the module that owns the entity runs `ConfigureServices`, otherwise the EF Core conventions module may already have built its model without seeing your extra columns. The `OneTimeRunner` pattern shown above guarantees a single registration even when the module class is reloaded by hot-reload during development.
+</Tip>

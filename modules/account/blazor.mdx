@@ -1,0 +1,374 @@
+---
+title: "Account Blazor UI"
+description: "Blazor-Server / WebAssembly account management — AccountManage.razor, ProfileMenuContributor, and AbpAccountBlazorModule."
+---
+
+The **`Volo.Abp.Account.Blazor`** project is the Blazorise-based UI that an ABP Blazor host uses for the profile-management experience. Unlike the [Razor Pages UI](/modules/account/web-mvc) it does **not** ship login, register, forgot-password, or reset-password pages — those flows still happen against the cookie-based MVC host (because the authentication cookie has to be set by the server pipeline). What Blazor owns is the authenticated `/account/manage-profile` page and the user-menu contributor.
+
+```text modules/account/src/Volo.Abp.Account.Blazor/
+├── _Imports.razor
+├── AbpAccountBlazorModule.cs
+├── AbpAccountBlazorMappers.cs
+├── AbpAccountBlazorUserMenuContributor.cs
+├── AbpAccountComponentBase.cs
+└── Pages/Account/
+    ├── AccountManage.razor
+    └── AccountManage.razor.cs
+```
+
+## `AbpAccountBlazorModule`
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/AbpAccountBlazorModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpMapperlyModule),
+    typeof(AbpAccountApplicationContractsModule)
+    )]
+public class AbpAccountBlazorModule : AbpModule
+{
+    private readonly static OneTimeRunner OneTimeRunner = new OneTimeRunner();
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper<AbpAccountBlazorModule>();
+
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new AbpAccountBlazorUserMenuContributor());
+        });
+
+        Configure<AbpRouterOptions>(options =>
+        {
+            options.AdditionalAssemblies.Add(typeof(AbpAccountBlazorModule).Assembly);
+        });
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        OneTimeRunner.Run(() =>
+        {
+            ModuleExtensionConfigurationHelper
+                .ApplyEntityConfigurationToUi(
+                    IdentityModuleExtensionConsts.ModuleName,
+                    IdentityModuleExtensionConsts.EntityNames.User,
+                    editFormTypes: new[] { typeof(PersonalInfoModel) }
+                );
+        });
+    }
+}
+```
+
+Three things happen at startup:
+
+1. **Mapperly object-mapper** is registered so `ObjectMapper.Map<ProfileDto, PersonalInfoModel>` and `ObjectMapper.Map<PersonalInfoModel, UpdateProfileDto>` work without further wiring (mappings live in `AbpAccountBlazorMappers.cs`).
+2. **User menu contributor** is added so the avatar dropdown gets a "My Account" link pointing at `account/manage-profile`.
+3. **`AbpRouterOptions.AdditionalAssemblies`** includes the Blazor assembly so the framework router discovers `AccountManage.razor` even when the host application doesn't declare an `<AssemblyLoadContext>` for it.
+
+`PostConfigureServices` is where the **Identity object-extension** machinery is plumbed into the personal-info form: extra properties registered against `IdentityUser` in the Identity module's extension consts are automatically rendered as additional `EditForm` fields on `AccountManage.razor`.
+
+## User menu contributor
+
+This is what places the "My Account" item in the avatar dropdown of any Blazor host:
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/AbpAccountBlazorUserMenuContributor.cs
+public class AbpAccountBlazorUserMenuContributor : IMenuContributor
+{
+    public Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.User)
+        {
+            return Task.CompletedTask;
+        }
+
+        var accountResource = context.GetLocalizer<AccountResource>();
+
+        context.Menu.AddItem(new ApplicationMenuItem(
+            "Account.Manage",
+            accountResource["MyAccount"],
+            url: "account/manage-profile",
+            icon: "fa fa-cog"));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+It is the Blazor analog of `AbpAccountUserMenuContributor` from the [Razor Pages UI](/modules/account/web-mvc). Note the absence of a "Logout" entry — Blazor hosts rely on the **theme** (Lepton, LeptonX, Basic) to render the logout link, which calls back to the MVC `/Account/Logout` page so the auth cookie can be cleared by the server.
+
+<Tip>
+Want a different landing tab or icon? Replace `AbpAccountBlazorUserMenuContributor` with a custom `IMenuContributor` registered after it in `MenuContributors.Add(...)`, or remove the default contributor entirely by configuring `AbpNavigationOptions` in your own module.
+</Tip>
+
+## `AbpAccountComponentBase`
+
+Every Blazor component in this project extends a small base class that sets up the right localization resource and object-mapper context:
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/AbpAccountComponentBase.cs
+public abstract class AbpAccountComponentBase : AbpComponentBase
+{
+    protected AbpAccountComponentBase()
+    {
+        LocalizationResource = typeof(AccountResource);
+        ObjectMapperContext  = typeof(AbpAccountBlazorModule);
+    }
+}
+```
+
+That means every Razor component that inherits `AbpAccountComponentBase` resolves `@L["..."]` against `AccountResource` (`[LocalizationResourceName("AbpAccount")]`) and routes `ObjectMapper.Map<...>` through the Mapperly profile registered above.
+
+## `AccountManage.razor`
+
+The Razor view is mapped to the route **`/account/manage-profile`** and renders a Blazorise `Tabs` control with two panels: *Password* and *Personal Info*.
+
+```razor modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor
+@page "/account/manage-profile"
+@using Microsoft.AspNetCore.Components.Forms
+@using Volo.Abp.Account.Localization
+@using Volo.Abp.AspNetCore.Components.Web
+@using Volo.Abp.BlazoriseUI.Components.ObjectExtending
+@using Volo.Abp.ObjectExtending
+@using Volo.Abp.Data
+
+@inject AbpBlazorMessageLocalizerHelper<AccountResource> LH
+@inherits AbpAccountComponentBase
+
+<Row>
+    <Column ColumnSize="ColumnSize.Is12">
+        <Tabs @bind-SelectedTab="@SelectedTab" TabPosition="TabPosition.Start" Pills="true">
+            <Items>
+                <Tab Name="Password">@L["ProfileTab:Password"]</Tab>
+                <Tab Name="PersonalInfo">@L["ProfileTab:PersonalInfo"]</Tab>
+            </Items>
+            <Content>
+                @if (ChangePasswordModel != null)
+                {
+                    <TabPanel Name="Password">
+                        <EditForm id="ChangePasswordForm"
+                                  Model="@ChangePasswordModel"
+                                  OnValidSubmit="ChangePasswordAsync">
+                            <Field>
+                                <FieldLabel>@L["DisplayName:CurrentPassword"]</FieldLabel>
+                                <TextEdit Role="@TextRole.Password" @bind-Text="@ChangePasswordModel.CurrentPassword" />
+                            </Field>
+                            <Field>
+                                <FieldLabel>@L["DisplayName:NewPassword"]</FieldLabel>
+                                <TextEdit Role="@TextRole.Password" @bind-Text="@ChangePasswordModel.NewPassword" />
+                            </Field>
+                            <Field>
+                                <FieldLabel>@L["DisplayName:NewPasswordConfirm"]</FieldLabel>
+                                <TextEdit Role="@TextRole.Password" @bind-Text="@ChangePasswordModel.NewPasswordConfirm" />
+                            </Field>
+                            <Field>
+                                <SubmitButton Form="ChangePasswordForm" Clicked="@ChangePasswordAsync" />
+                            </Field>
+                        </EditForm>
+                    </TabPanel>
+                }
+                @* PersonalInfo tab continues below *@
+            </Content>
+        </Tabs>
+    </Column>
+</Row>
+```
+
+The *Personal Info* tab uses the same `EditForm`/`Field` pattern for `UserName`, `Name`, `Surname`, `Email`, and `PhoneNumber`, and then iterates the object-extension registry to render any extra property declared against `PersonalInfoModel`:
+
+```razor modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor
+@foreach (var propertyInfo in ObjectExtensionManager.Instance.GetProperties<PersonalInfoModel>())
+{
+    var isAllowed = propertyInfo.Configuration.GetOrDefault(
+        IdentityModuleExtensionConsts.ConfigurationNames.AllowUserToEdit);
+
+    if (isAllowed == null || !isAllowed.Equals(true)) continue;
+    if (propertyInfo.Name.EndsWith("_Text"))          continue;
+
+    if (propertyInfo.Type.IsEnum)
+    {
+        <SelectExtensionProperty PropertyInfo="@propertyInfo" Entity="@PersonalInfoModel"
+                                 TEntity="PersonalInfoModel" TResourceType="AccountResource" LH="@LH" />
+    }
+    else if (!propertyInfo.Lookup.Url.IsNullOrEmpty())
+    {
+        <LookupExtensionProperty PropertyInfo="@propertyInfo" Entity="@PersonalInfoModel"
+                                 TEntity="PersonalInfoModel" TResourceType="AccountResource" LH="@LH" />
+    }
+    else
+    {
+        var inputType = propertyInfo.GetInputType();
+        __builder.OpenComponent(0, inputType.MakeGenericType(
+            new[] { typeof(PersonalInfoModel), typeof(AccountResource) }));
+        __builder.AddAttribute(1, "PropertyInfo", propertyInfo);
+        __builder.AddAttribute(2, "Entity",       PersonalInfoModel);
+        __builder.AddAttribute(3, "LH",           LH);
+        __builder.CloseComponent();
+    }
+}
+```
+
+This is what makes the "add a `Department` column to `IdentityUser`" tutorial work end-to-end: as soon as you call `ObjectExtensionManager.Instance.AddOrUpdateProperty<PersonalInfoModel, string>(...)` and decorate the property with `AllowUserToEdit = true`, the field shows up here without any code change.
+
+## `AccountManage.razor.cs`
+
+The code-behind owns the data flow:
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor.cs
+public partial class AccountManage
+{
+    [Inject] protected IProfileAppService ProfileAppService { get; set; }
+    [Inject] protected IUiMessageService  UiMessageService  { get; set; }
+
+    protected string SelectedTab = "Password";
+
+    protected ChangePasswordModel ChangePasswordModel;
+    protected PersonalInfoModel   PersonalInfoModel;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await GetUserInformations();
+    }
+
+    protected async Task GetUserInformations()
+    {
+        var user = await ProfileAppService.GetAsync();
+
+        ChangePasswordModel = new ChangePasswordModel
+        {
+            HideOldPasswordInput = !user.HasPassword
+        };
+
+        PersonalInfoModel = ObjectMapper.Map<ProfileDto, PersonalInfoModel>(user);
+    }
+}
+```
+
+Two important details:
+
+- `HideOldPasswordInput = !user.HasPassword` — externally-registered users (Google / Microsoft / OIDC) won't have a local password yet. Hiding the *Current Password* input lets them **set** a first password instead of failing the `ChangePasswordAsync` validation.
+- `ObjectMapper.Map<ProfileDto, PersonalInfoModel>` is wired by the Mapperly profile in `AbpAccountBlazorMappers.cs`, which preserves `extraProperties` via the `ExtensibleObject` base class.
+
+### Change-password handler
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor.cs
+protected async Task ChangePasswordAsync()
+{
+    if (string.IsNullOrWhiteSpace(ChangePasswordModel.CurrentPassword))
+    {
+        return;
+    }
+
+    if (ChangePasswordModel.NewPassword != ChangePasswordModel.NewPasswordConfirm)
+    {
+        await UiMessageService.Warn(L["NewPasswordConfirmFailed"]);
+        return;
+    }
+
+    if (ChangePasswordModel.CurrentPassword == ChangePasswordModel.NewPassword)
+    {
+        await UiMessageService.Warn(L["NewPasswordSameAsOld"]);
+        return;
+    }
+
+    await ProfileAppService.ChangePasswordAsync(new ChangePasswordInput
+    {
+        CurrentPassword = ChangePasswordModel.CurrentPassword,
+        NewPassword     = ChangePasswordModel.NewPassword
+    });
+
+    ChangePasswordModel.Clear();
+
+    await UiMessageService.Success(L["PasswordChanged"]);
+}
+```
+
+Client-side guards (confirm-match, same-as-old) keep one round trip out of the way. The server still re-validates via `IdentityOptions` so the policy is authoritative.
+
+### Update-personal-info handler
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor.cs
+protected virtual async Task UpdatePersonalInfoAsync()
+{
+    await ProfileAppService.UpdateAsync(
+        ObjectMapper.Map<PersonalInfoModel, UpdateProfileDto>(PersonalInfoModel)
+        );
+
+    await UiMessageService.Success(L["PersonalSettingsSaved"]);
+}
+```
+
+The form's `ConcurrencyStamp` survives the round-trip because both `PersonalInfoModel` and `UpdateProfileDto` carry it; that is what makes optimistic-concurrency on the `IdentityUser` entity correct under simultaneous edits.
+
+### The two view-models
+
+```csharp modules/account/src/Volo.Abp.Account.Blazor/Pages/Account/AccountManage.razor.cs
+public class ChangePasswordModel
+{
+    public string CurrentPassword       { get; set; }
+    public string NewPassword           { get; set; }
+    public string NewPasswordConfirm    { get; set; }
+    public bool   HideOldPasswordInput  { get; set; }
+
+    public void Clear()
+    {
+        CurrentPassword    = string.Empty;
+        NewPassword        = string.Empty;
+        NewPasswordConfirm = string.Empty;
+    }
+}
+
+public class PersonalInfoModel : ExtensibleObject
+{
+    public string UserName              { get; set; }
+    public string Email                 { get; set; }
+    public string Name                  { get; set; }
+    public string Surname               { get; set; }
+    public string PhoneNumber           { get; set; }
+    public bool   PhoneNumberConfirmed  { get; set; }
+    public bool   EmailConfirmed        { get; set; }
+    public string ConcurrencyStamp      { get; set; }
+}
+```
+
+`PersonalInfoModel` extending `ExtensibleObject` is what enables the extra-property loop in the Razor view above.
+
+## What about `Login.razor`?
+
+The Blazor project does **not** ship a `Login.razor` page. Authentication in an ABP Blazor host is bootstrapped one of two ways:
+
+| Host topology | Where login lives |
+|---|---|
+| Blazor Server / Blazor WebApp | The host is an MVC app — login is rendered by `Login.cshtml` from [`Volo.Abp.Account.Web`](/modules/account/web-mvc) and the auth cookie is shared with the Blazor circuit. |
+| Blazor WebAssembly | The WASM app is an OIDC client — login redirects to an external authorization server (the OpenIddict / IdentityServer host) which again uses the Razor `Login.cshtml`. The WASM side only consumes the resulting access token via `IAccessTokenProvider`. |
+
+Either way, the actual UI form that captures username + password is `Volo.Abp.Account.Web/Pages/Account/Login.cshtml`, not a Blazor page. The Blazor project is intentionally scoped to **post-login profile management**.
+
+## Wiring a Blazor host
+
+Add the module dependency and the default user-menu, plus `AccountResource` localization, are picked up automatically:
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountBlazorModule),
+    typeof(AbpAccountHttpApiClientModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyThemingModule)
+)]
+public class MyBlazorClientModule : AbpModule { }
+```
+
+Because `AbpAccountHttpApiClientModule` is depended on, `IProfileAppService` is resolved as a dynamic HTTP proxy — calls from `AccountManage.razor.cs` become `GET/PUT /api/account/my-profile` requests to the API host without any extra plumbing.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Razor Pages UI" icon="window" href="/modules/account/web-mvc">
+    Login, register, and password-reset flows the Blazor host delegates to.
+  </Card>
+  <Card title="Application services" icon="cog" href="/modules/account/application">
+    `IProfileAppService` shape and behaviour.
+  </Card>
+  <Card title="Identity overview" icon="user-shield" href="/modules/identity/overview">
+    `IdentityModuleExtensionConsts`, dynamic claims, and the user store consumed here.
+  </Card>
+  <Card title="OpenID Connect authentication" icon="globe" href="/aspnetcore/auth-openidconnect">
+    How a Blazor WASM client validates the access token used to call the profile endpoints.
+  </Card>
+</CardGroup>

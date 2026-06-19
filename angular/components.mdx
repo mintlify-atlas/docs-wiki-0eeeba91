@@ -1,0 +1,317 @@
+---
+title: "@abp/ng.components"
+description: "Reusable Angular building blocks distributed as secondary entry points — page shell, extensible CRUD tables/forms, tree widget, chart.js wrapper."
+---
+
+`@abp/ng.components` lives in `npm/ng-packs/packages/components/` and is published as a single package with **secondary entry points** so consumers can import only what they need:
+
+```text
+npm/ng-packs/packages/components/
+├── page/              → @abp/ng.components/page
+├── extensible/        → @abp/ng.components/extensible
+├── tree/              → @abp/ng.components/tree
+└── chart.js/          → @abp/ng.components/chart.js
+```
+
+Each folder has its own `ng-package.json` and `public-api.ts`, so a bundler can tree‑shake to the exact entry point used by your code. The root `src/public-api.ts` is intentionally empty:
+
+```ts npm/ng-packs/packages/components/src/public-api.ts
+/*
+ * Public API Surface of components
+ */
+
+export {};
+```
+
+These primitives are theme‑agnostic — they style themselves through CSS classes that `@abp/ng.theme.shared` and `@abp/ng.theme.basic` provide.
+
+## `@abp/ng.components/page` — page shell
+
+`page/src/page.component.ts` is the high‑level scaffold every management screen renders into:
+
+```ts components/page/src/page.component.ts
+@Component({
+  selector: 'abp-page',
+  templateUrl: './page.component.html',
+  encapsulation: ViewEncapsulation.None,
+  imports: [BreadcrumbComponent, PageToolbarComponent, PagePartDirective],
+})
+export class PageComponent {
+  @Input() title?: string;
+
+  toolbarVisible = false;
+  _toolbarData: any;
+  @Input() set toolbar(val: any) {
+    this._toolbarData = val;
+    this.toolbarVisible = true;
+  }
+
+  get toolbarData() { return this._toolbarData; }
+
+  @Input() breadcrumb = true;
+
+  pageParts = {
+    title: PageParts.title,
+    breadcrumb: PageParts.breadcrumb,
+    toolbar: PageParts.toolbar,
+  };
+
+  @ContentChild(PageTitleContainerComponent) customTitle?: PageTitleContainerComponent;
+}
+```
+
+You can swap any region (title, breadcrumb, toolbar) by content‑projecting one of the sibling container components — `PageTitleContainerComponent`, `PageBreadcrumbContainerComponent`, `PageToolbarContainerComponent` — defined in `page/src/page-parts.component.ts`.
+
+Typical usage:
+
+```html
+<abp-page title="{{ 'AbpIdentity::Users' | abpLocalization }}" [toolbar]="data?.items">
+  <abp-page-toolbar-container *abpPageToolbar>
+    <button class="btn btn-primary" (click)="onCreate()">
+      {{ 'AbpIdentity::NewUser' | abpLocalization }}
+    </button>
+  </abp-page-toolbar-container>
+
+  <abp-extensible-table
+    [data]="data?.items ?? []"
+    [recordsTotal]="data?.totalCount ?? 0"
+    [list]="list">
+  </abp-extensible-table>
+</abp-page>
+```
+
+## `@abp/ng.components/extensible` — extension system
+
+This entry point delivers the **extensible CRUD** machinery used by every management module. The folder layout:
+
+```text
+components/extensible/src/lib/
+├── components/
+│   ├── extensible-table/
+│   ├── extensible-form/
+│   ├── extensible-form-prop/
+│   ├── grid-actions/
+│   ├── page-toolbar/
+│   ├── multi-select/
+│   └── date-time-picker/
+├── constants/extra-properties.ts
+├── directives/prop-data.directive.ts
+├── enums/components.ts
+└── enums/props.enum.ts
+```
+
+`ExtensibleTableComponent` consumes the entity‑prop list produced by `ExtensionsService` and renders an ngx-datatable that adapts to any DTO:
+
+```ts components/extensible/src/lib/components/extensible-table/extensible-table.component.ts
+@Component({
+  selector: 'abp-extensible-table',
+  templateUrl: './extensible-table.component.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class ExtensibleTableComponent implements AfterViewInit, OnChanges, OnDestroy {
+  @Input() data!: any[];
+  @Input() recordsTotal!: number;
+  @Input() list!: ListService;
+  @Input() actionsText = 'AbpUi::Actions';
+  @Input() actionsTrigger: 'click' | 'hover' = 'click';
+  @Input() actionsColumnWidth?: number;
+  @Input() recordsPerPageOptions = [5, 10, 25, 50, 100];
+
+  protected permissionService = inject(PermissionService);
+  protected timezoneService = inject(TimezoneService);
+  protected configState = inject(ConfigStateService);
+}
+```
+
+### How extensions work
+
+Each feature module exposes contributor tokens:
+
+```ts identity/src/lib/tokens/extensions.token.ts
+export const IDENTITY_ENTITY_PROP_CONTRIBUTORS =
+  new InjectionToken<EntityPropContributors>('IDENTITY_ENTITY_PROP_CONTRIBUTORS');
+export const IDENTITY_ENTITY_ACTION_CONTRIBUTORS =
+  new InjectionToken<EntityActionContributors>('IDENTITY_ENTITY_ACTION_CONTRIBUTORS');
+```
+
+Inside an application you push contributors that mutate the prop / action / form‑prop lists:
+
+```ts identity-extensions.ts
+import { EntityPropContributors, eIdentityComponents } from '@abp/ng.identity';
+import { ePropType, EntityProp } from '@abp/ng.components/extensible';
+import { IdentityUserDto } from '@abp/ng.identity/proxy';
+
+const ssnProp = new EntityProp<IdentityUserDto>({
+  type: ePropType.String,
+  name: 'ssn',
+  displayName: 'Identity::Ssn',
+  sortable: true,
+  columnWidth: 200,
+});
+
+export const identityEntityPropContributors: EntityPropContributors = {
+  [eIdentityComponents.Users]: [propList => propList.addTail(ssnProp)],
+};
+```
+
+Then register them at route definition time:
+
+```ts app.routes.ts
+{
+  path: 'identity',
+  loadChildren: () =>
+    import('@abp/ng.identity').then(m =>
+      m.createRoutes({
+        entityPropContributors: identityEntityPropContributors,
+      }),
+    ),
+}
+```
+
+The same mechanism exists for `entityActionContributors`, `toolbarActionContributors`, `entityPropContributors`, `createFormPropContributors` and `editFormPropContributors`. Identity, tenant management, account and any third‑party module that wants its UI extensible follows this convention.
+
+### `ExtensibleFormComponent`
+
+Builds an Angular reactive form from a `FormProp` list. The helper `generateFormFromProps()` (called inside identity's user create modal) walks the contributors and emits an `UntypedFormGroup`:
+
+```ts
+const data = new FormPropData(this.injector, this.selected);
+this.form = generateFormFromProps(data);
+```
+
+Form props can be of type `ePropType.String`, `Number`, `Date`, `DateTime`, `Boolean`, `Enum`, `MultiSelect`, `Custom` — see `extensible/src/lib/enums/props.enum.ts`.
+
+## `@abp/ng.components/tree` — checkbox tree
+
+`tree/src/lib/components/tree.component.ts` wraps `ng-zorro-antd`'s tree (through `NzTreeAdapter`) into an ABP friendly API:
+
+```text
+components/tree/src/lib/
+├── components/tree.component.{ts,html,scss}
+├── disable-tree-style-loading.token.ts
+├── templates/
+│   ├── tree-node-template.directive.ts
+│   └── expanded-icon-template.directive.ts
+├── utils/nz-tree-adapter.ts
+└── tree.module.ts
+```
+
+Use it inside permission management, organisation units or any other hierarchical data picker. Custom templates let you change the node label or the expand icon:
+
+```html
+<abp-tree [nodes]="permissionTree" (checkedChange)="onPermissionChecked($event)">
+  <ng-template abpTreeNodeTemplate let-node>
+    <i class="bi bi-key"></i>
+    {{ node.displayName | abpLocalization }}
+  </ng-template>
+</abp-tree>
+```
+
+## `@abp/ng.components/chart.js` — chart wrapper
+
+A minimal wrapper that lets you declaratively render Chart.js charts in dashboards:
+
+```ts components/chart.js/src/chart.component.ts
+@Component({
+  selector: 'abp-chart',
+  template: '<canvas #canvas></canvas>',
+})
+export class ChartComponent { /* binds inputs to Chart.js ctor */ }
+```
+
+The accompanying `ChartModule` exposes the directive set; the entry point ships its own `public-api.ts` so applications can import it without pulling in `extensible`, `tree` or `page`.
+
+## `ePropType` enum
+
+Form and entity props share a single type enum (`extensible/src/lib/enums/props.enum.ts`):
+
+```ts
+export enum ePropType {
+  String = 'string',
+  Number = 'number',
+  Date = 'date',
+  DateTime = 'date-time',
+  Boolean = 'boolean',
+  Enum = 'enum',
+  CustomComponent = 'custom-component',
+}
+```
+
+`extensible/src/lib/components/extensible-table/extensible-table.component.html` uses an `ngTemplateOutlet` switch driven by this enum to format each cell — booleans become check icons, dates apply `UtcToLocalPipe`, enums are looked up against `ConfigStateService.getDeep('localization.values')`.
+
+## Theme integration
+
+`@abp/ng.components` never imports from `@abp/ng.theme.basic`. Instead it depends only on:
+
+- `@abp/ng.core` — `LocalizationPipe`, `PermissionDirective`, `ListService`, `TimezoneService`.
+- `@abp/ng.theme.shared` — `BreadcrumbComponent`, `ButtonComponent`, `NgxDatatableDefaultDirective`.
+- `@swimlane/ngx-datatable` for the table.
+- `@ng-bootstrap/ng-bootstrap` (`NgbDropdown`, `NgbTooltip`) for menus and tooltips.
+
+That's why the extensible widgets render identically against the basic theme, Volo's Lepton X theme, or any custom replacement — they emit semantic markup with class hooks rather than baking in a design.
+
+## `EntityProp`, `EntityAction`, `FormProp`
+
+The classes that contributors instantiate live in `extensible/src/lib/models/`:
+
+- `EntityProp<T>` — column descriptor. Fields: `type` (`ePropType`), `name`, `displayName`, `sortable`, `columnWidth`, `permission`, `visible`, `valueResolver`.
+- `EntityAction<T>` — row action descriptor. Fields: `text`, `action: (data: EntityActionData<T>) => void`, `permission`, `visible`, `icon`.
+- `ToolbarAction<T>` — page toolbar button.
+- `FormProp<T>` — form field descriptor. Fields: `type`, `name`, `displayName`, `validators`, `options`, `disabled`, `readonly`, `dynamicDisabled`.
+
+`EntityProp` and friends are wrapped in linked‑list containers (`EntityPropList`, `EntityActionList`, …) that expose `addHead`, `addTail`, `addByIndex(prop, index)`, `addAfter(prop, refName)` and `dropByValue(name)` so contributors can position their entries precisely:
+
+```ts
+new EntityAction<IdentityUserDto>({
+  text: 'MyProject::Disable',
+  icon: 'fa fa-ban',
+  permission: 'AbpIdentity.Users.Update',
+  visible: data => data.record.isActive,
+  action: data => this.disable(data.record),
+});
+```
+
+`EntityActionData<T>` (`models/props.ts`) carries the row data and the host injector, so the action handler can resolve any service it needs:
+
+```ts
+new EntityAction<TenantDto>({
+  text: 'MyProject::SwitchToTenant',
+  action: data => {
+    const session = data.getInjected(SessionStateService);
+    session.setTenant({ id: data.record.id, name: data.record.name, isAvailable: true });
+  },
+});
+```
+
+## `EXTENSIONS_IDENTIFIER`
+
+Pages that consume the extensible primitives provide `EXTENSIONS_IDENTIFIER` at the route or component level to tell the table/form which entry to pick from the contributor map. Identity users provides:
+
+```ts
+providers: [
+  { provide: EXTENSIONS_IDENTIFIER, useValue: eIdentityComponents.Users },
+]
+```
+
+`ExtensibleTableComponent` and `ExtensibleFormComponent` both inject the token and use it to look up the matching contributor list from `ExtensionsService`.
+
+## Why secondary entry points?
+
+Angular's secondary entry points (one per folder with an `ng-package.json`) allow consumers to import only `@abp/ng.components/page` without pulling in `chart.js` or the extensible system. Each entry point is built independently by `ng-packagr`, so unused entry points don't end up in the final bundle. The root entry point intentionally exports nothing — every public symbol is consumed through one of the four subpaths.
+
+## Cross‑links
+
+<CardGroup cols={2}>
+  <Card title="@abp/ng.theme.shared" href="/angular/theme-shared" icon="palette">
+    Provides the table directive, breadcrumb, modal and toaster components consumed here.
+  </Card>
+  <Card title="@abp/ng.identity" href="/angular/identity" icon="users">
+    The most complete consumer of `extensible` — entity table, create/edit forms, action menus.
+  </Card>
+  <Card title="@abp/ng.tenant-management" href="/angular/tenant-management" icon="building">
+    Demonstrates `EntityActionContributors` for the “Manage Features” and “Manage Connection Strings” actions.
+  </Card>
+  <Card title="Localization" href="/localization/overview" icon="language">
+    The localization resource keys (`AbpUi::Actions`, etc.) referenced from defaults live in the backend modules.
+  </Card>
+</CardGroup>

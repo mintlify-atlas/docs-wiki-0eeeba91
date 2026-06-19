@@ -1,0 +1,294 @@
+---
+title: "Inside Volo.Abp.Core: the Framework's Anchor Package"
+sidebarTitle: "Volo.Abp.Core"
+description: "Folder-by-folder anatomy of Volo.Abp.Core — every subdirectory under Volo/Abp/ and what role it plays in the runtime."
+---
+
+`Volo.Abp.Core` is the single package every ABP module transitively references. The csproj lives at [`framework/src/Volo.Abp.Core/Volo.Abp.Core.csproj`](https://github.com/abpframework/abp/blob/dev/framework/src/Volo.Abp.Core/Volo.Abp.Core.csproj). Everything you see in this group — `AbpApplicationBase`, `AbpModule`, `ConventionalRegistrarBase`, `BusinessException`, `IAbpInterceptor` — is defined inside this one assembly. This page is a directory walk of its source tree so you can navigate the repo with a map in hand.
+
+The project root contains a small set of top-level types and one folder per concern:
+
+```text
+framework/src/Volo.Abp.Core/
+├── Volo.Abp.Core.csproj
+├── Microsoft/                  ← extension methods on IServiceCollection / IConfiguration
+├── System/                     ← extension methods on string, Type, IEnumerable, etc.
+└── Volo/Abp/                   ← everything in the Volo.Abp.* namespaces
+    ├── AbpApplicationBase.cs   (and friends — see /core/abp-application-base)
+    ├── AbpException.cs
+    ├── BusinessException.cs
+    ├── Check.cs
+    ├── IAbpApplication*.cs
+    ├── Aspects/
+    ├── Bundling/
+    ├── Collections/
+    ├── Content/
+    ├── DependencyInjection/
+    ├── DynamicProxy/
+    ├── ExceptionHandling/
+    ├── Http/
+    ├── Internal/
+    ├── IO/
+    ├── Localization/
+    ├── Logging/
+    ├── Modularity/
+    ├── Options/
+    ├── Reflection/
+    ├── SimpleStateChecking/
+    ├── Studio/
+    ├── Text/
+    ├── Threading/
+    └── Tracing/
+```
+
+The rest of this page is a `cd` into each folder.
+
+## Top-level types (no subfolder)
+
+These are the entry points other packages reach for directly.
+
+| Type | File | Purpose |
+| --- | --- | --- |
+| `IAbpApplication` | `IAbpApplication.cs` | The boot facade returned by `AbpApplicationFactory.Create`. |
+| `AbpApplicationBase` | `AbpApplicationBase.cs` | Loads modules, runs `ConfigureServices`, drives `Shutdown`. See [Lifecycle](/core/abp-application-base). |
+| `AbpApplicationFactory` | `AbpApplicationFactory.cs` | Static factory with `Create<T>` and `CreateAsync<T>` overloads. |
+| `AbpApplicationCreationOptions` | `AbpApplicationCreationOptions.cs` | Options bag passed to the factory — `ApplicationName`, `Environment`, `SkipConfigureServices`, `PlugInSources`. |
+| `AbpException` / `AbpInitializationException` / `AbpShutdownException` | `Abp*Exception.cs` | Framework-internal failures. See [Exception handling](/core/exception-handling). |
+| `BusinessException` / `IBusinessException` / `IUserFriendlyException` | `BusinessException.cs`, `IBusinessException.cs`, `IUserFriendlyException.cs` | Domain-level error contracts. |
+| `Check` | `Check.cs` | Tiny argument-validation helper (`Check.NotNull(value, nameof(value))`) used pervasively across the framework. |
+| `ApplicationInitializationContext` / `ApplicationShutdownContext` | `ApplicationInitializationContext.cs`, `ApplicationShutdownContext.cs` | Carriers passed through the lifecycle pipeline. |
+| `DisposeAction` / `AsyncDisposeFunc` / `NullDisposable` | top-level files | Reusable `IDisposable` / `IAsyncDisposable` helpers (the framework hands these out so callers can `using` an undo block). |
+
+## `Aspects/` — cross-cutting concern bookkeeping
+
+A two-file folder that gives ABP's [interceptors](/core/dynamic-proxy-and-aspects) a way to avoid re-applying the same concern when a method calls itself through an interface.
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Aspects/AbpCrossCuttingConcerns.cs
+public static class AbpCrossCuttingConcerns
+{
+    public const string Auditing = "AbpAuditing";
+    public const string UnitOfWork = "AbpUnitOfWork";
+    public const string FeatureChecking = "AbpFeatureChecking";
+    public const string GlobalFeatureChecking = "AbpGlobalFeatureChecking";
+
+    public static IDisposable Applying(object obj, params string[] concerns) { /* ... */ }
+    public static bool IsApplied(object? obj, [NotNull] string concern) { /* ... */ }
+}
+```
+
+The companion interface is one property:
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Aspects/IAvoidDuplicateCrossCuttingConcerns.cs
+public interface IAvoidDuplicateCrossCuttingConcerns
+{
+    List<string> AppliedCrossCuttingConcerns { get; }
+}
+```
+
+This is what stops an [audit log interceptor](/auditing/overview) from logging the same call twice when an application service wraps another one.
+
+## `Bundling/` — script and style bundle plumbing
+
+Defines `IBundleManager`-adjacent contracts that the ASP.NET Core MVC UI consumes. The folder ships the abstractions; concrete bundling lives in `Volo.Abp.AspNetCore.Mvc.UI.Bundling`. Browse the files at [`Volo.Abp.Core/Volo/Abp/Bundling/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Core/Volo/Abp/Bundling).
+
+## `Collections/` — typed collections used across the framework
+
+Specialized collections like `ITypeList<TBaseType>` (an `IList<Type>` that constrains its items to a base type at compile time) and `TypeList<TBaseType>`. The framework uses these for things like "the ordered list of validation contributors" or "the ordered list of interceptor types".
+
+## `Content/` — `IRemoteStreamContent` and friends
+
+A small abstraction over a stream + metadata pair. Used by [Application Services](/ddd/application) that return file downloads and by the [HTTP integration](/aspnetcore/overview).
+
+## `DependencyInjection/` — the conventional registrar
+
+The largest folder in the package and the focus of [Dependency injection](/core/dependency-injection). Contents:
+
+| File | Role |
+| --- | --- |
+| `ConventionalRegistrarBase.cs` | Abstract base that iterates types in an assembly and calls `AddType`. |
+| `DefaultConventionalRegistrar.cs` | Reads `[Dependency]` + `I*Dependency` interfaces, calls `services.Add`. |
+| `IConventionalRegistrar.cs` + `ConventionalRegistrarList.cs` | The pluggable list `AbpApplicationBase` consults. |
+| `ExposeServicesAttribute.cs`, `ExposeKeyedServiceAttribute.cs` | Declare which interfaces a class should be registered as. |
+| `DependencyAttribute.cs` | Explicit lifetime, `TryRegister`, `ReplaceServices`. |
+| `DisableConventionalRegistrationAttribute.cs`, `DisablePropertyInjectionAttribute.cs` | Opt-outs. |
+| `ISingletonDependency.cs`, `IScopedDependency.cs`, `ITransientDependency.cs` | Marker interfaces. |
+| `IAbpLazyServiceProvider.cs`, `AbpLazyServiceProvider.cs` | Property-injection helper. |
+| `CachedServiceProvider.cs`, `CachedServiceProviderBase.cs`, `ICachedServiceProvider.cs`, `TransientCachedServiceProvider.cs` | Per-scope service caches. |
+| `IObjectAccessor.cs`, `ObjectAccessor.cs` | Holder pattern used to publish singletons before the provider is built. |
+| `OnServiceRegistredContext.cs`, `ServiceRegistrationActionList.cs` | Hook into every registration — used by the [interceptor pipeline](/core/dynamic-proxy-and-aspects). |
+| `OnServiceExposingContext.cs`, `ServiceExposingActionList.cs` | Hook into the *expose decision* (which interfaces a type satisfies). |
+| `OnServiceActivatedContext.cs`, `ServiceActivatedActionList.cs` | Hook fired the first time a service is resolved. |
+| `RootServiceProvider.cs`, `IRootServiceProviderAccessor.cs`, `IClientScopeServiceProviderAccessor.cs` | Escape hatches to reach beyond the current scope. |
+| `ServiceIdentifier.cs` | `(serviceKey, serviceType)` tuple used by the keyed-service path. |
+| `IInjectPropertiesService.cs`, `NullInjectPropertiesService.cs` | Property injection contract. |
+| `ClassInterceptorsSelectorList.cs`, `IClassInterceptorsSelectorList.cs` | Decide which interceptors to attach to a class. |
+
+## `DynamicProxy/` — proxy contracts (no Castle dependency here)
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/DynamicProxy/IAbpInterceptor.cs
+public interface IAbpInterceptor
+{
+    Task InterceptAsync(IAbpMethodInvocation invocation);
+}
+```
+
+`AbpInterceptor` is the abstract base every framework interceptor (auditing, unit-of-work, authorization, feature checking) inherits. `IAbpMethodInvocation` exposes `Arguments`, `Method`, `TargetObject`, `ProceedAsync()`. `ProxyHelper.UnProxy(obj)` unwraps a Castle proxy when you need the underlying instance. See [Dynamic proxy & aspects](/core/dynamic-proxy-and-aspects).
+
+## `ExceptionHandling/` — the contracts
+
+This folder is the abstractions. The concrete subscriber/notifier pipeline ships from `Volo.Abp.ExceptionHandling` (the separate package). The contracts in the Core are:
+
+| File | Contract |
+| --- | --- |
+| `IHasErrorCode.cs` | `string? Code { get; }` |
+| `IHasErrorDetails.cs` | `string? Details { get; }` |
+| `IHasHttpStatusCode.cs` | `int HttpStatusCode { get; }` |
+| `ILocalizeErrorMessage.cs` | Opt-in for message localization. |
+| `IExceptionNotifier.cs` / `ExceptionNotifier.cs` / `NullExceptionNotifier.cs` | Pub/sub of caught exceptions. |
+| `ExceptionSubscriber.cs` / `IExceptionSubscriber.cs` | Receive notifications. |
+| `ExceptionNotificationContext.cs` | The payload subscribers see. |
+
+Full coverage on [Exception handling](/core/exception-handling).
+
+## `Http/` — HTTP-status-related primitives
+
+Carries `HttpStatusCode` constants and `RemoteServiceErrorInfo` shapes that the [HTTP API exception filter](/aspnetcore/overview) serializes. Not a hosting layer — just shared shapes.
+
+## `Internal/` — framework-only plumbing
+
+Off-limits to consumers. Contains `Telemetry` (opt-in dev-only usage stats — see `AbpApplicationBase.ShouldSendTelemetryData`) and helpers the public API delegates to.
+
+## `IO/` — small file / path helpers
+
+`DirectoryHelper`, `FileHelper` style utilities the [virtual file system](/aspnetcore/overview) and code-generation utilities use.
+
+## `Localization/` — `LocalizableString` and contracts
+
+Defines `LocalizableString`, `LocalizedString`-adjacent contracts, and attribute markers. The actual `IStringLocalizerFactory` machinery lives in `Volo.Abp.Localization`; the Core only ships what other packages need to *reference* a localizable string without depending on the full localization stack.
+
+## `Logging/` — the init logger
+
+A miniature logger used **before** `IServiceProvider` exists, so module-loading errors can be reported.
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Logging/IInitLoggerFactory.cs (excerpt)
+public interface IInitLoggerFactory
+{
+    IInitLogger<T> Create<T>();
+}
+```
+
+`AbpApplicationBase.WriteInitLogs` flushes the queued entries through `ILogger` once it is available:
+
+```csharp
+// AbpApplicationBase.cs
+var initLogger = serviceProvider.GetRequiredService<IInitLoggerFactory>().Create<AbpApplicationBase>();
+foreach (var entry in initLogger.Entries)
+{
+    logger.Log(entry.LogLevel, entry.EventId, entry.State, entry.Exception, entry.Formatter);
+}
+```
+
+The folder also defines `IHasLogLevel` (so `BusinessException` can request `LogLevel.Warning` instead of `Error`) and `IExceptionWithSelfLogging` (for exceptions that know how to log themselves).
+
+## `Modularity/` — the module graph
+
+The whole composition model. See the dedicated [Modularity](/core/modularity) page. Folder highlights: `AbpModule`, `IAbpModule`, `AbpModuleDescriptor`, `ModuleLoader`, `ModuleManager`, `DependsOnAttribute`, `AdditionalAssemblyAttribute`, `IPreConfigureServices`, `IPostConfigureServices`, the four `IOn*Initialization` hooks, `IOnApplicationShutdown`, `ServiceConfigurationContext`, the `PlugIns/` subfolder, and `AbpModuleLifecycleOptions` (which lists `DefaultModuleLifecycleContributor`s, one per hook).
+
+## `Options/` — overlays on Microsoft.Extensions.Options
+
+| File | Role |
+| --- | --- |
+| `AbpOptionsFactory.cs` | Custom `IOptionsFactory<TOptions>` that runs setups, post-configures, validations in a deterministic order. |
+| `AbpDynamicOptionsManager.cs` | Base for options that need to be **re-computed per scope** (think: tenant-aware settings). |
+| `PreConfigureActionList.cs` | Backs `services.PreConfigure<T>(...)`. |
+
+See [Options & configuration](/core/options-and-configuration).
+
+## `Reflection/` — assembly and type discovery
+
+| Type | Used by |
+| --- | --- |
+| `IAssemblyFinder` / `AssemblyFinder` | The conventional registrar — "give me every assembly the loaded modules contribute". |
+| `ITypeFinder` / `TypeFinder` | "Find every type assignable to T in those assemblies." |
+| `AssemblyHelper.GetAllTypes(assembly)` | Static helper that swallows `ReflectionTypeLoadException` and returns the loaded types. |
+| `ReflectionHelper.GetSingleAttributeOfMemberOrDeclaringTypeOrDefault<TAttribute>(...)` | The "look on the method, then the class" attribute walker used by interceptors. |
+| `TypeHelper` | `IsPrimitiveExtended`, `IsFunc`, `IsNonNullablePrimitiveType`, etc. |
+
+## `SimpleStateChecking/` — feature toggles for state-aware objects
+
+Contracts for "is this object in state X" composable checks. Used by `Volo.Abp.Features` and `Volo.Abp.GlobalFeatures` to gate functionality without each consumer rolling its own flag pattern.
+
+## `Studio/` — ABP Studio integration shims
+
+Marker types the closed-source ABP Studio tooling reads at design time. No runtime behavior.
+
+## `Text/` — small string helpers
+
+Things like `InlineStringBuilder` and `Encoding` helpers. Trivial; check the folder when you need them.
+
+## `Threading/` — async building blocks
+
+Covered in depth on [Threading & async](/core/threading-and-async). Contents shipping in `Volo.Abp.Core` (the bigger `AbpAsyncTimer` etc. live in the sibling `Volo.Abp.Threading` package):
+
+| File | Role |
+| --- | --- |
+| `AsyncHelper.cs` | `RunSync(Func<Task>)`, `IsAsync(MethodInfo)`, `UnwrapTask(Type)`. |
+| `AsyncOneTimeRunner.cs` / `OneTimeRunner.cs` | Run a delegate exactly once even under concurrent calls. |
+| `InternalAsyncHelper.cs` | Internal `AwaitTaskWithFinally` used by interceptors to bolt an `await` onto a method that returned a `Task`. |
+| `LockExtensions.cs`, `SemaphoreSlimExtensions.cs` | `using` patterns for monitors and semaphores. |
+| `TaskCache.cs` | Pre-allocated `Task.FromResult(true)` / `false` to avoid allocations. |
+
+## `Tracing/` — correlation IDs
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Tracing/ICorrelationIdProvider.cs
+public interface ICorrelationIdProvider
+{
+    string Get();
+}
+```
+
+`DefaultCorrelationIdProvider` plus `AbpCorrelationIdOptions` (header name `X-Correlation-Id`, whether to write it back, etc.). The HTTP middleware that reads/writes the header lives in `Volo.Abp.AspNetCore`.
+
+## `Microsoft/Extensions/DependencyInjection/` — `IServiceCollection` sugar
+
+This sibling tree under the Microsoft namespace is what makes module code feel ergonomic:
+
+| File | Provides |
+| --- | --- |
+| `ServiceCollectionApplicationExtensions.cs` | `AddAbpApplication<T>()`, `AddCoreServices()`, `AddCoreAbpServices()` (called from `AbpApplicationBase` ctor). |
+| `ServiceCollectionConfigurationExtensions.cs` | `GetConfiguration()` / `GetConfigurationOrNull()`. |
+| `ServiceCollectionConventionalRegistrationExtensions.cs` | `AddAssembly(asm)`, `AddType(t)`, `GetConventionalRegistrars()`. |
+| `ServiceCollectionPreConfigureExtensions.cs` | `PreConfigure<T>(action)`, `ExecutePreConfiguredActions<T>()`. |
+| `ServiceCollectionObjectAccessorExtensions.cs` | `TryAddObjectAccessor<T>()`, `AddObjectAccessor(value)`. |
+| `ServiceCollectionLoggingExtensions.cs` | `GetInitLogger<T>()`. |
+| `ServiceCollectionRegistrationActionExtensions.cs` | `OnRegistered`, `OnExposing`, `OnActivated` hooks. |
+| `ServiceCollectionDynamicOptionsManagerExtensions.cs` | Wires `AbpDynamicOptionsManager<T>` into the container. |
+| `ServiceCollectionLifetimeEventExtensions.cs` | `OnApplicationInitialization` callbacks registered as services. |
+| `ServiceDescriptorExtensions.cs` | `WithLifetime`, etc. |
+
+## `System/` — extension methods on BCL types
+
+Small but heavily used. Highlights:
+
+| Extension | Defined on | What it does |
+| --- | --- | --- |
+| `IsNullOrEmpty()`, `IsNullOrWhiteSpace()`, `EnsureEndsWith(char)`, `Left(n)`, `Right(n)` | `string` | The string helpers `BusinessException` and the registrar use. |
+| `AddIfNotContains(item)` | `ICollection<T>` | Used by `AbpModuleDescriptor.AddDependency`. |
+| `GetOrAdd(key, factory)` | `IDictionary<K,V>` | Used by `ServiceConfigurationContext.Items`. |
+| `SortByDependencies(dependsOn)` | `IEnumerable<T>` | Topological sort the `ModuleLoader` runs to order modules. |
+| `MoveItem(predicate, newIndex)` | `IList<T>` | Used to push the startup module to the *end* of the sorted list. |
+
+## What is **not** in `Volo.Abp.Core`
+
+- No `IClock`, no `IGuidGenerator`, no JSON. Those ship in `Volo.Abp.Timing`, `Volo.Abp.Guids`, `Volo.Abp.Serialization`, and `Volo.Abp.Json`. Covered separately on [Timing](/core/timing), [Guids](/core/guids), [Serialization](/core/serialization).
+- No `Castle.Core` reference. The Core declares `IAbpInterceptor`; the package that actually wires Castle.DynamicProxy is `Volo.Abp.Castle.Core` (consumed by Autofac integration). See [Dynamic proxy & aspects](/core/dynamic-proxy-and-aspects) for the wiring story.
+- No EF / Mongo / Dapper. Persistence is layered on top — start at [Data layer overview](/data/overview).
+
+<Note>
+  When in doubt, `grep -r "ITransientDependency" framework/src/Volo.Abp.Core/` from the repo root. Reading the source is the fastest way to understand how a framework piece is wired — every type in this package fits on one screen.
+</Note>

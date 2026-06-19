@@ -1,0 +1,370 @@
+---
+title: "Imaging — ImageSharp: pure-managed JPEG/PNG/WebP/GIF/BMP/TIFF resizing and compression"
+sidebarTitle: "Imaging — ImageSharp"
+description: "The SixLabors.ImageSharp contributors that implement IImageResizer and IImageCompressor without any native dependencies. JpegEncoder/PngEncoder/WebpEncoder configuration, supported mime types, and how the compression keep-or-discard rule works."
+---
+
+`Volo.Abp.Imaging.ImageSharp` is the **default pure-managed** imaging backend. It depends only on `SixLabors.ImageSharp` (no native bits), so it works identically on Windows/Linux/macOS containers without extra packaging. For most ABP apps this is the only imaging package you need.
+
+Source: `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/`
+
+## The module
+
+```csharp
+// framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/AbpImagingImageSharpModule.cs
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingImageSharpModule : AbpModule
+{
+}
+```
+
+That's it — registration happens through the `ITransientDependency` markers on the contributors.
+
+## The compressor contributor
+
+```csharp
+// framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpImageCompressorContributor.cs
+public class ImageSharpImageCompressorContributor : IImageCompressorContributor, ITransientDependency
+{
+    protected ImageSharpCompressOptions Options { get; }
+
+    public ImageSharpImageCompressorContributor(IOptions<ImageSharpCompressOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public virtual async Task<ImageCompressResult<Stream>> TryCompressAsync(
+        Stream stream, string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && !CanCompress(mimeType))
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        using var image = await Image.LoadAsync(stream, cancellationToken);
+
+        if (!CanCompress(image.Metadata.DecodedImageFormat!.DefaultMimeType))
+            return new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        var memoryStream = await GetStreamFromImageAsync(
+            image, image.Metadata.DecodedImageFormat, cancellationToken);
+
+        if (memoryStream.Length < stream.Length)
+            return new ImageCompressResult<Stream>(memoryStream, ImageProcessState.Done);
+
+        await memoryStream.DisposeAsync();
+        return new ImageCompressResult<Stream>(stream, ImageProcessState.Canceled);
+    }
+```
+
+What it does:
+
+1. **Bail out early** if the caller's `mimeType` says it's not JPEG/PNG/WebP.
+2. **Load and re-inspect** — the decoded mime type is the authoritative one. A file lying about its extension still fails this check.
+3. **Re-encode** with the configured encoder for the format.
+4. **Compare sizes** — keep the new stream only if it's smaller, otherwise return `Canceled` so callers know to keep the original.
+
+The byte-array overload trampolines through the stream version:
+
+```csharp
+public virtual async Task<ImageCompressResult<byte[]>> TryCompressAsync(
+    byte[] bytes, string? mimeType = null, CancellationToken cancellationToken = default)
+{
+    if (!string.IsNullOrWhiteSpace(mimeType) && !CanCompress(mimeType))
+        return new ImageCompressResult<byte[]>(bytes, ImageProcessState.Unsupported);
+
+    using var ms = new MemoryStream(bytes);
+    var result = await TryCompressAsync(ms, mimeType, cancellationToken);
+
+    if (result.State != ImageProcessState.Done)
+        return new ImageCompressResult<byte[]>(bytes, result.State);
+
+    var newBytes = await result.Result.GetAllBytesAsync(cancellationToken);
+    await result.Result.DisposeAsync();
+    return new ImageCompressResult<byte[]>(newBytes, result.State);
+}
+```
+
+### Supported mime types
+
+```csharp
+protected virtual bool CanCompress(string? mimeType)
+{
+    return mimeType switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Webp => true,
+        _ => false
+    };
+}
+```
+
+Just three formats — these are the ones where lossy/lossless re-encoding actually helps. GIF compression is a separate problem solved well by [Magick.NET](/misc/imaging-magick).
+
+### Encoder selection
+
+```csharp
+protected virtual IImageEncoder GetEncoder(IImageFormat format)
+{
+    switch (format.DefaultMimeType)
+    {
+        case MimeTypes.Image.Jpeg: return Options.JpegEncoder;
+        case MimeTypes.Image.Png:  return Options.PngEncoder;
+        case MimeTypes.Image.Webp: return Options.WebpEncoder;
+        default:
+            throw new NotSupportedException($"No encoder available for the given format: {format.Name}");
+    }
+}
+```
+
+The encoder objects come from `ImageSharpCompressOptions`, which is the single configuration surface for this backend.
+
+## `ImageSharpCompressOptions`
+
+```csharp
+// framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpCompressOptions.cs
+using SixLabors.ImageSharp.Formats;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.Formats.Webp;
+
+namespace Volo.Abp.Imaging;
+
+public class ImageSharpCompressOptions
+{
+    public IImageEncoder JpegEncoder { get; set; }
+    public IImageEncoder PngEncoder  { get; set; }
+    public IImageEncoder WebpEncoder { get; set; }
+
+    public int DefaultQuality { get; set; } = 75;
+
+    public ImageSharpCompressOptions()
+    {
+        JpegEncoder = new JpegEncoder { Quality = DefaultQuality };
+        PngEncoder  = new PngEncoder
+        {
+            CompressionLevel = PngCompressionLevel.BestCompression,
+            SkipMetadata     = true
+        };
+        WebpEncoder = new WebpEncoder { Quality = DefaultQuality };
+    }
+}
+```
+
+| Property | Default | Notes |
+|---|---|---|
+| `JpegEncoder` | `JpegEncoder { Quality = 75 }` | Quality is a 0–100 visual-quality dial; 75 is a sweet spot for most user uploads. |
+| `PngEncoder` | `BestCompression`, `SkipMetadata = true` | PNG compression is **lossless** — the only knob is CPU cost. `SkipMetadata` drops EXIF/PHYSICAL tags. |
+| `WebpEncoder` | `WebpEncoder { Quality = 75 }` | WebP supports both lossy and lossless modes; `Quality = 75` is lossy. |
+| `DefaultQuality` | `75` | The seed for the JPEG and WebP encoders. Override the encoders directly to use a different quality. |
+
+### Tuning
+
+```csharp
+[DependsOn(typeof(AbpImagingImageSharpModule))]
+public class MyHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<ImageSharpCompressOptions>(options =>
+        {
+            options.JpegEncoder = new JpegEncoder
+            {
+                Quality            = 82,                              // visual quality up
+                ColorType          = JpegEncodingColor.YCbCrRatio444, // less chroma subsampling
+                Interleaved        = true                             // progressive
+            };
+
+            options.WebpEncoder = new WebpEncoder
+            {
+                Quality      = 90,
+                Method       = WebpEncodingMethod.BestQuality,
+                FileFormat   = WebpFileFormatType.Lossy
+            };
+
+            options.PngEncoder = new PngEncoder
+            {
+                CompressionLevel = PngCompressionLevel.Level9,
+                FilterMethod     = PngFilterMethod.Adaptive,
+                SkipMetadata     = false  // keep ICC for photographic PNGs
+            };
+        });
+    }
+}
+```
+
+<Tip>Quality 75 is a *defensive* default. For e-commerce product imagery aim for 82-88; for user-generated content on a social feed 70 is often enough.</Tip>
+
+## The resizer contributor
+
+```csharp
+// framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpImageResizerContributor.cs
+public class ImageSharpImageResizerContributor : IImageResizerContributor, ITransientDependency
+{
+    public virtual async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string? mimeType = null, CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        using var image = await Image.LoadAsync(stream, cancellationToken);
+
+        if (!CanResize(image.Metadata.DecodedImageFormat!.DefaultMimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        if (ResizeModeMap.TryGetValue(resizeArgs.Mode, out var resizeMode))
+        {
+            image.Mutate(x => x.Resize(new ResizeOptions
+            {
+                Size = GetSize(resizeArgs),
+                Mode = resizeMode
+            }));
+        }
+        else
+        {
+            throw new NotSupportedException("Resize mode " + resizeArgs.Mode + "is not supported!");
+        }
+
+        var memoryStream = new MemoryStream();
+        await image.SaveAsync(memoryStream, image.Metadata.DecodedImageFormat, cancellationToken: cancellationToken);
+        memoryStream.Position = 0;
+        return new ImageResizeResult<Stream>(memoryStream, ImageProcessState.Done);
+    }
+```
+
+The shape mirrors the compressor:
+
+1. Reject by mime type (caller-declared and decoded).
+2. Call `image.Mutate(x => x.Resize(...))` with the mapped mode.
+3. **Save in the same format** (`image.Metadata.DecodedImageFormat`) — no format conversion.
+
+### The `ImageResizeMode` → `ResizeMode` map
+
+```csharp
+protected Dictionary<ImageResizeMode, ResizeMode> ResizeModeMap = new()
+{
+    { ImageResizeMode.None,    default },
+    { ImageResizeMode.Stretch, ResizeMode.Stretch },
+    { ImageResizeMode.BoxPad,  ResizeMode.BoxPad },
+    { ImageResizeMode.Min,     ResizeMode.Min },
+    { ImageResizeMode.Max,     ResizeMode.Max },
+    { ImageResizeMode.Crop,    ResizeMode.Crop },
+    { ImageResizeMode.Pad,     ResizeMode.Pad }
+};
+```
+
+`ImageResizeMode.Default` doesn't appear because the orchestrator (`ImageResizer.ChangeDefaultResizeMode`) already replaces it with `ImageResizeOptions.DefaultResizeMode` before reaching the contributor.
+
+### `GetSize`
+
+```csharp
+private static Size GetSize(ImageResizeArgs resizeArgs)
+{
+    var size = new Size();
+    if (resizeArgs.Width  > 0) size.Width  = (int)resizeArgs.Width;
+    if (resizeArgs.Height > 0) size.Height = (int)resizeArgs.Height;
+    return size;
+}
+```
+
+Either dimension can be zero, which ImageSharp interprets as "compute from the other dimension and the resize mode". So `ResizeAsync(stream, new ImageResizeArgs(width: 1024, mode: ImageResizeMode.Min))` shrinks the image so that **either** axis is at most 1024 while preserving aspect — perfect for "max-width thumbnails".
+
+### Supported mime types
+
+```csharp
+protected virtual bool CanResize(string? mimeType)
+{
+    return mimeType switch
+    {
+        MimeTypes.Image.Jpeg => true,
+        MimeTypes.Image.Png  => true,
+        MimeTypes.Image.Gif  => true,
+        MimeTypes.Image.Bmp  => true,
+        MimeTypes.Image.Tiff => true,
+        MimeTypes.Image.Webp => true,
+        _ => false
+    };
+}
+```
+
+The resizer supports more formats than the compressor — even BMP and TIFF, because resizing is a pixel operation independent of the format-specific encoder knobs.
+
+## Format conversion pattern
+
+ImageSharp can save in *any* format, not just the input one. To implement "convert all uploads to WebP", subclass the contributor and override the save step:
+
+```csharp
+[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]
+[ExposeServices(typeof(IImageResizerContributor))]
+public class WebpConvertingResizerContributor : ImageSharpImageResizerContributor
+{
+    public override async Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs, string? mimeType = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && !CanResize(mimeType))
+            return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+        using var image = await Image.LoadAsync(stream, cancellationToken);
+
+        image.Mutate(x => x.Resize(new ResizeOptions
+        {
+            Size = new Size((int)resizeArgs.Width, (int)resizeArgs.Height),
+            Mode = ResizeMode.Min
+        }));
+
+        var ms = new MemoryStream();
+        await image.SaveAsWebpAsync(ms, cancellationToken: cancellationToken);
+        ms.Position = 0;
+        return new ImageResizeResult<Stream>(ms, ImageProcessState.Done);
+    }
+}
+```
+
+Because the contributor returns a `Stream` that's now WebP-encoded, the *caller* needs to know to save it as `.webp` — `ImageResizeResult<Stream>` doesn't carry a mime type. If you need that, pair the conversion with a wrapper response type of your own.
+
+## When to add a sibling backend
+
+| Need | Add |
+|---|---|
+| Lossless GIF optimization | [`Volo.Abp.Imaging.MagickNet`](/misc/imaging-magick) |
+| Skia interop (drawing, shaders) | [`Volo.Abp.Imaging.SkiaSharp`](/misc/imaging-skiasharp) |
+| Just JPEG/PNG/WebP at scale | Stay with ImageSharp alone — it's fast, fully managed, and has no native deps. |
+
+Multiple backends *coexist* — the contributor chain falls through to the next one when ImageSharp returns `Unsupported`.
+
+## Memory considerations
+
+ImageSharp decodes images into managed memory. A 24-megapixel JPEG decompresses to roughly 72 MB of raw pixels. For a server doing batch image processing, two things help:
+
+1. **Use the stream overloads** — they let the buffer get GC'd quickly.
+2. **Set a per-request memory limit** at the host level. ImageSharp respects `Configuration.Default.MemoryAllocator`; you can install a [`UniformUnmanagedMemoryPoolMemoryAllocator`](https://docs.sixlabors.com/api/ImageSharp/SixLabors.ImageSharp.Memory.UniformUnmanagedMemoryPoolMemoryAllocator.html) with a tight budget.
+
+```csharp
+Configuration.Default.MemoryAllocator =
+    new UniformUnmanagedMemoryPoolMemoryAllocator(
+        unmanagedBlockSize: 32 * 1024 * 1024,   // 32 MB blocks
+        unmanagedBudget:    256 * 1024 * 1024); // 256 MB total
+```
+
+## Pitfalls
+
+<Warning>**Decoding before mime-type check.** If `mimeType` is `null` *and* the file isn't actually an image, `Image.LoadAsync` throws. The contributor relies on callers (notably `ResizeImageAttribute` / `CompressImageAttribute`) to pass the upload's `ContentType`. If you call `IImageResizer` directly, do the same.</Warning>
+
+<Warning>**`Canceled` is normal.** It means "compressed bigger, kept the original". Don't surface it as an error in your UI.</Warning>
+
+<Warning>**`SkipMetadata = true` on PNG drops ICC profiles.** Acceptable for thumbnails and user avatars; not acceptable for colour-critical assets (prepress, e-commerce). Flip it to `false` per-encoder when you care.</Warning>
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Imaging abstractions" icon="image" href="/misc/imaging-abstractions">
+    The orchestrator and contributor contracts that this backend implements.
+  </Card>
+  <Card title="Magick.NET" icon="wand-magic-sparkles" href="/misc/imaging-magick">
+    Native ImageMagick — useful sibling for GIF and lossless cases.
+  </Card>
+  <Card title="BLOB storing" icon="database" href="/modules/blob-storing-database">
+    Persist the resized/compressed outputs.
+  </Card>
+</CardGroup>

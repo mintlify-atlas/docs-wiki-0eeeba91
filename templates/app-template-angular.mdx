@@ -1,0 +1,366 @@
+---
+title: "Layered Angular App Template"
+description: "Tour of templates/app/angular/ — the Angular SPA workspace that pairs with the layered ABP backend."
+---
+
+When you pass `-u angular` to [`abp new`](/cli/new-command) on a layered (`-t app`) solution, the CLI also extracts the workspace under [`templates/app/angular/`](https://github.com/abpframework/abp/tree/dev/templates/app/angular). The result is a standard Angular CLI workspace pre-wired for ABP — same `Routes`-based router, same `provideAbpCore` / `provideAbpOAuth` / `provideThemeLeptonX` configuration, same authority on `HttpApi.HostWithIds`.
+
+This page documents the workspace as it lives in the framework repo. Every file path below is real.
+
+```
+templates/app/angular/
+├── README.md
+├── angular.json                  # Angular CLI workspace config
+├── karma.conf.js                 # Karma test runner config
+├── package.json                  # Dependencies (Angular 20 + @abp/ng.* 10.x)
+├── start.ps1                     # Convenience script: npm install + ng serve
+├── tsconfig.app.json             # App-only TS config
+├── tsconfig.json                 # Root TS config
+├── tsconfig.spec.json            # Test TS config
+└── src/
+    ├── app/
+    ├── assets/
+    ├── environments/
+    ├── favicon.ico
+    ├── index.html
+    ├── main.ts
+    ├── polyfills.ts
+    ├── styles.scss
+    └── test.ts
+```
+
+## Bootstrap chain
+
+Standalone Angular: there is no `AppModule`. `main.ts` calls `bootstrapApplication` directly:
+
+```ts templates/app/angular/src/main.ts
+import { bootstrapApplication } from '@angular/platform-browser';
+import { appConfig } from './app/app.config';
+import { AppComponent } from './app/app.component';
+
+bootstrapApplication(AppComponent, appConfig).catch(err => console.error(err));
+```
+
+`AppComponent` is intentionally minimal — it's just a host for the ABP dynamic layout, loader bar, and connectivity indicator:
+
+```ts templates/app/angular/src/app/app.component.ts
+import { Component } from '@angular/core';
+import { InternetConnectionStatusComponent, LoaderBarComponent } from '@abp/ng.theme.shared';
+import { DynamicLayoutComponent } from '@abp/ng.core';
+
+@Component({
+  selector: 'app-root',
+  template: `
+    <abp-loader-bar />
+    <abp-dynamic-layout />
+    <abp-internet-status />
+  `,
+  imports: [LoaderBarComponent, DynamicLayoutComponent, InternetConnectionStatusComponent],
+})
+export class AppComponent {}
+```
+
+`<abp-dynamic-layout>` reads each `Route`'s `data.layout` value (set by `eLayoutType` in route providers) and swaps in the right shell — application, account, or empty.
+
+## `app.config.ts` — the wiring
+
+This is where every ABP feature is enabled. Order matters: `provideAbpCore` first, then OAuth, then UI providers.
+
+```ts templates/app/angular/src/app/app.config.ts
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(appRoutes),
+    APP_ROUTE_PROVIDER,
+    provideAbpCore(
+      withOptions({
+        environment,
+        registerLocaleFn: registerLocale(),
+      })
+    ),
+    provideThemeLeptonX(),
+    provideSideMenuLayout(),
+    provideAbpOAuth(),
+    provideAbpThemeShared(),
+    provideSettingManagementConfig(),
+    provideAccountConfig(),
+    provideIdentityConfig(),
+    provideTenantManagementConfig(),
+    provideFeatureManagementConfig(),
+    provideAnimations(),
+    provideLogo(withEnvironmentOptions(environment)),
+  ],
+};
+```
+
+<Info>
+The default theme baked into the layered template is **LeptonX** (`@abp/ng.theme.lepton-x ~5.0.1`). The no-layers template defaults to the basic theme. See [`templates/app-nolayers-angular`](/templates/app-nolayers-angular) for the comparison.
+</Info>
+
+## `environment.ts` — points at the backend
+
+The Angular app talks to `HttpApi.HostWithIds` on `https://localhost:44305` by default:
+
+```ts templates/app/angular/src/environments/environment.ts
+const baseUrl = 'http://localhost:4200';
+
+export const environment = {
+  production: false,
+  application: {
+    baseUrl,
+    name: 'MyProjectName',
+    logoUrl: '',
+  },
+  oAuthConfig: {
+    issuer: 'https://localhost:44305/',
+    redirectUri: baseUrl,
+    clientId: 'MyProjectName_App',
+    responseType: 'code',
+    scope: 'offline_access MyProjectName',
+    requireHttps: true,
+  },
+  apis: {
+    default: {
+      url: 'https://localhost:44305',
+      rootNamespace: 'MyCompanyName.MyProjectName',
+    },
+  },
+} as Environment;
+```
+
+<Warning>
+The `clientId` value (`MyProjectName_App`) and the matching `OpenIddictDataSeedContributor` entry on the backend must agree. `abp new` keeps them in sync; if you rename either, update both.
+</Warning>
+
+`environment.prod.ts` ships alongside and replaces these values during `ng build --configuration production`.
+
+## Routing
+
+`app.routes.ts` lazy-loads ABP feature modules from their standalone packages:
+
+```ts templates/app/angular/src/app/app.routes.ts
+export const appRoutes: Routes = [
+  {
+    path: '',
+    pathMatch: 'full',
+    loadChildren: () => import('./home/home.routes').then(m => m.homeRoutes),
+  },
+  {
+    path: 'account',
+    loadChildren: () => import('@abp/ng.account').then(m => m.createRoutes()),
+  },
+  {
+    path: 'identity',
+    loadChildren: () => import('@abp/ng.identity').then(m => m.createRoutes()),
+  },
+  {
+    path: 'tenant-management',
+    loadChildren: () =>
+      import('@abp/ng.tenant-management').then(m => m.createRoutes()),
+  },
+  {
+    path: 'setting-management',
+    loadChildren: () =>
+      import('@abp/ng.setting-management').then(m => m.createRoutes()),
+  },
+];
+```
+
+The `createRoutes()` factory each package exports lets you customise route data without forking the package.
+
+## Menu wiring
+
+`route.provider.ts` registers the **menu entries** (independent from Angular's `Routes`). ABP renders the menu in `<abp-dynamic-layout>` based on what `RoutesService` knows:
+
+```ts templates/app/angular/src/app/route.provider.ts
+import { RoutesService, eLayoutType } from '@abp/ng.core';
+import { APP_INITIALIZER } from '@angular/core';
+
+export const APP_ROUTE_PROVIDER = [
+  { provide: APP_INITIALIZER, useFactory: configureRoutes, deps: [RoutesService], multi: true },
+];
+
+function configureRoutes(routesService: RoutesService) {
+  return () => {
+    routesService.add([
+      {
+        path: '/',
+        name: '::Menu:Home',
+        iconClass: 'fas fa-home',
+        order: 1,
+        layout: eLayoutType.application,
+      },
+    ]);
+  };
+}
+```
+
+Note the `::Menu:Home` localization key — ABP's Angular i18n uses `<resource>::<key>` notation, and the resource is implicit (the default app resource).
+
+## `package.json` — the dependency footprint
+
+```jsonc templates/app/angular/package.json
+{
+  "name": "MyProjectName",
+  "version": "0.0.0",
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve --open",
+    "build": "ng build",
+    "build:prod": "ng build --configuration production",
+    "watch": "ng build --watch --configuration development",
+    "test": "ng test",
+    "lint": "ng lint"
+  },
+  "private": true,
+  "dependencies": {
+    "@abp/ng.account": "~10.0.1",
+    "@abp/ng.components": "~10.0.1",
+    "@abp/ng.core": "~10.0.1",
+    "@abp/ng.identity": "~10.0.1",
+    "@abp/ng.oauth": "~10.0.1",
+    "@abp/ng.setting-management": "~10.0.1",
+    "@abp/ng.tenant-management": "~10.0.1",
+    "@abp/ng.theme.lepton-x": "~5.0.1",
+    "@abp/ng.theme.shared": "~10.0.1",
+    "@angular/animations": "~20.0.0",
+    "@angular/common": "~20.0.0",
+    "@angular/compiler": "~20.0.0",
+    "@angular/core": "~20.0.0",
+    "@angular/forms": "~20.0.0",
+    "@angular/localize": "~20.0.0",
+    "@angular/platform-browser": "~20.0.0"
+    /* … */
+  }
+}
+```
+
+Every `@abp/ng.*` package versions are pinned to the same minor. Upgrading the framework? Bump all of them together.
+
+## `angular.json` highlights
+
+```jsonc templates/app/angular/angular.json
+{
+  "projects": {
+    "MyProjectName": {
+      "projectType": "application",
+      "schematics": {
+        "@schematics/angular:component": { "style": "scss" }
+      },
+      "root": "",
+      "sourceRoot": "src",
+      "prefix": "app",
+      "architect": {
+        "build": {
+          "builder": "@angular/build:application",
+          "options": {
+            "outputPath": "dist/MyProjectName",
+            "index": "src/index.html",
+            "browser": "src/main.ts",
+            "polyfills": ["src/polyfills.ts"],
+            "tsConfig": "tsconfig.app.json",
+            "inlineStyleLanguage": "scss",
+            "allowedCommonJsDependencies": ["chart.js", "js-sha256"],
+            "assets": ["src/favicon.ico", "src/assets"]
+            /* styles + scripts */
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+A few ABP-specific pieces:
+
+- **`allowedCommonJsDependencies`** — `chart.js` and `js-sha256` are CommonJS; Angular warns otherwise.
+- **`prefix: "app"`** — every component generated by `ng g` is `app-…`.
+- **Builder is `@angular/build:application`** — the modern esbuild-based builder, not the deprecated webpack one.
+
+## `src/app/shared/`
+
+```
+src/app/shared/
+└── shared.module.ts   # Re-exports common ABP / Angular modules for feature pages
+```
+
+A single `SharedModule` aggregates the imports every page tends to need (forms, common, theme components). Standalone components import it explicitly.
+
+## `src/app/home/`
+
+The starter "home" page. It uses ABP's `CurrentUserService` and route service to show whether the user is logged in. Look here for an example of a `@Component({ standalone: true, imports: [...] })` page that participates in the dynamic layout.
+
+## Workspace utilities
+
+<AccordionGroup>
+  <Accordion title="start.ps1">
+    PowerShell convenience for Windows devs: `npm install` then `ng serve --open`. Equivalent to `npm install && npm start`.
+  </Accordion>
+  <Accordion title="karma.conf.js">
+    Standard Angular CLI Karma + Jasmine setup. The template ships with no real tests — you bring them.
+  </Accordion>
+  <Accordion title="tsconfig.json / tsconfig.app.json / tsconfig.spec.json">
+    Standard Angular TS configs. `strict: true`, `experimentalDecorators: true`, `useDefineForClassFields: false` (ABP needs the legacy semantics for some decorators).
+  </Accordion>
+  <Accordion title="src/styles.scss">
+    Global stylesheet. Empty by default — LeptonX styles come from the `@abp/ng.theme.lepton-x` package and are injected via `angular.json`'s `styles` array.
+  </Accordion>
+</AccordionGroup>
+
+## Running it locally
+
+<Steps>
+  <Step title="Generate the layered solution with Angular UI">
+    ```bash
+    abp new Acme.Bookstore -t app -u angular -d ef
+    ```
+  </Step>
+  <Step title="Start the backend hosts">
+    Apply migrations, then run `HttpApi.HostWithIds` (and `AuthServer` if you chose `--separate-auth-server`). See [Project building](/cli/project-building) for details.
+  </Step>
+  <Step title="Install Angular dependencies">
+    ```bash
+    cd angular
+    npm install
+    ```
+  </Step>
+  <Step title="Run the SPA">
+    ```bash
+    npm start
+    ```
+    The app opens at `http://localhost:4200` and authenticates against `https://localhost:44305`.
+  </Step>
+</Steps>
+
+## Files you will edit first
+
+<CardGroup cols={2}>
+  <Card title="environment.ts" icon="gear">
+    Point at your real API origin and OpenIddict authority before deploying.
+  </Card>
+  <Card title="route.provider.ts" icon="bars">
+    Add menu items. ABP renders them by their localization key.
+  </Card>
+  <Card title="app.routes.ts" icon="signs-post">
+    Add lazy-loaded feature folders. Follow the `createRoutes()` pattern for module packages.
+  </Card>
+  <Card title="src/app/home/" icon="house">
+    Replace the placeholder home page with your own dashboard.
+  </Card>
+</CardGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Layered backend" icon="layer-group" href="/templates/app-template-aspnet-core">
+    The matching ASP.NET Core solution this SPA talks to.
+  </Card>
+  <Card title="abp new flags" icon="terminal" href="/cli/new-command">
+    `-u angular`, `--tiered`, and what else you can combine.
+  </Card>
+  <Card title="No-layers Angular" icon="square-code" href="/templates/app-nolayers-angular">
+    Same Angular skeleton against a flatter backend.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    `abp install-libs`, NPM, and host startup order.
+  </Card>
+</CardGroup>

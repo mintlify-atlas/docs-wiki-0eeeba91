@@ -1,0 +1,305 @@
+---
+title: "Data Filtering: ISoftDelete, IMultiTenant and Custom Filters"
+sidebarTitle: "Data Filtering"
+description: "Use IDataFilter<TFilter> to scope EF Core and Mongo queries by soft delete, tenant or custom predicates, with safe enable/disable scopes."
+---
+
+ABP's data filtering is a thin, provider‑agnostic abstraction that lets your application code say "ignore soft‑deleted entities for this block" or "include other tenants' data for this lookup" without ever touching the underlying ORM. It is the seam through which `Volo.Abp.EntityFrameworkCore` and `Volo.Abp.MongoDB` add `EF.Functions`/`Mongo` query filters automatically. The runtime types live in `framework/src/Volo.Abp.Data/Volo/Abp/Data/` and the provider hooks live alongside `AbpDbContext` and `MongoDbRepositoryFilterer`.
+
+This page covers the abstraction layer. For the multi‑tenant interaction (tenant id matching, `ICurrentTenant.Change`, host vs tenant database) see [`/tenancy/data-filtering`](/tenancy/data-filtering). For raw provider behavior see [`/data/entityframeworkcore`](/data/entityframeworkcore) and [`/data/mongodb`](/data/mongodb).
+
+## IDataFilter — the abstraction
+
+Source: `framework/src/Volo.Abp.Data/Volo/Abp/Data/IDataFilter.cs`.
+
+```csharp
+public interface IDataFilter<TFilter>
+    where TFilter : class
+{
+    IDisposable Enable();
+    IDisposable Disable();
+    bool IsEnabled { get; }
+}
+
+public interface IDataFilter
+{
+    IDisposable Enable<TFilter>()  where TFilter : class;
+    IDisposable Disable<TFilter>() where TFilter : class;
+    bool IsEnabled<TFilter>()      where TFilter : class;
+}
+```
+
+Two flavors:
+
+- **`IDataFilter<TFilter>`** — strongly typed per filter; what providers consume at query time.
+- **`IDataFilter`** — non‑generic dispatcher; what application code uses to flip filters in scoped `using` blocks.
+
+`AbpDataModule` registers them like this (`AbpDataModule.cs`):
+
+```csharp
+context.Services.AddSingleton(typeof(IDataFilter<>), typeof(DataFilter<>));
+// non-generic IDataFilter is registered through ITransientDependency
+// on the DataFilter class
+```
+
+## Built-in filters
+
+The framework ships two filter markers, both consumed automatically by `AbpDbContext` and `MongoDbRepository`.
+
+### ISoftDelete
+
+Defined in `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/ISoftDelete.cs`:
+
+```csharp
+public interface ISoftDelete
+{
+    bool IsDeleted { get; set; }
+}
+```
+
+When enabled (default), `AbpDbContext`:
+
+1. Sets `IsDeleted = true` in `ApplyAbpConceptsForDeletedEntity` rather than calling `Remove`.
+2. Adds a global query filter `e => !e.IsDeleted` so SELECTs hide them.
+
+`MongoDbRepository` does the same: deletes flip `IsDeleted` and `MongoDbRepositoryFilterer` adds an `Eq(x => x.IsDeleted, false)` predicate.
+
+### IMultiTenant
+
+Defined in `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/IMultiTenant.cs`:
+
+```csharp
+public interface IMultiTenant
+{
+    Guid? TenantId { get; }
+}
+```
+
+When enabled (default), `AbpDbContext` adds a filter `e => e.TenantId == CurrentTenantId` so queries automatically scope to the current tenant. The deep dive is on [`/tenancy/data-filtering`](/tenancy/data-filtering).
+
+## Configuring defaults
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDataFilterOptions.cs
+public class AbpDataFilterOptions
+{
+    public Dictionary<Type, DataFilterState> DefaultStates { get; }
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataFilterState.cs
+public class DataFilterState
+{
+    public bool IsEnabled { get; set; }
+    public DataFilterState(bool isEnabled) { IsEnabled = isEnabled; }
+    public DataFilterState Clone() => new(IsEnabled);
+}
+```
+
+Flip a default in a module:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpDataFilterOptions>(options =>
+    {
+        // Globally show soft-deleted by default (for an audit module, say)
+        options.DefaultStates[typeof(ISoftDelete)] = new DataFilterState(false);
+    });
+}
+```
+
+If no entry exists for a filter type, `DataFilter<TFilter>` falls back to `new DataFilterState(true)` — *enabled* by default — as seen in `EnsureInitialized`:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataFilter.cs
+private void EnsureInitialized()
+{
+    if (_filter.Value != null) return;
+    _filter.Value = _options.DefaultStates.GetOrDefault(typeof(TFilter))?.Clone()
+                   ?? new DataFilterState(true);
+}
+```
+
+## Scoped enable / disable
+
+The whole API is a `using` block. The returned `IDisposable` restores the previous state on dispose, so toggles never leak:
+
+```csharp
+public class SoftDeleteAuditAppService : ApplicationService
+{
+    private readonly IDataFilter _dataFilter;
+    private readonly IRepository<Book, Guid> _books;
+
+    public async Task<List<Book>> GetIncludingDeletedAsync()
+    {
+        // Disable for the duration of this query only.
+        using (_dataFilter.Disable<ISoftDelete>())
+        {
+            return await _books.GetListAsync(x => x.AuthorId == CurrentUser.Id!.Value);
+        }
+    }
+}
+```
+
+The implementation:
+
+```csharp
+// framework/src/Volo.Abp.Data/Volo/Abp/Data/DataFilter.cs
+public IDisposable Enable()
+{
+    if (IsEnabled) return NullDisposable.Instance;
+    _filter.Value!.IsEnabled = true;
+    return new DisposeAction(() => Disable());
+}
+
+public IDisposable Disable()
+{
+    if (!IsEnabled) return NullDisposable.Instance;
+    _filter.Value!.IsEnabled = false;
+    return new DisposeAction(() => Enable());
+}
+```
+
+<Warning>
+The state is stored in `AsyncLocal<DataFilterState>` (see [`/data/volo-abp-data`](/data/volo-abp-data)). The disposable is **only safe in the async context that opened it**. Don't pass it across `Task.Run` or to a `BackgroundService` worker thread.
+</Warning>
+
+## Defining a custom filter
+
+Custom filters are useful for tenant‑independent partitioning (e.g. archived rows, multi‑org).
+
+<Steps>
+  <Step title="Define the marker interface">
+    ```csharp
+    public interface IArchivable
+    {
+        bool IsArchived { get; set; }
+    }
+    ```
+    Have your entities implement it.
+  </Step>
+  <Step title="Add the EF Core query filter">
+    In your `DbContext` (or override `ConfigureGlobalFilters` in `AbpDbContext`), add a filter when the data‑filter is enabled:
+    ```csharp
+    protected override Expression<Func<TEntity, bool>>?
+        CreateFilterExpression<TEntity>(ModelBuilder modelBuilder)
+    {
+        var expr = base.CreateFilterExpression<TEntity>(modelBuilder);
+
+        if (typeof(IArchivable).IsAssignableFrom(typeof(TEntity)))
+        {
+            Expression<Func<TEntity, bool>> archived =
+                e => !IsArchivableFilterEnabled
+                  || !EF.Property<bool>(e, nameof(IArchivable.IsArchived));
+            expr = expr == null ? archived : QueryFilterExpressionHelper.CombineExpressions(expr, archived);
+        }
+
+        return expr;
+    }
+
+    protected bool IsArchivableFilterEnabled
+        => DataFilter?.IsEnabled<IArchivable>() ?? false;
+    ```
+  </Step>
+  <Step title="Toggle it">
+    ```csharp
+    using (_dataFilter.Disable<IArchivable>())
+    {
+        // also see archived rows
+    }
+    ```
+  </Step>
+  <Step title="Optional: register a default">
+    ```csharp
+    Configure<AbpDataFilterOptions>(o =>
+        o.DefaultStates[typeof(IArchivable)] = new DataFilterState(true));
+    ```
+  </Step>
+</Steps>
+
+## Provider implementations
+
+### EF Core
+
+`AbpDbContext` (`framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs`) wires the filters:
+
+```csharp
+protected virtual bool IsMultiTenantFilterEnabled =>
+    DataFilter?.IsEnabled<IMultiTenant>() ?? false;
+
+protected virtual bool IsSoftDeleteFilterEnabled =>
+    DataFilter?.IsEnabled<ISoftDelete>() ?? false;
+```
+
+These are evaluated when EF Core builds the model's query filter. The resulting expression uses a boolean **captured by closure**, which is then re‑evaluated each query thanks to `AbpCompiledQueryCacheKeyGenerator` injecting filter state into the cache key (`framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/Modeling/AbpCompiledQueryCacheKeyGenerator.cs`).
+
+When the SQL Server/PostgreSQL provider is used, `AbpEfCoreGlobalFilterOptions.UseDbFunction = true` allows the filter to compile to a `dbo.IsActive(...)` DB function — far better cache reuse. Set in each provider module (see [`/data/efcore-sqlserver`](/data/efcore-sqlserver)).
+
+### MongoDB
+
+`MongoDbRepositoryFilterer` (`framework/src/Volo.Abp.MongoDB/Volo/Abp/Domain/Repositories/MongoDB/MongoDbRepositoryFilterer.cs`) checks `IDataFilter.IsEnabled<>()` and appends `Builders<TEntity>.Filter.Eq(x => x.IsDeleted, false)` / tenant predicates when applying queries.
+
+### MemoryDb
+
+`MemoryDbRepository.ApplyDataFilters` does the same on top of `IQueryable<TEntity>` (LINQ over `List<T>`):
+
+```csharp
+// framework/src/Volo.Abp.MemoryDb/Volo/Abp/Domain/Repositories/MemoryDb/MemoryDbRepository.cs
+public override async Task<IQueryable<TEntity>> GetQueryableAsync()
+{
+    return ApplyDataFilters((await GetCollectionAsync()).AsQueryable());
+}
+```
+
+## Common patterns
+
+<AccordionGroup>
+  <Accordion title="Bypass soft delete for an admin export">
+    ```csharp
+    using (_dataFilter.Disable<ISoftDelete>())
+    using (_dataFilter.Disable<IMultiTenant>())
+    {
+        return await _books.GetListAsync();
+    }
+    ```
+  </Accordion>
+  <Accordion title="Enable a normally-off filter only here">
+    Useful when you ship the framework with the filter off but a small surface needs it on.
+    ```csharp
+    using (_dataFilter.Enable<IArchivable>())
+    {
+        // archived rows hidden in this scope
+    }
+    ```
+  </Accordion>
+  <Accordion title="Check current state before deciding">
+    ```csharp
+    if (_dataFilter.IsEnabled<IMultiTenant>())
+    {
+        // Tenant scoping is on; safe to call host-only logic
+    }
+    ```
+  </Accordion>
+  <Accordion title="DbContext-internal probe">
+    Inside an `AbpDbContext`, prefer the protected `IsSoftDeleteFilterEnabled` / `IsMultiTenantFilterEnabled` properties — they avoid one indirection through the umbrella `IDataFilter`.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.Data" icon="database" href="/data/volo-abp-data">
+    Where `IDataFilter` is registered, options model.
+  </Card>
+  <Card title="Tenancy: data filtering" icon="building" href="/tenancy/data-filtering">
+    `IMultiTenant` + `ICurrentTenant.Change` + host/tenant connection strings.
+  </Card>
+  <Card title="EF Core integration" icon="elephant" href="/data/entityframeworkcore">
+    How `AbpDbContext` applies the filter expression.
+  </Card>
+  <Card title="Repositories" icon="boxes-stacked" href="/ddd/repositories">
+    The boundary where filters become invisible query rewrites.
+  </Card>
+</CardGroup>

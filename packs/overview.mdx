@@ -1,0 +1,312 @@
+---
+title: "npm/packs — ABP's client-side distribution packs"
+sidebarTitle: "Overview"
+description: "The @abp/* npm packages under npm/packs/ that ship JS/CSS shims, resource mappings, and tilde-pinned dependencies copied into wwwroot/libs by abp install-libs."
+---
+
+`npm/packs/` is ABP's set of **publish-only npm packages** that wrap third‑party front‑end libraries (Bootstrap, jQuery, DataTables, Font Awesome, Chart.js, CodeMirror, …) together with the small JS/CSS shims and resource‑mapping descriptors ABP needs at runtime. Every package is published to npm under the **`@abp/<name>`** scope and is the *only* supported way for an MVC or Blazor Server ABP application to acquire those static assets — `abp install-libs` reads each project's `package.json`, runs `yarn` to populate `node_modules`, then walks every `@abp/*` package's `abp.resourcemapping.js` and copies the declared files into the project's `wwwroot/libs/` tree.
+
+This page is the map. Each child page documents one package family and shows its real `package.json` dependencies plus its real `abp.resourcemapping.js` glob list.
+
+## Where this lives
+
+```
+abp/
+└── npm/
+    ├── lerna.json                       # monorepo orchestrator
+    ├── package.json                     # workspace root
+    ├── publish-mvc.ps1                  # publishes packs/* to npmjs.org
+    ├── publish-ng.ps1                   # publishes ng-packs/* to npmjs.org
+    ├── replace-with-tilde.js            # tilde-pins @abp/* deps before publish
+    ├── ng-packs/                        # Angular workspace (separate page tree)
+    └── packs/
+        ├── core/                        # @abp/core           — abp.js, abp.css
+        ├── utils/                       # @abp/utils          — abp.utils package
+        ├── aspnetcore.mvc.ui/                       # @abp/aspnetcore.mvc.ui
+        ├── aspnetcore.mvc.ui.theme.shared/          # @abp/aspnetcore.mvc.ui.theme.shared
+        ├── aspnetcore.mvc.ui.theme.basic/           # @abp/aspnetcore.mvc.ui.theme.basic
+        ├── aspnetcore.components.server.theming/    # @abp/aspnetcore.components.server.theming
+        ├── aspnetcore.components.server.basictheme/ # @abp/aspnetcore.components.server.basictheme
+        ├── bootstrap/                   # @abp/bootstrap                       — Bootstrap 5
+        ├── bootstrap-datepicker/        # @abp/bootstrap-datepicker
+        ├── bootstrap-daterangepicker/   # @abp/bootstrap-daterangepicker
+        ├── jquery/                      # @abp/jquery
+        ├── jquery-form/                 # @abp/jquery-form
+        ├── jquery-validation/           # @abp/jquery-validation
+        ├── jquery-validation-unobtrusive/
+        ├── lodash/  luxon/  moment/  timeago/
+        ├── datatables.net/              # @abp/datatables.net
+        ├── datatables.net-bs4/          # @abp/datatables.net-bs4
+        ├── datatables.net-bs5/          # @abp/datatables.net-bs5
+        ├── select2/                     # @abp/select2
+        ├── sweetalert2/                 # @abp/sweetalert2
+        ├── toastr/                      # @abp/toastr
+        ├── malihu-custom-scrollbar-plugin/
+        ├── chart.js/                    # @abp/chart.js                        — Chart.js v4
+        ├── flag-icon-css/  flag-icons/  # legacy + current flag icon families
+        ├── font-awesome/                # @abp/font-awesome                    — @fortawesome/fontawesome-free
+        ├── highlight.js/                # @abp/highlight.js                    — @highlightjs/cdn-assets
+        ├── prismjs/                     # @abp/prismjs
+        ├── codemirror/                  # @abp/codemirror                      — CodeMirror 5
+        ├── tui-editor/                  # @abp/tui-editor                      — Toast UI Markdown editor
+        ├── markdown-it/  slugify/       # CMS Kit editor utilities
+        ├── star-rating-svg/             # CMS Kit rating widget
+        ├── uppy/                        # CMS Kit uploader
+        ├── jstree/                      # CMS Kit page tree
+        ├── anchor-js/  clipboard/  cropperjs/
+        ├── owl.carousel/                # Blogging module
+        ├── qrcode/  zxcvbn/  signalr/  vee-validate/  vue/
+        ├── cms-kit/                     # @abp/cms-kit             — meta package
+        ├── cms-kit.admin/               # @abp/cms-kit.admin       — admin-side bundles
+        ├── cms-kit.public/              # @abp/cms-kit.public      — public-side bundles
+        ├── blogging/                    # @abp/blogging            — blog module bundles
+        ├── docs/                        # @abp/docs                — docs module bundles
+        └── virtual-file-explorer/       # @abp/virtual-file-explorer
+```
+
+## Why ABP wraps these libraries
+
+Three things every `@abp/<lib>` pack does that consuming a vanilla npm package directly cannot:
+
+<CardGroup cols={2}>
+  <Card title="abp.resourcemapping.js" icon="map">
+    Declares the glob list of files to lift out of `node_modules` into the consumer's `wwwroot/libs/`. The `abp install-libs` CLI command walks every installed `@abp/*` package, evaluates these mappings, and stages files deterministically — no `npm run build`, no bundler config, no per-project copy script.
+  </Card>
+  <Card title="Pre-shipped shims" icon="puzzle-piece">
+    Small JS files in `src/` that adapt the underlying library to ABP conventions: `bootstrap.enable.tooltips.everywhere.js`, `daterangepicker.js` (a Moment-free wrapper), the `abp.jquery.js` localization bridge, etc. These ship inside the `@abp` package itself, not the upstream.
+  </Card>
+  <Card title="Pinned upstream version" icon="lock">
+    Each `package.json` carries a `^`-pinned upstream version (e.g. `"bootstrap": "^5.3.8"`) and a tilde-pinned ABP version (e.g. `"@abp/core": "~10.0.1"`). The publish pipeline (`npm/replace-with-tilde.js`) rewrites the `*`/`workspace:` ranges to exact tildes before pushing to npmjs.org.
+  </Card>
+  <Card title="MVC bundle alignment" icon="layer-group">
+    The file paths each mapping writes into `@libs/<name>/...` line up 1:1 with the **`IBundleContributor` files** in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages` — see [aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages). So `Volo.Abp.AspNetCore.Mvc.UI.Packages.Bootstrap.BootstrapScriptContributor` references `/libs/bootstrap/js/bootstrap.bundle.min.js`, which is exactly what `@abp/bootstrap`'s mapping produces.
+  </Card>
+</CardGroup>
+
+## The libs.config → install-libs → wwwroot/libs flow
+
+```mermaid
+flowchart LR
+    subgraph App["Your MVC / Blazor Server project"]
+        Csproj["MyApp.Web.csproj"]
+        Pkg["package.json<br/>dependencies: { @abp/aspnetcore.mvc.ui.theme.basic, ... }"]
+    end
+
+    subgraph Yarn["Yarn / npm install (step 1)"]
+        NM["node_modules/<br/>├── @abp/core<br/>├── @abp/bootstrap<br/>├── @abp/jquery<br/>├── @abp/aspnetcore.mvc.ui.theme.basic<br/>└── @abp/aspnetcore.mvc.ui.theme.shared"]
+        RM["…each pack contains<br/>abp.resourcemapping.js"]
+    end
+
+    subgraph CLI["abp install-libs (step 2)"]
+        Cmd["InstallLibsCommand<br/>(framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands)"]
+        Svc["InstallLibsService<br/>(Volo/Abp/Cli/LIbs/InstallLibsService.cs)<br/>const LibsDirectory = './wwwroot/libs'"]
+        Map["ResourceMapping evaluator<br/>(reads each abp.resourcemapping.js,<br/>resolves @node_modules / @libs aliases)"]
+    end
+
+    subgraph Out["Output (step 3)"]
+        Libs["wwwroot/libs/<br/>├── abp/core/abp.js<br/>├── bootstrap/css/bootstrap.css<br/>├── bootstrap/js/bootstrap.bundle.js<br/>├── jquery/jquery.js<br/>├── datatables.net-bs5/...<br/>└── @fortawesome/fontawesome-free/css/all.css"]
+    end
+
+    Csproj -->|abp install-libs<br/>finds project| Cmd
+    Pkg -->|yarn install| NM
+    NM --> RM
+    Cmd --> Svc
+    Svc -->|RunYarn(projectDirectory)<br/>then CleanAndCopyResources| Map
+    RM --> Map
+    Map --> Libs
+
+    Libs -.bundled by.-> Bund["AbpMvcLibsService /<br/>BundleContributors<br/>(aspnetcore/mvc-ui-bundling)"]
+```
+
+This diagram is the **literal flow** implemented in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs`:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs
+public class InstallLibsService : IInstallLibsService, ITransientDependency
+{
+    public const string LibsDirectory = "./wwwroot/libs";
+
+    public async Task InstallLibsAsync(string directory)
+    {
+        var projectPaths = FindAllProjects(directory);          // *.csproj + angular.json
+        if (!NpmHelper.IsNpmInstalled())
+        {
+            Logger.LogWarning("NPM is not installed, ...");
+            return;
+        }
+
+        foreach (var projectPath in projectPaths)
+        {
+            // MVC or BLAZOR SERVER
+            if (projectPath.EndsWith(".csproj"))
+            {
+                var packageJsonFilePath = Path.Combine(
+                    Path.GetDirectoryName(projectPath), "package.json");
+                if (!File.Exists(packageJsonFilePath)) continue;
+
+                NpmHelper.RunYarn(projectDirectory);             // step 1: install
+                await CleanAndCopyResources(projectDirectory);   // step 2 + 3
+            }
+        }
+    }
+}
+```
+
+Note: there is **no** standalone `libs.config.json` file. ABP's contract is "the project has `package.json`, every transitively installed `@abp/*` pack carries `abp.resourcemapping.js`, and the CLI reads all of them." The `package.json` itself plays the role of "libs.config" — what you list in `dependencies` is what gets staged into `wwwroot/libs/`.
+
+## Package families documented on this site
+
+<CardGroup cols={2}>
+  <Card title="aspnetcore.mvc.ui" icon="cube" href="/packs/aspnetcore-mvc-ui">
+    `@abp/aspnetcore.mvc.ui` — the entry-point pack consumers reference indirectly. Hosts ABP UI helpers and acts as the dependency anchor for `theme.shared`.
+  </Card>
+  <Card title="Theme: Basic" icon="palette" href="/packs/theme-basic">
+    `@abp/aspnetcore.mvc.ui.theme.basic` — Basic theme JS/CSS assets staged by `install-libs`. Pulls in `theme.shared` transitively.
+  </Card>
+  <Card title="Theme: Shared" icon="layer-group" href="/packs/theme-shared">
+    `@abp/aspnetcore.mvc.ui.theme.shared` — the umbrella metapackage that pulls in **bootstrap, datepicker, daterangepicker, datatables-bs5, font-awesome, jquery-form, jquery-validation-unobtrusive, lodash, luxon, moment, select2, sweetalert2, timeago, malihu-custom-scrollbar-plugin**.
+  </Card>
+  <Card title="CMS Kit packs" icon="newspaper" href="/packs/cms-kit-packs">
+    `@abp/cms-kit`, `cms-kit.admin`, `cms-kit.public`, `blogging` — editor JS (Markdown, Slugify, TUI Editor), comment/rating widgets, star-rating-svg, uppy, prismjs, owl.carousel.
+  </Card>
+  <Card title="jQuery & utilities" icon="hammer" href="/packs/jquery-and-utilities">
+    `@abp/jquery`, `jquery-form`, `jquery-validation`, `jquery-validation-unobtrusive`, `clipboard`, `anchor-js`, `highlight.js`, `codemirror`, `cropperjs` — the small-utility tier.
+  </Card>
+  <Card title="Bootstrap & DataTables" icon="table" href="/packs/bootstrap-and-datatables">
+    `@abp/bootstrap`, `bootstrap-datepicker`, `bootstrap-daterangepicker`, `datatables.net`, `datatables.net-bs4`, `datatables.net-bs5`, `chart.js`, `flag-icon-css`, `flag-icons`, `font-awesome` — UI framework + grid + charting + icons.
+  </Card>
+</CardGroup>
+
+## How each pack is shaped
+
+Every pack — regardless of family — follows the same three-file layout:
+
+```
+npm/packs/<name>/
+├── package.json                # name = "@abp/<name>", upstream pinned with ^,
+│                               #   @abp/* deps pinned with ~ at publish time
+├── abp.resourcemapping.js       # module.exports = { mappings: { "@node_modules/...": "@libs/..." } }
+└── src/                         # OPTIONAL — small JS/CSS shim files
+    └── *.js
+```
+
+Packs that wrap **pure upstream content** (Chart.js, flag-icons, clipboard, anchor-js, font-awesome, highlight.js, datepicker, daterangepicker css, datatables*, cropperjs) carry **no `src/`** — the mapping pulls files straight from `@node_modules/<upstream>/...`.
+
+Packs that add ABP-specific runtime behaviour ship a `src/` folder:
+
+| Pack | `src/` files |
+| --- | --- |
+| `@abp/core` | `abp.js`, `abp.css` (referenced by every contributor) |
+| `@abp/bootstrap` | `bootstrap.enable.popovers.everywhere.js`, `bootstrap.enable.tooltips.everywhere.js` |
+| `@abp/jquery` | jQuery localization bridge files |
+| `@abp/jquery-form` | `jquery.form.min.js` (re-shipped to avoid path drift) |
+| `@abp/bootstrap-daterangepicker` | `daterangepicker.js` (Luxon-friendly fork that replaces the upstream Moment dependency for ABP's Luxon-first stack) |
+| `@abp/jquery-validation` | jQuery-validation entry shim |
+| `@abp/utils` | `abp.utils.js` and helpers consumed by [ASP.NET Core MVC UI Packages](/aspnetcore/mvc-ui-packages) contributors |
+
+## Where `abp install-libs` and add-package fit
+
+The two CLI commands that interact with this tree are documented together at [/cli/install-libs-and-add-package](/cli/install-libs-and-add-package):
+
+- **`abp install-libs`** — the *consumer* side. Run inside an MVC or Blazor Server solution; for every `.csproj` next to a `package.json`, runs Yarn and then walks every transitively-installed `@abp/*` package's `abp.resourcemapping.js` and copies declared files into `./wwwroot/libs/`. Implemented in `Volo/Abp/Cli/Commands/InstallLibsCommand.cs` and `Volo/Abp/Cli/LIbs/InstallLibsService.cs`.
+- **`abp add-package`** — adds a NuGet module to a project and, where appropriate, adds the matching `@abp/<x>` to `package.json`. It does **not** populate `wwwroot/libs/` itself; you run `install-libs` afterwards.
+
+## Where the bundles live
+
+The files staged into `wwwroot/libs/` are then served by the MVC bundling/minification pipeline:
+
+- **Bundle contributors** — one per pack — live in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages/Volo/Abp/AspNetCore/Mvc/UI/Packages/<Name>/`. See [aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages) for the catalogue. Each contributor's `ScriptContributor.AddFiles(...)` and `StyleContributor.AddFiles(...)` calls reference paths under `/libs/<name>/...` — the *exact* output of the matching `abp.resourcemapping.js`.
+- **Tag helpers / dev-time fallback** — `<abp-script>` / `<abp-style>` tag helpers (see [ui/minify-and-bundling](/ui/minify-and-bundling)) wire the bundles into Razor views.
+
+## Reading the rest of this section
+
+<Steps>
+  <Step title="Start with theme.shared">
+    [/packs/theme-shared](/packs/theme-shared) lists every transitive pack pulled by a default ABP MVC project — it's the unified shopping list.
+  </Step>
+  <Step title="Look up a specific library">
+    Each child page reproduces the real `package.json` and `abp.resourcemapping.js` for the pack, so you can see *exactly* what ends up in `wwwroot/libs/<x>/`.
+  </Step>
+  <Step title="Check the matching C# contributor">
+    For any pack here, the file under `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages/Volo/Abp/AspNetCore/Mvc/UI/Packages/<Name>/<Name>ScriptContributor.cs` cites the same paths. They are intentionally kept in lock-step. See [aspnetcore/mvc-ui-packages](/aspnetcore/mvc-ui-packages).
+  </Step>
+  <Step title="Wire it into a view">
+    [/ui/overview](/ui/overview) and [/ui/minify-and-bundling](/ui/minify-and-bundling) cover how `BundleContributor`s are referenced from a layout.
+  </Step>
+</Steps>
+
+## Conventions used in mapping files
+
+All mappings use two path aliases:
+
+| Alias | Resolves to | Used as |
+| --- | --- | --- |
+| `@node_modules/` | the project's `./node_modules/` | **source** of files |
+| `@libs/` | the project's `./wwwroot/libs/` | **destination** for files |
+
+Globs follow `Microsoft.Extensions.FileSystemGlobbing` (the same matcher ASP.NET Core's static file pipeline uses), which is why patterns like `**/*.*`, `*.css*` (for sourcemaps too) and `*.*` appear consistently in the mappings.
+
+## Anatomy of a single staging round
+
+Concretely, what happens when a developer runs `abp install-libs` inside an MVC project's solution root:
+
+<Steps>
+  <Step title="Find projects">
+    `InstallLibsService.FindAllProjects(workingDirectory)` walks every directory (excluding `node_modules`, `.git`, `.idea`, `_templates`, `bin/debug`, `obj/debug`) and collects every `*.csproj` that has a sibling `package.json`, plus every `angular.json` file. Angular projects only get `yarn install`; MVC/Blazor Server projects get `yarn install` **and** the resource-copy pass.
+  </Step>
+  <Step title="Run yarn">
+    `NpmHelper.RunYarn(projectDirectory)` shells out to Yarn (or npm depending on which is on PATH). Result: `node_modules/` is fully populated.
+  </Step>
+  <Step title="Walk every @abp/* pack in node_modules">
+    `CleanAndCopyResources` scans `node_modules/@abp/*` (and any other npm scope ABP modules use, e.g. `node_modules/@volo/*` for commercial modules). For each, it looks for `abp.resourcemapping.js` at the package root.
+  </Step>
+  <Step title="Evaluate each mapping">
+    Each `abp.resourcemapping.js` exports `{ mappings: { "<source-glob>": "<dest-folder>", ... } }`. Source globs use the `@node_modules/...` alias (resolves to the *project's* `node_modules/`, *not* the pack's own). Destination uses `@libs/...` (resolves to `./wwwroot/libs/` per `InstallLibsService.LibsDirectory`).
+  </Step>
+  <Step title="Glob match and copy">
+    `Microsoft.Extensions.FileSystemGlobbing.Matcher` resolves each pattern; matches are copied preserving the relative path under the destination root. Existing files are overwritten (`Clean…And…CopyResources` step removes stale files between runs to avoid drift).
+  </Step>
+</Steps>
+
+The whole sequence is idempotent — running `abp install-libs` repeatedly produces the same `wwwroot/libs/` tree.
+
+## What's *not* in the picture
+
+A few things deliberately **not** part of the `npm/packs` story:
+
+- **No bundler config.** ABP does not run webpack, Vite, or Rollup over these files. They are staged verbatim and bundled at runtime by `Volo.Abp.AspNetCore.Mvc.UI.Bundling` ([ui/minify-and-bundling](/ui/minify-and-bundling)) — or in production with the offline bundling tool.
+- **No TypeScript source.** Every file under `npm/packs/<x>/src/` is plain JS. ABP's TypeScript code lives in `npm/ng-packs/` (Angular workspace), not here.
+- **No build step in the consumer project.** All consumers do is `yarn install` and `abp install-libs`. No `npm run build`, no `npm run watch`, no `webpack.config.js`.
+- **No `libs.config.json`.** The project's `package.json` is the manifest. The `@abp/<x>` packs' `abp.resourcemapping.js` are the rules.
+
+## Versioning and release flow
+
+All `@abp/*` packs in this folder version-bump together. The release pipeline is:
+
+```
+1. Choose new version (e.g. 10.0.2)
+2. npm/lerna.json: update "version"
+3. npm/replace-with-tilde.js:
+   - rewrite every @abp/* dep in every @abp/* pack to "~10.0.2"
+   - keep upstream deps untouched (^bootstrap, ^chart.js, …)
+4. npm/publish-mvc.ps1:
+   - `yarn install` at npm root
+   - `npm publish` from every npm/packs/<x>/
+5. Tag git release
+```
+
+`lerna.json` orchestrates the version sync; `replace-with-tilde.js` flips `workspace:*` references to tildes immediately before publishing. The end-state on npmjs.org is a self-consistent graph where every `@abp/<x>@10.0.2` declares `@abp/<dep>": "~10.0.2"`.
+
+## Cross-references
+
+<CardGroup cols={3}>
+  <Card title="CLI install-libs" icon="terminal" href="/cli/install-libs-and-add-package">
+    The CLI command that consumes every pack on this page.
+  </Card>
+  <Card title="MVC UI Packages" icon="cube" href="/aspnetcore/mvc-ui-packages">
+    The C# bundle contributors that *reference* the files this section stages.
+  </Card>
+  <Card title="UI Overview" icon="palette" href="/ui/overview">
+    How themes assemble bundles from these contributors.
+  </Card>
+</CardGroup>

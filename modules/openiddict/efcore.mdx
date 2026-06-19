@@ -1,0 +1,466 @@
+---
+title: "OpenIddict EF Core — DbContext, Schema, Repositories"
+sidebarTitle: "Entity Framework Core"
+description: "Volo.Abp.OpenIddict.EntityFrameworkCore — the OpenIddictDbContext / IOpenIddictDbContext, the ConfigureOpenIddict() model‑builder extension, the four EfCoreOpenIddict*Repository classes, and the EF Core concurrency‑exception handler."
+---
+
+`Volo.Abp.OpenIddict.EntityFrameworkCore` is the **persistence provider** for the OpenIddict domain layer. It maps the four aggregate roots (`OpenIddictApplication`, `OpenIddictAuthorization`, `OpenIddictScope`, `OpenIddictToken`) to relational tables, supplies a dedicated `OpenIddictDbContext` (single‑database, `[IgnoreMultiTenancy]`), implements `IOpenIddictApplicationRepository` / `IOpenIddictAuthorizationRepository` / `IOpenIddictScopeRepository` / `IOpenIddictTokenRepository` against EF Core, and translates `DbUpdateConcurrencyException` into ABP's `AbpDbConcurrencyException`.
+
+Folder covered: `modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/`.
+
+## Module declaration
+
+`AbpOpenIddictEntityFrameworkCoreModule` depends on the domain module and ABP's EF Core module, then registers the DbContext and pairs each aggregate with its repository implementation:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EntityFrameworkCore/AbpOpenIddictEntityFrameworkCoreModule.cs
+[DependsOn(
+    typeof(AbpOpenIddictDomainModule),
+    typeof(AbpEntityFrameworkCoreModule)
+)]
+public class AbpOpenIddictEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<OpenIddictDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IOpenIddictDbContext>();
+
+            options.AddRepository<OpenIddictApplication,   EfCoreOpenIddictApplicationRepository>();
+            options.AddRepository<OpenIddictAuthorization, EfCoreOpenIddictAuthorizationRepository>();
+            options.AddRepository<OpenIddictScope,         EfCoreOpenIddictScopeRepository>();
+            options.AddRepository<OpenIddictToken,         EfCoreOpenIddictTokenRepository>();
+        });
+
+        Configure<AbpEntityChangeOptions>(options =>
+        {
+            options.IgnoredNavigationEntitySelectors.Add(
+                "DisableOpenIddictApplication",
+                type => type == typeof(OpenIddictApplication));
+        });
+    }
+}
+```
+
+The `AbpEntityChangeOptions.IgnoredNavigationEntitySelectors` line tells ABP's entity‑change tracking system *not* to traverse navigations into `OpenIddictApplication` when computing entity change logs. Without it, auditing the related `OpenIddictAuthorization` and `OpenIddictToken` entities would pull the application along with them on every change.
+
+## The DbContext
+
+The contract lives in `IOpenIddictDbContext`:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EntityFrameworkCore/IOpenIddictDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpOpenIddictDbProperties.ConnectionStringName)] // "AbpOpenIddict"
+public interface IOpenIddictDbContext : IEfCoreDbContext
+{
+    DbSet<OpenIddictApplication>   Applications   { get; }
+    DbSet<OpenIddictAuthorization> Authorizations { get; }
+    DbSet<OpenIddictScope>         Scopes         { get; }
+    DbSet<OpenIddictToken>         Tokens         { get; }
+}
+```
+
+The concrete implementation is the matching `OpenIddictDbContext`:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EntityFrameworkCore/OpenIddictDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpOpenIddictDbProperties.ConnectionStringName)]
+public class OpenIddictDbContext : AbpDbContext<OpenIddictDbContext>, IOpenIddictDbContext
+{
+    public DbSet<OpenIddictApplication>   Applications   { get; set; }
+    public DbSet<OpenIddictAuthorization> Authorizations { get; set; }
+    public DbSet<OpenIddictScope>         Scopes         { get; set; }
+    public DbSet<OpenIddictToken>         Tokens         { get; set; }
+
+    public OpenIddictDbContext(DbContextOptions<OpenIddictDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureOpenIddict();
+    }
+}
+```
+
+Two attributes shape behaviour:
+
+- **`[IgnoreMultiTenancy]`** — `ICurrentTenant.Id` is *not* automatically applied as a query filter. OpenIddict data is host‑level by design.
+- **`[ConnectionStringName("AbpOpenIddict")]`** — the DbContext resolves a dedicated connection string. Map it in your config:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default":       "Server=…;Database=MyApp;…",
+    "AbpOpenIddict": "Server=…;Database=MyApp_OpenIddict;…"
+  }
+}
+```
+
+If you don't define `AbpOpenIddict`, ABP falls back to `Default` so a single‑database setup just works.
+
+## Reusing your existing DbContext
+
+For most real apps you don't run a separate `OpenIddictDbContext`. Instead, you reuse your application DbContext and tell ABP to route `IOpenIddictDbContext` through it:
+
+```csharp
+public class MyAppDbContext : AbpDbContext<MyAppDbContext>, IIdentityProDbContext, IOpenIddictDbContext
+{
+    public DbSet<OpenIddictApplication>   Applications   { get; set; }
+    public DbSet<OpenIddictAuthorization> Authorizations { get; set; }
+    public DbSet<OpenIddictScope>         Scopes         { get; set; }
+    public DbSet<OpenIddictToken>         Tokens         { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureOpenIddict();
+        // builder.ConfigureIdentity(); etc.
+    }
+}
+
+// And in your EF Core module:
+context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+{
+    options.ReplaceDbContext<IOpenIddictDbContext>();
+    options.AddDefaultRepositories<IOpenIddictDbContext>();
+});
+```
+
+`ReplaceDbContext<TInterface>()` tells the unit‑of‑work to satisfy `IOpenIddictDbContext` requests with `MyAppDbContext`. The OpenIddict module repositories then route through your DbContext transparently.
+
+## The schema
+
+`ConfigureOpenIddict()` is the single source of truth for the relational model. It pulls table names, schema, indices, and max‑length constraints out of the shared consts:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EntityFrameworkCore/OpenIddictDbContextModelCreatingExtensions.cs
+public static void ConfigureOpenIddict(this ModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    if (builder.IsTenantOnlyDatabase())
+    {
+        return;
+    }
+
+    builder.Entity<OpenIddictApplication>(b =>
+    {
+        b.ToTable(AbpOpenIddictDbProperties.DbTablePrefix + "Applications",
+                  AbpOpenIddictDbProperties.DbSchema);
+        b.ConfigureByConvention();
+        b.HasIndex(x => x.ClientId);
+
+        b.Property(x => x.ApplicationType).HasMaxLength(OpenIddictApplicationConsts.ApplicationTypeMaxLength);
+        b.Property(x => x.ClientId).HasMaxLength(OpenIddictApplicationConsts.ClientIdMaxLength);
+        b.Property(x => x.ConsentType).HasMaxLength(OpenIddictApplicationConsts.ConsentTypeMaxLength);
+        b.Property(x => x.ClientType).HasMaxLength(OpenIddictApplicationConsts.ClientTypeMaxLength);
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<OpenIddictAuthorization>(b =>
+    {
+        b.ToTable(AbpOpenIddictDbProperties.DbTablePrefix + "Authorizations",
+                  AbpOpenIddictDbProperties.DbSchema);
+        b.ConfigureByConvention();
+        b.HasIndex(x => new { x.ApplicationId, x.Status, x.Subject, x.Type });
+
+        b.Property(x => x.Status).HasMaxLength(OpenIddictAuthorizationConsts.StatusMaxLength);
+        b.Property(x => x.Subject).HasMaxLength(OpenIddictAuthorizationConsts.SubjectMaxLength);
+        b.Property(x => x.Type).HasMaxLength(OpenIddictAuthorizationConsts.TypeMaxLength);
+
+        b.HasOne<OpenIddictApplication>()
+            .WithMany()
+            .HasForeignKey(x => x.ApplicationId)
+            .IsRequired(false);
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<OpenIddictScope>(b =>
+    {
+        b.ToTable(AbpOpenIddictDbProperties.DbTablePrefix + "Scopes",
+                  AbpOpenIddictDbProperties.DbSchema);
+        b.ConfigureByConvention();
+        b.HasIndex(x => x.Name);
+        b.Property(x => x.Name).HasMaxLength(OpenIddictScopeConsts.NameMaxLength);
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<OpenIddictToken>(b =>
+    {
+        b.ToTable(AbpOpenIddictDbProperties.DbTablePrefix + "Tokens",
+                  AbpOpenIddictDbProperties.DbSchema);
+        b.ConfigureByConvention();
+        b.HasIndex(x => x.ReferenceId);
+        b.HasIndex(x => new { x.ApplicationId, x.Status, x.Subject, x.Type });
+
+        b.Property(x => x.ReferenceId).HasMaxLength(OpenIddictTokenConsts.ReferenceIdMaxLength);
+        b.Property(x => x.Status).HasMaxLength(OpenIddictTokenConsts.StatusMaxLength);
+        b.Property(x => x.Subject).HasMaxLength(OpenIddictTokenConsts.SubjectMaxLength);
+        b.Property(x => x.Type).HasMaxLength(OpenIddictTokenConsts.TypeMaxLength);
+
+        b.HasOne<OpenIddictApplication>().WithMany()
+            .HasForeignKey(x => x.ApplicationId).IsRequired(false);
+        b.HasOne<OpenIddictAuthorization>().WithMany()
+            .HasForeignKey(x => x.AuthorizationId).IsRequired(false);
+
+        b.ApplyObjectExtensionMappings();
+    });
+}
+```
+
+Key points:
+
+- **`IsTenantOnlyDatabase()` short‑circuit.** When the model is being built for a tenant‑only database (multi‑tenant setups where each tenant has its own DB), the OpenIddict schema is skipped — these are host tables.
+- **`AbpOpenIddictDbProperties.DbTablePrefix`** defaults to `"OpenIddict"`, so the four tables become `OpenIddictApplications`, `OpenIddictAuthorizations`, `OpenIddictScopes`, `OpenIddictTokens` (plus whatever schema your provider uses).
+- **`ApplyObjectExtensionMappings()`** materializes any module‑extension properties you registered through `ObjectExtensionManager` as actual columns on the table.
+- **Foreign keys are nullable.** `OpenIddictAuthorization.ApplicationId` and `OpenIddictToken.ApplicationId` / `AuthorizationId` are `Guid?` because both ad‑hoc authorizations and standalone tokens are spec‑legal.
+
+The resulting tables (using SQL Server names):
+
+| Table | Indexes | Notes |
+| --- | --- | --- |
+| `OpenIddictApplications` | (ClientId) | Audited; full‑audited columns ( `CreationTime`, `LastModificationTime`, `IsDeleted`, … ). |
+| `OpenIddictAuthorizations` | (ApplicationId, Status, Subject, Type) | FK → `OpenIddictApplications.Id`. |
+| `OpenIddictScopes` | (Name) | Audited. |
+| `OpenIddictTokens` | (ReferenceId), (ApplicationId, Status, Subject, Type) | FKs → `OpenIddictApplications.Id` and `OpenIddictAuthorizations.Id`. |
+
+## The repositories
+
+Each repository extends `EfCoreRepository<IOpenIddictDbContext, TEntity, Guid>` and implements the OpenIddict‑specific query surface that `AbpOpenIddict*Store` invokes.
+
+### EfCoreOpenIddictApplicationRepository
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/Applications/EfCoreOpenIddictApplicationRepository.cs
+public class EfCoreOpenIddictApplicationRepository
+    : EfCoreRepository<IOpenIddictDbContext, OpenIddictApplication, Guid>,
+      IOpenIddictApplicationRepository
+{
+    public EfCoreOpenIddictApplicationRepository(IDbContextProvider<IOpenIddictDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<List<OpenIddictApplication>> GetListAsync(
+        string sorting, int skipCount, int maxResultCount,
+        string filter = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .OrderBy(sorting.IsNullOrWhiteSpace()
+                ? nameof(OpenIddictApplication.CreationTime) + " desc"
+                : sorting)
+            .PageBy(skipCount, maxResultCount)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<long> GetCountAsync(
+        string filter = null, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .WhereIf(!filter.IsNullOrWhiteSpace(), x => x.ClientId.Contains(filter))
+            .LongCountAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<OpenIddictApplication> FindByClientIdAsync(
+        string clientId, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .FirstOrDefaultAsync(x => x.ClientId == clientId,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> FindByPostLogoutRedirectUriAsync(
+        string address, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(x => x.PostLogoutRedirectUris.Contains(address))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> FindByRedirectUriAsync(
+        string address, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(x => x.RedirectUris.Contains(address))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictApplication>> ListAsync(
+        int? count, int? offset, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .SkipIf<OpenIddictApplication, IQueryable<OpenIddictApplication>>(offset.HasValue, offset)
+            .TakeIf<OpenIddictApplication, IQueryable<OpenIddictApplication>>(count.HasValue, count)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+A few patterns worth keeping in mind:
+
+- `GetListAsync` is the admin‑UI pagination call (`AbpOpenIddictApplicationsAppService` ultimately invokes it). Sorting defaults to most‑recently‑created first.
+- `FindByPostLogoutRedirectUriAsync` / `FindByRedirectUriAsync` rely on string `Contains` against the JSON arrays stored on `OpenIddictApplication`. That's a substring match, not a JSON parse — works on every relational provider but is also the reason redirect URIs and post‑logout URIs can't share suffixes ambiguously.
+
+### EfCoreOpenIddictAuthorizationRepository
+
+`EfCoreOpenIddictAuthorizationRepository : EfCoreRepository<IOpenIddictDbContext, OpenIddictAuthorization, Guid>` provides `FindAsync(subject, client, status, type, ct)`, `FindByApplicationIdAsync`, `FindByIdAsync`, `FindBySubjectAsync`, `GetCountAsync`, `ListAsync`, `PruneAsync(threshold, ct)`, and the cascade‑helper `DeleteManyByApplicationIdAsync(applicationId, autoSave, ct)`. Each method is a thin EF Core query that respects the composite index `(ApplicationId, Status, Subject, Type)` defined in `ConfigureOpenIddict`.
+
+### EfCoreOpenIddictScopeRepository
+
+Simplest of the four — `FindByNameAsync(name)`, `FindByNamesAsync(names)`, `FindByResourceAsync(resource)`, plus the standard list / count helpers. The index on `Name` keeps `FindByNameAsync` cheap.
+
+### EfCoreOpenIddictTokenRepository
+
+The busiest repository. The cascade helpers it exposes are what makes `AbpOpenIddictApplicationStore.DeleteAsync(...)` and `AbpOpenIddictAuthorizationStore.DeleteAsync(...)` work cleanly:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/Tokens/EfCoreOpenIddictTokenRepository.cs
+public class EfCoreOpenIddictTokenRepository
+    : EfCoreRepository<IOpenIddictDbContext, OpenIddictToken, Guid>, IOpenIddictTokenRepository
+{
+    public virtual async Task DeleteManyByApplicationIdAsync(
+        Guid applicationId, bool autoSave = false,
+        CancellationToken cancellationToken = default)
+    {
+        var tokens = await (await GetDbSetAsync())
+            .Where(x => x.ApplicationId == applicationId)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        await DeleteManyAsync(tokens, autoSave, cancellationToken);
+    }
+
+    public virtual async Task DeleteManyByAuthorizationIdAsync(
+        Guid authorizationId, bool autoSave = false,
+        CancellationToken cancellationToken = default)
+    {
+        var tokens = await (await GetDbSetAsync())
+            .Where(x => x.AuthorizationId == authorizationId)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+
+        await DeleteManyAsync(tokens, autoSave, GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<OpenIddictToken>> FindAsync(
+        string subject, Guid? client, string status, string type,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync())
+            .WhereIf(!subject.IsNullOrWhiteSpace(), x => x.Subject == subject)
+            .WhereIf(client.HasValue,              x => x.ApplicationId == client)
+            .WhereIf(!status.IsNullOrWhiteSpace(), x => x.Status == status)
+            .WhereIf(!type.IsNullOrWhiteSpace(),   x => x.Type == type)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<OpenIddictToken> FindByReferenceIdAsync(
+        string referenceId, CancellationToken cancellationToken = default)
+    {
+        return await (await GetQueryableAsync())
+            .FirstOrDefaultAsync(x => x.ReferenceId == referenceId,
+                GetCancellationToken(cancellationToken));
+    }
+    // ... FindByApplicationIdAsync, FindByAuthorizationIdAsync, FindByIdAsync,
+    //     FindBySubjectAsync, ListAsync, PruneAsync ...
+}
+```
+
+`FindByReferenceIdAsync` is the introspection hot path — `/connect/introspect` looks up a presented reference token by its `ReferenceId`. The `(ReferenceId)` index in the schema serves this query.
+
+`PruneAsync(threshold, ct)` is what `TokenCleanupService` calls every hour. It removes tokens whose `CreationDate < threshold` and that are in a terminal state (`Inactive`, `Rejected`, `Revoked`, `Redeemed`) or have already expired.
+
+## Concurrency exception handler
+
+OpenIddict's manager pipeline is built around optimistic concurrency: it stamps a row, reads it back, and panics if a competing process changed it in between. EF Core surfaces these as `DbUpdateConcurrencyException`, which the ABP repository wraps into `AbpDbConcurrencyException`. The Abp stores catch the wrapper and hand it to `IOpenIddictDbConcurrencyExceptionHandler`:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.EntityFrameworkCore/Volo/Abp/OpenIddict/EfCoreOpenIddictDbConcurrencyExceptionHandler.cs
+public class EfCoreOpenIddictDbConcurrencyExceptionHandler
+    : IOpenIddictDbConcurrencyExceptionHandler, ITransientDependency
+{
+    public virtual Task HandleAsync(AbpDbConcurrencyException exception)
+    {
+        if (exception != null &&
+            exception.InnerException is DbUpdateConcurrencyException updateConcurrencyException)
+        {
+            foreach (var entry in updateConcurrencyException.Entries)
+            {
+                // Reset the state of the entity to prevent future SaveChangesAsync calls from failing.
+                entry.State = EntityState.Unchanged;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+It resets every affected `EntityEntry.State` back to `Unchanged`. The store then throws `OpenIddictExceptions.ConcurrencyException`, OpenIddict reloads the entity, and the next call sees a clean change‑tracker.
+
+## Multi‑tenancy
+
+Both the interface and the concrete DbContext are marked `[IgnoreMultiTenancy]`. OpenIddict tables are intended to live in the host database; the data filter system will not silently scope queries by `ICurrentTenant.Id`. If you do want per‑tenant clients (a rare requirement), you'll want to keep the entities in the host tables but add a column for the owning tenant via the extensible‑object system and filter manually in a custom repository.
+
+## Customizing tables and schema
+
+The two static fields on `AbpOpenIddictDbProperties` are mutable:
+
+```csharp
+// modules/openiddict/src/Volo.Abp.OpenIddict.Domain/Volo/Abp/OpenIddict/AbpOpenIddictDbProperties.cs
+public static class AbpOpenIddictDbProperties
+{
+    public static string DbTablePrefix { get; set; } = "OpenIddict";
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpOpenIddict";
+}
+```
+
+Tweak them before `OnModelCreating` runs (for example in your `Program.cs` before `app.Run()` — actually before the host is built, ideally in a `[BeforeStartup]` block or in your DbContext static initializer):
+
+```csharp
+AbpOpenIddictDbProperties.DbTablePrefix = "OAuth";
+AbpOpenIddictDbProperties.DbSchema      = "auth";
+```
+
+You can also override `ConfigureOpenIddict()` by writing your own extension method and calling it directly from `OnModelCreating` — handy when you need wider columns than the defaults from `OpenIddictApplicationConsts` allow.
+
+## EF Core migrations
+
+Because `OpenIddictDbContext` is a standalone DbContext, you can generate migrations against it on its own:
+
+```bash
+dotnet ef migrations add Initial_OpenIddict_Schema \
+    --context OpenIddictDbContext \
+    --output-dir Migrations/OpenIddict
+```
+
+In practice, most ABP solutions consolidate the OpenIddict tables into the main application DbContext (using `ReplaceDbContext<IOpenIddictDbContext>()`) and produce one set of migrations covering identity, OpenIddict, and your own entities.
+
+## Quick reference
+
+| Concept | Type | File |
+| --- | --- | --- |
+| Module | `AbpOpenIddictEntityFrameworkCoreModule` | `EntityFrameworkCore/AbpOpenIddictEntityFrameworkCoreModule.cs` |
+| DbContext interface | `IOpenIddictDbContext` | `EntityFrameworkCore/IOpenIddictDbContext.cs` |
+| DbContext | `OpenIddictDbContext` | `EntityFrameworkCore/OpenIddictDbContext.cs` |
+| Schema builder | `OpenIddictDbContextModelCreatingExtensions.ConfigureOpenIddict` | `EntityFrameworkCore/OpenIddictDbContextModelCreatingExtensions.cs` |
+| Application repo | `EfCoreOpenIddictApplicationRepository` | `Applications/EfCoreOpenIddictApplicationRepository.cs` |
+| Authorization repo | `EfCoreOpenIddictAuthorizationRepository` | `Authorizations/EfCoreOpenIddictAuthorizationRepository.cs` |
+| Scope repo | `EfCoreOpenIddictScopeRepository` | `Scopes/EfCoreOpenIddictScopeRepository.cs` |
+| Token repo | `EfCoreOpenIddictTokenRepository` | `Tokens/EfCoreOpenIddictTokenRepository.cs` |
+| Concurrency handler | `EfCoreOpenIddictDbConcurrencyExceptionHandler` | `EfCoreOpenIddictDbConcurrencyExceptionHandler.cs` |
+
+## See also
+
+- Aggregate roots, managers, stores: [/modules/openiddict/domain](/modules/openiddict/domain)
+- ASP.NET Core wiring on top: [/modules/openiddict/aspnetcore-integration](/modules/openiddict/aspnetcore-integration)
+- MongoDB alternative: [/modules/openiddict/mongodb](/modules/openiddict/mongodb)
+- Module overview: [/modules/openiddict/overview](/modules/openiddict/overview)
+- Login UI: [/modules/account/openiddict-host](/modules/account/openiddict-host)
+- Identity store: [/modules/identity/overview](/modules/identity/overview)
+- Browser apps consuming the tokens: [/aspnetcore/auth-openidconnect](/aspnetcore/auth-openidconnect)
+- Granting permissions to clients: [/security/permissions](/security/permissions)

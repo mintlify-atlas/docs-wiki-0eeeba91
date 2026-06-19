@@ -1,0 +1,529 @@
+---
+title: "Volo.Abp.AzureServiceBus: Connections, Publishers and Processors"
+sidebarTitle: "Azure Service Bus"
+description: "The low-level Azure Service Bus transport — AbpAzureServiceBusOptions, IConnectionPool (client + administration), IPublisherPool, IProcessorPool and the IAzureServiceBusMessageConsumerFactory used by Volo.Abp.EventBus.AzureServiceBus."
+---
+
+`Volo.Abp.AzureServiceBus` wraps the official `Azure.Messaging.ServiceBus` SDK. Compared to the RabbitMQ and Kafka transports it has one extra responsibility: **provisioning topics and subscriptions on demand** through `ServiceBusAdministrationClient`. ABP's Azure Service Bus event-bus integration assumes you can declare topics and subscriptions at runtime, the same way the RabbitMQ integration assumes it can declare exchanges and queues.
+
+That means the pool layer exposes two kinds of clients:
+
+| Client | Used for |
+| --- | --- |
+| `ServiceBusClient` | Sending and receiving messages (data plane). |
+| `ServiceBusAdministrationClient` | Creating topics and subscriptions (management plane). |
+
+Both are pooled by connection name on the singleton `ConnectionPool`. On top of them, `PublisherPool` caches one `ServiceBusSender` per topic and `ProcessorPool` caches one `ServiceBusProcessor` per `(topic, subscription)` pair.
+
+## Package layout
+
+```text
+framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/
+├── AbpAzureServiceBusModule.cs
+├── AbpAzureServiceBusOptions.cs
+├── AzureServiceBusConnections.cs
+├── AzureServiceBusMessageConsumer.cs
+├── AzureServiceBusMessageConsumerFactory.cs
+├── ClientConfig.cs
+├── ConnectionPool.cs
+├── IAzureServiceBusMessageConsumer.cs
+├── IAzureServiceBusMessageConsumerFactory.cs
+├── IAzureServiceBusSerializer.cs
+├── IConnectionPool.cs
+├── IProcessorPool.cs
+├── IPublisherPool.cs
+├── ProcessorPool.cs
+├── PublisherPool.cs
+├── ServiceBusAdministrationClientExtensions.cs
+└── Utf8JsonAzureServiceBusSerializer.cs
+```
+
+## Module: `AbpAzureServiceBusModule`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AbpAzureServiceBusModule.cs
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpThreadingModule)
+)]
+public class AbpAzureServiceBusModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpAzureServiceBusOptions>(configuration.GetSection("Azure:ServiceBus"));
+    }
+}
+```
+
+Note the configuration key — `Azure:ServiceBus` — which lets you keep your Azure-related options under a single root (`Azure`) in `appsettings.json`.
+
+Unlike the RabbitMQ and Kafka modules, **there is no explicit `OnApplicationShutdown` override**. The pools implement `IAsyncDisposable` and are unwound as the DI container shuts down; `ProcessorPool` in particular needs `StopProcessingAsync` before `CloseAsync`, and it does that itself (see [Disposal](#disposal)).
+
+## Options: `AbpAzureServiceBusOptions` + `AzureServiceBusConnections` + `ClientConfig`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AbpAzureServiceBusOptions.cs
+public class AbpAzureServiceBusOptions
+{
+    public AzureServiceBusConnections Connections { get; }
+
+    public AbpAzureServiceBusOptions()
+    {
+        Connections = new AzureServiceBusConnections();
+    }
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AzureServiceBusConnections.cs
+[Serializable]
+public class AzureServiceBusConnections : Dictionary<string, ClientConfig>
+{
+    public const string DefaultConnectionName = "Default";
+
+    [NotNull]
+    public ClientConfig Default {
+        get => this[DefaultConnectionName];
+        set => this[DefaultConnectionName] = Check.NotNull(value, nameof(value));
+    }
+
+    public AzureServiceBusConnections()
+    {
+        Default = new ClientConfig();
+    }
+
+    public ClientConfig GetOrDefault(string connectionName)
+    {
+        return TryGetValue(connectionName, out var connectionFactory)
+            ? connectionFactory
+            : Default;
+    }
+}
+```
+
+Each entry is a `ClientConfig`, which bundles the connection string with three SDK option objects:
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/ClientConfig.cs
+public class ClientConfig
+{
+    public string ConnectionString { get; set; } = default!;
+
+    public ServiceBusAdministrationClientOptions Admin { get; set; } = new();
+
+    public ServiceBusClientOptions Client { get; set; } = new();
+
+    public ServiceBusProcessorOptions Processor { get; set; } = new ()
+    {
+        AutoCompleteMessages = false
+    };
+}
+```
+
+Three things to call out:
+
+- **`Admin`** is passed to `ServiceBusAdministrationClient` — controls retry policy and HTTP transport for management calls.
+- **`Client`** is passed to `ServiceBusClient` — controls retry policy and transport (`AmqpTcp` vs `AmqpWebSockets`) for data-plane calls.
+- **`Processor.AutoCompleteMessages = false`** is the critical opinionated default. ABP completes messages *after* your handler runs successfully. With auto-complete on, the SDK would settle the message before your callback even started.
+
+### Configuration shape
+
+<CodeGroup>
+
+```json appsettings.json
+{
+  "Azure": {
+    "ServiceBus": {
+      "Connections": {
+        "Default": {
+          "ConnectionString": "Endpoint=sb://my-ns.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=..."
+        }
+      }
+    }
+  }
+}
+```
+
+```csharp Code-first
+Configure<AbpAzureServiceBusOptions>(options =>
+{
+    options.Connections.Default.ConnectionString = configuration["ServiceBusConnection"]!;
+
+    options.Connections.Default.Client.TransportType = ServiceBusTransportType.AmqpWebSockets;
+
+    options.Connections.Default.Processor.MaxConcurrentCalls = 16;
+    options.Connections.Default.Processor.PrefetchCount = 32;
+    options.Connections.Default.Processor.AutoCompleteMessages = false; // keep!
+
+    options.Connections["audit"] = new ClientConfig
+    {
+        ConnectionString = configuration["AuditServiceBusConnection"]!
+    };
+});
+```
+
+</CodeGroup>
+
+<Warning>
+  Never override `Processor.AutoCompleteMessages` to `true`. ABP's consumer relies on the message being unsettled when the callback fires; auto-complete would acknowledge the message before your code ran, breaking at-least-once semantics.
+</Warning>
+
+## `IConnectionPool` / `ConnectionPool`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/IConnectionPool.cs
+public interface IConnectionPool : IAsyncDisposable
+{
+    ServiceBusClient GetClient(string? connectionName);
+
+    ServiceBusAdministrationClient GetAdministrationClient(string? connectionName);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/ConnectionPool.cs
+public ServiceBusClient GetClient(string? connectionName)
+{
+    connectionName ??= AzureServiceBusConnections.DefaultConnectionName;
+    return _clients.GetOrAdd(
+        connectionName, new Lazy<ServiceBusClient>(() =>
+        {
+            var config = _options.Connections.GetOrDefault(connectionName);
+            return new ServiceBusClient(config.ConnectionString, config.Client);
+        })
+    ).Value;
+}
+
+public ServiceBusAdministrationClient GetAdministrationClient(string? connectionName)
+{
+    connectionName ??= AzureServiceBusConnections.DefaultConnectionName;
+    return _adminClients.GetOrAdd(
+        connectionName, new Lazy<ServiceBusAdministrationClient>(() =>
+        {
+            var config = _options.Connections.GetOrDefault(connectionName);
+            return new ServiceBusAdministrationClient(config.ConnectionString, config.Admin);
+        })
+    ).Value;
+}
+```
+
+Two `ConcurrentDictionary<string, Lazy<...>>` — one for data-plane clients, one for admin clients. The `Lazy<>` wrapper means concurrent first-access for the same connection name still produces exactly one instance.
+
+### `IAzureServiceBusAdministrationClient`
+
+ABP doesn't define a separate `IAzureServiceBusAdministrationClient` interface — the SDK's `ServiceBusAdministrationClient` is the contract you depend on, surfaced through `IConnectionPool.GetAdministrationClient`. The "administration client" role is fulfilled directly by the Azure SDK type, with ABP adding a couple of helper extensions for idempotent topic/subscription provisioning (next section).
+
+If you need to set entity properties (custom TTL, dead-letter-on-message-expiration, partitioning…), do it through `ServiceBusAdministrationClient` directly:
+
+```csharp
+public class TopicProvisioner : ITransientDependency
+{
+    private readonly IConnectionPool _pool;
+
+    public TopicProvisioner(IConnectionPool pool) => _pool = pool;
+
+    public async Task ProvisionAsync(string topicName)
+    {
+        var admin = _pool.GetAdministrationClient(connectionName: null); // default
+
+        if (!await admin.TopicExistsAsync(topicName))
+        {
+            await admin.CreateTopicAsync(new CreateTopicOptions(topicName)
+            {
+                DefaultMessageTimeToLive = TimeSpan.FromDays(7),
+                EnablePartitioning = true
+            });
+        }
+    }
+}
+```
+
+### `ServiceBusAdministrationClientExtensions`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/ServiceBusAdministrationClientExtensions.cs
+public static class ServiceBusAdministrationClientExtensions
+{
+    public static async Task SetupTopicAsync(this ServiceBusAdministrationClient client, string topicName)
+    {
+        if (!await client.TopicExistsAsync(topicName))
+        {
+            await client.CreateTopicAsync(topicName);
+        }
+    }
+
+    public static async Task SetupSubscriptionAsync(this ServiceBusAdministrationClient client, string topicName, string subscriptionName)
+    {
+        await client.SetupTopicAsync(topicName);
+        if (!await client.SubscriptionExistsAsync(topicName, subscriptionName))
+        {
+            await client.CreateSubscriptionAsync(topicName, subscriptionName);
+        }
+    }
+}
+```
+
+The publisher and processor pools call these — they're what makes "first publish creates the topic" Just Work without any infra step.
+
+<Note>
+  These helpers use the default-options overloads (no second argument to `CreateTopicAsync` / `CreateSubscriptionAsync`). If you want non-default entity properties, pre-create the entities yourself (as in the `TopicProvisioner` snippet above) or override the publisher/processor pool to call the typed overloads.
+</Note>
+
+## `IPublisherPool` / `PublisherPool`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/IPublisherPool.cs
+public interface IPublisherPool : IAsyncDisposable
+{
+    Task<ServiceBusSender> GetAsync(string topicName, string? connectionName);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/PublisherPool.cs
+public async Task<ServiceBusSender> GetAsync(string topicName, string? connectionName)
+{
+    var admin = _connectionPool.GetAdministrationClient(connectionName);
+    await admin.SetupTopicAsync(topicName);
+
+    return _publishers.GetOrAdd(
+        topicName, new Lazy<ServiceBusSender>(() =>
+        {
+            var client = _connectionPool.GetClient(connectionName);
+            return client.CreateSender(topicName);
+        })
+    ).Value;
+}
+```
+
+The contract:
+
+- **`SetupTopicAsync` runs every call** — but `TopicExistsAsync` is fast against Azure's management endpoint and short-circuits cheaply once the topic exists.
+- **`ServiceBusSender` is cached per topic name** — `Lazy<>` guarantees one builder run per topic across concurrent callers.
+- **The pool is keyed by topic only**, not by `(topic, connectionName)`. If you publish the same topic against two connections you'll cross-pollinate — keep each topic on a single broker.
+
+Using it directly:
+
+```csharp
+public class UserSignupNotifier : ITransientDependency
+{
+    private readonly IPublisherPool _publisherPool;
+    private readonly IAzureServiceBusSerializer _serializer;
+
+    public UserSignupNotifier(
+        IPublisherPool publisherPool,
+        IAzureServiceBusSerializer serializer)
+    {
+        _publisherPool = publisherPool;
+        _serializer = serializer;
+    }
+
+    public async Task NotifyAsync(UserSignedUpEto eto)
+    {
+        var sender = await _publisherPool.GetAsync("user.signed-up", connectionName: null);
+
+        var message = new ServiceBusMessage(_serializer.Serialize(eto))
+        {
+            MessageId = eto.Id.ToString(),
+            ContentType = "application/json"
+        };
+
+        await sender.SendMessageAsync(message);
+    }
+}
+```
+
+`MessageId` is a good thing to set: Azure Service Bus will use it as a fingerprint for duplicate detection when duplicate detection is enabled on the topic.
+
+### Disposal
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/PublisherPool.cs
+foreach (var publisher in _publishers.Values)
+{
+    await publisher.Value.CloseAsync();
+    await publisher.Value.DisposeAsync();
+}
+```
+
+Senders are closed and disposed in order. There's no per-item timeout — if you need a bound, set one on `ClientConfig.Client.RetryOptions`.
+
+## `IProcessorPool` / `ProcessorPool`
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/IProcessorPool.cs
+public interface IProcessorPool : IAsyncDisposable
+{
+    Task<ServiceBusProcessor> GetAsync(string subscriptionName, string topicName, string connectionName);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/ProcessorPool.cs
+public async Task<ServiceBusProcessor> GetAsync(string subscriptionName, string topicName, string connectionName)
+{
+    var admin = _connectionPool.GetAdministrationClient(connectionName);
+    await admin.SetupSubscriptionAsync(topicName, subscriptionName);
+
+    return _processors.GetOrAdd(
+        $"{topicName}-{subscriptionName}", new Lazy<ServiceBusProcessor>(() =>
+        {
+            var config = _options.Connections.GetOrDefault(connectionName);
+            var client = _connectionPool.GetClient(connectionName);
+            return client.CreateProcessor(topicName, subscriptionName, config.Processor);
+        })
+    ).Value;
+}
+```
+
+- Subscriptions are auto-created with `SetupSubscriptionAsync` (which transitively ensures the topic).
+- The cache key is `"{topicName}-{subscriptionName}"`, so the same subscription used against multiple topics gets one processor each.
+- `ServiceBusProcessor` is configured with `ClientConfig.Processor` — that's where `MaxConcurrentCalls`, `PrefetchCount` and `AutoCompleteMessages = false` come from.
+
+### Disposal
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/ProcessorPool.cs
+foreach (var item in _processors.Values)
+{
+    var processor = item.Value;
+    if (processor.IsProcessing)
+    {
+        await processor.StopProcessingAsync();
+    }
+
+    if (!processor.IsClosed)
+    {
+        await processor.CloseAsync();
+    }
+
+    await processor.DisposeAsync();
+}
+```
+
+This is the strict close order: **stop** receiving (drain in-flight callbacks), **close** the link, **dispose** the handle. Doing it any other way risks leaking AMQP receivers in long-running test harnesses.
+
+## `IAzureServiceBusMessageConsumerFactory` and the consumer
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/IAzureServiceBusMessageConsumerFactory.cs
+public interface IAzureServiceBusMessageConsumerFactory
+{
+    IAzureServiceBusMessageConsumer CreateMessageConsumer(
+        string topicName,
+        string subscriptionName,
+        string? connectionName);
+}
+```
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AzureServiceBusMessageConsumerFactory.cs
+public IAzureServiceBusMessageConsumer CreateMessageConsumer(string topicName, string subscriptionName, string? connectionName)
+{
+    var processor = ServiceScope.ServiceProvider.GetRequiredService<AzureServiceBusMessageConsumer>();
+    processor.Initialize(topicName, subscriptionName, connectionName);
+    return processor;
+}
+```
+
+Identical shape to the RabbitMQ and Kafka factories. The factory keeps a long-lived `IServiceScope`; each `Create*` resolves a transient `AzureServiceBusMessageConsumer` from it.
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/IAzureServiceBusMessageConsumer.cs
+public interface IAzureServiceBusMessageConsumer
+{
+    void OnMessageReceived(Func<ServiceBusReceivedMessage, Task> callback);
+}
+```
+
+`AzureServiceBusMessageConsumer.Initialize` resolves a `ServiceBusProcessor` from `IProcessorPool` and wires up the SDK's two event handlers:
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AzureServiceBusMessageConsumer.cs
+protected virtual void StartProcessing()
+{
+    Task.Factory.StartNew(function: async () =>
+    {
+        var serviceBusProcessor = await _processorPool.GetAsync(_subscriptionName, _topicName, _connectionName);
+        serviceBusProcessor.ProcessErrorAsync += HandleIncomingError;
+        serviceBusProcessor.ProcessMessageAsync += HandleIncomingMessage;
+        // ... StartProcessingAsync ...
+    });
+}
+```
+
+The handler invokes every callback registered via `OnMessageReceived` with the `ServiceBusReceivedMessage`. Because `ClientConfig.Processor.AutoCompleteMessages` defaults to `false`, **your callback is responsible for `CompleteMessageAsync`** (or `AbandonMessageAsync`, `DeadLetterMessageAsync`, …). Higher-level layers like `AzureServiceBusDistributedEventBus` perform that step automatically.
+
+## Putting it together
+
+```csharp
+public class OrderSubscriber : ISingletonDependency
+{
+    private readonly IAzureServiceBusMessageConsumerFactory _factory;
+    private readonly IAzureServiceBusSerializer _serializer;
+    private IAzureServiceBusMessageConsumer? _consumer;
+
+    public OrderSubscriber(
+        IAzureServiceBusMessageConsumerFactory factory,
+        IAzureServiceBusSerializer serializer)
+    {
+        _factory = factory;
+        _serializer = serializer;
+    }
+
+    public void Start()
+    {
+        _consumer = _factory.CreateMessageConsumer(
+            topicName: "orders.created",
+            subscriptionName: "fulfilment",
+            connectionName: null); // default
+
+        _consumer.OnMessageReceived(async message =>
+        {
+            var dto = _serializer.Deserialize(message.Body.ToArray(), typeof(OrderCreatedEto));
+            await HandleAsync((OrderCreatedEto)dto);
+            // NOTE: the wrapping layer (event bus) is what calls CompleteMessageAsync.
+        });
+    }
+
+    private Task HandleAsync(OrderCreatedEto dto) { /* ... */ return Task.CompletedTask; }
+}
+```
+
+Topic *and* subscription are created if missing. The consumer survives the call — it lives as long as the application.
+
+## Serializer hook
+
+```csharp
+public interface IAzureServiceBusSerializer
+{
+    byte[] Serialize(object obj);
+    object Deserialize(byte[] value, Type type);
+}
+```
+
+The default `Utf8JsonAzureServiceBusSerializer` delegates to `IJsonSerializer`. Replace via DI if you need a different format. The event-bus layer uses this same interface for both publish and consume.
+
+## Where this is used inside ABP
+
+<Card title="Azure Service Bus event bus" icon="cloud" href="/eventbus/azure-service-bus">
+  `AzureServiceBusDistributedEventBus` builds one topic per event type and one subscription per service. Publish goes through `IPublisherPool`, subscribe goes through `IAzureServiceBusMessageConsumerFactory`, automatic topic/subscription creation goes through the admin client.
+</Card>
+
+There is no first-party Azure Service Bus background-job package. For queue-style workloads ABP recommends [RabbitMQ background jobs](/background/jobs-rabbitmq) on top of `Volo.Abp.RabbitMQ`.
+
+## Operational notes
+
+- **First call provisions the entity.** `SetupTopicAsync` and `SetupSubscriptionAsync` are called every time you `GetAsync` a sender/processor — they're idempotent and cheap once the entity exists. Pre-create entities only when you need non-default properties.
+- **One sender per topic, one processor per `(topic, subscription)`.** The pool keys are intentional — never call `client.CreateSender(...)` ad hoc; you'll bypass disposal and leak AMQP links.
+- **Concurrency is `Processor.MaxConcurrentCalls`.** ABP doesn't add a layer on top — set it on `ClientConfig.Processor` and the SDK fans out from there.
+- **No shutdown hook on the module.** Disposal relies on `IAsyncDisposable` chaining through DI. If you write a custom host that builds the pools manually, dispose them explicitly in the right order: processors → publishers → connections.
+
+## Related
+
+- [Transports / overview](/transports/overview) — comparison with the RabbitMQ and Kafka transports.
+- [Event bus / Azure Service Bus](/eventbus/azure-service-bus) — the high-level layer that uses everything on this page.
+- [Transports / RabbitMQ](/transports/rabbitmq) — same `Connections` dictionary + scoped-factory pattern under AMQP.
+- [Transports / Kafka](/transports/kafka) — same pattern under Confluent.Kafka.
+- [Background jobs / RabbitMQ](/background/jobs-rabbitmq) — queue-style workloads use the RabbitMQ transport, not Azure Service Bus.

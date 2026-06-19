@@ -1,0 +1,327 @@
+---
+title: "Module Template"
+description: "Tour of templates/module/ — the scaffolding abp new -t module produces for a reusable ABP module solution (NuGet + npm)."
+---
+
+When you build a **reusable feature** for many ABP applications — a Blog module, a CRM module, a Payments module — you don't want it in any one app's `Application` project. You want a self-contained solution that compiles to a set of NuGet packages (and, optionally, an npm package) other apps can install. That's what the `module` template under [`templates/module/`](https://github.com/abpframework/abp/tree/dev/templates/module) generates.
+
+```
+templates/module/
+├── aspnet-core/      # The .NET solution (this page)
+└── angular/          # Optional Angular sub-package
+```
+
+Run [`abp new`](/cli/new-command) with `-t module`:
+
+```bash
+abp new Acme.Blogging -t module
+```
+
+…and you get the structure documented below.
+
+## Why a module instead of an app?
+
+| Concern | App template | Module template |
+| --- | --- | --- |
+| **Distribution** | Internal solution | Versioned NuGet (+ npm) packages |
+| **Hosts** | Runs in production | Runs only for **local debugging** (`host/` folder) |
+| **Migration ownership** | Owns its DB | Plugs into the host app's `DbContext` via `IMigrationContextProvider` |
+| **Permissions** | Defined once | Defined in `PermissionDefinitionProvider`, contributed at runtime |
+| **UI** | One front-end | Often ships both MVC pages **and** an Angular sub-package |
+| **Localization** | Application-wide resource | Module-scoped resource (other apps can extend) |
+
+## Solution layout
+
+```
+templates/module/aspnet-core/
+├── MyCompanyName.MyProjectName.abpmdl       # ABP Suite module manifest
+├── MyCompanyName.MyProjectName.abpsln       # ABP Suite solution manifest
+├── MyCompanyName.MyProjectName.slnx         # MSBuild solution
+├── MyCompanyName.MyProjectName.sln.DotSettings
+├── NuGet.Config
+├── common.props
+├── docker-compose.yml                       # Local-debug DB + auxiliary services
+├── docker-compose.migrations.yml
+├── docker-compose.override.yml
+├── database/                                # SQL init scripts
+├── src/                                     # The shipped packages
+├── host/                                    # Debug hosts (NOT shipped)
+└── test/                                    # Unit + integration tests
+```
+
+The fact that the template ships an `.abpmdl` (module manifest) and an `.abpsln` (solution manifest) tells ABP Suite this is a module — Suite uses those files to enumerate packages and pick the right project when you scaffold an entity inside the module.
+
+## `src/` — the packages your consumers install
+
+```
+src/
+├── MyCompanyName.MyProjectName.Domain.Shared
+├── MyCompanyName.MyProjectName.Domain
+├── MyCompanyName.MyProjectName.Application.Contracts
+├── MyCompanyName.MyProjectName.Application
+├── MyCompanyName.MyProjectName.EntityFrameworkCore
+├── MyCompanyName.MyProjectName.MongoDB
+├── MyCompanyName.MyProjectName.HttpApi
+├── MyCompanyName.MyProjectName.HttpApi.Client
+├── MyCompanyName.MyProjectName.Installer            # Setup helpers + permission grants
+├── MyCompanyName.MyProjectName.Web                  # MVC pages + Razor components
+├── MyCompanyName.MyProjectName.Blazor               # Blazor WASM client
+├── MyCompanyName.MyProjectName.Blazor.Server
+├── MyCompanyName.MyProjectName.Blazor.WebAssembly
+└── MyCompanyName.MyProjectName.Blazor.WebAssembly.Bundling
+```
+
+This mirrors the layered `app` template but **without the `Host` projects** — modules are consumed, not hosted. Notes on the module-specific projects:
+
+<AccordionGroup>
+  <Accordion title="MyCompanyName.MyProjectName.Domain.Shared">
+    Constants, enums, localization keys, error codes. Referenced by every other package — including HTTP API clients running in unrelated processes. Zero dependencies on persistence.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Domain">
+    Entities, aggregate roots, repository interfaces, domain services, domain events, **`MyProjectNameDbProperties`** (the static class that defines your schema prefix and connection string name).
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Application.Contracts">
+    Application service interfaces, request/response DTOs, **`PermissionDefinitionProvider`**, **`SettingDefinitionProvider`**, **`FeatureDefinitionProvider`**.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Application">
+    Application service implementations + AutoMapper / Mapperly profiles. This is where most of the module's behaviour lives.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.EntityFrameworkCore">
+    The module's **`IDbContext` interface**, entity configurations, and repository implementations. The consuming app's main `DbContext` extends this interface so all entities share one connection / one transaction.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.MongoDB">
+    MongoDB equivalent: a partial `IMyProjectNameMongoDbContext`, collection mappings, repository impls. Consumers pick EF or Mongo by referencing the matching package.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.HttpApi">
+    The controllers (typically auto-generated from the application service interfaces via `ConfigureConventionalControllers`).
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.HttpApi.Client">
+    Typed HTTP client proxies. Lets *other* services call this module remotely with the same interfaces from `Application.Contracts`.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Installer">
+    Helpers a consuming app calls to grant default permissions to system roles, register navigation entries, and seed initial data. Optional but conventional.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Web">
+    MVC Razor Pages, view components, theme contributions, menu providers, branding hooks. Consumed by MVC apps via `[DependsOn(typeof(MyProjectNameWebModule))]`.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor">
+    Blazor WASM client components. Importable into either a standalone WASM app or a Blazor WebApp client.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.Server">
+    Blazor Server (interactive server) components.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly">
+    WASM-rendered components for the .NET 8+ Blazor Web App pattern (used as the *Client* project).
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.Blazor.WebAssembly.Bundling">
+    Holds the `BundleContributor`s that participate in the consumer host's CSS/JS bundle. Tiny package; just metadata.
+  </Accordion>
+</AccordionGroup>
+
+## `host/` — the local debug solution
+
+Modules don't ship hosts, but you need *something* to run while you develop. The `host/` folder is the answer — a parallel mini-solution that references the `src/` projects and lets you `dotnet run` the module in isolation.
+
+```
+host/
+├── MyCompanyName.MyProjectName.AuthServer            # OpenIddict authority for local debug
+├── MyCompanyName.MyProjectName.Blazor.Host           # Blazor WebApp host
+├── MyCompanyName.MyProjectName.Blazor.Host.Client    # Blazor WebApp client
+├── MyCompanyName.MyProjectName.Blazor.Server.Host    # Blazor Server host
+├── MyCompanyName.MyProjectName.Host.Shared           # Shared host configuration
+├── MyCompanyName.MyProjectName.HttpApi.Host          # API host (for Angular dev or HTTP testing)
+├── MyCompanyName.MyProjectName.Web.Host              # MVC host
+└── MyCompanyName.MyProjectName.Web.Unified           # MVC + API + Auth combined for quick start
+```
+
+Every host follows the same bootstrap shape as the layered app template. Here's the API host verbatim:
+
+```csharp templates/module/aspnet-core/host/MyCompanyName.MyProjectName.HttpApi.Host/Program.cs
+Log.Information("Starting web host.");
+var builder = WebApplication.CreateBuilder(args);
+builder.Host.AddAppSettingsSecretsJson()
+    .UseAutofac()
+    .UseSerilog();
+await builder.AddApplicationAsync<MyProjectNameHttpApiHostModule>();
+var app = builder.Build();
+await app.InitializeApplicationAsync();
+await app.RunAsync();
+return 0;
+```
+
+<Warning>
+The `host/` projects are **debug-only**. They never get published to NuGet. Don't put production logic in them — anything a real app needs belongs in `src/`.
+</Warning>
+
+## `test/` — the test pyramid
+
+```
+test/
+├── MyCompanyName.MyProjectName.TestBase                       # Shared fixtures + data seed
+├── MyCompanyName.MyProjectName.Domain.Tests
+├── MyCompanyName.MyProjectName.Application.Tests
+├── MyCompanyName.MyProjectName.EntityFrameworkCore.Tests
+├── MyCompanyName.MyProjectName.MongoDB.Tests
+└── MyCompanyName.MyProjectName.HttpApi.Client.ConsoleTestApp  # Manual smoke client
+```
+
+`TestBase` is the seam every other test project depends on — it boots an ABP application with a deterministic seed, swaps in SQLite-in-memory for the EF tests, and provides helper extension methods like `WithUnitOfWorkAsync(...)`.
+
+## Suite + tooling files
+
+<AccordionGroup>
+  <Accordion title="MyCompanyName.MyProjectName.abpmdl">
+    Module manifest. Lists every package by path, the connection string name (`Default` by default), and the database providers supported. ABP Suite reads this to know which projects to scaffold into.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.abpsln">
+    Solution manifest pointing at the `src/`, `test/`, and `host/` folders so Suite can present them as a single tree.
+  </Accordion>
+  <Accordion title="MyCompanyName.MyProjectName.slnx">
+    Standard MSBuild solution. Used by `dotnet build` and IDEs.
+  </Accordion>
+  <Accordion title="docker-compose.yml + docker-compose.override.yml">
+    Spin up SQL Server / PostgreSQL / Mongo locally so the `host/` projects can connect without you installing a DB.
+  </Accordion>
+  <Accordion title="docker-compose.migrations.yml">
+    Variant that runs the migration container as a sidecar — useful in CI.
+  </Accordion>
+  <Accordion title="database/">
+    Seed SQL scripts (idempotent) the docker-compose files mount into the DB container's init folder.
+  </Accordion>
+</AccordionGroup>
+
+## The Angular sub-package
+
+The Angular workspace under `templates/module/angular/` is a **library** workspace, not an app workspace. Two projects live side-by-side:
+
+```
+templates/module/angular/
+├── README.md
+├── angular.json
+├── package.json
+├── tsconfig.json
+├── tsconfig.prod.json
+└── projects/
+    ├── my-project-name/         # The shipped Angular library
+    │   ├── ng-package.json
+    │   ├── package.json
+    │   ├── src/
+    │   │   ├── public-api.ts
+    │   │   └── lib/
+    │   ├── config/
+    │   ├── karma.conf.js
+    │   ├── tsconfig.lib.json
+    │   ├── tsconfig.lib.prod.json
+    │   └── tsconfig.spec.json
+    └── dev-app/                 # Local Angular app that consumes the library
+        ├── src/
+        ├── karma.conf.js
+        ├── tsconfig.app.json
+        ├── tsconfig.prod.json
+        └── tsconfig.spec.json
+```
+
+`ng-package.json` configures `ng-packagr` to compile the library into `dist/my-project-name`:
+
+```jsonc templates/module/angular/projects/my-project-name/ng-package.json
+{
+  "$schema": "../../node_modules/ng-packagr/ng-package.schema.json",
+  "dest": "../../dist/my-project-name",
+  "lib": {
+    "entryFile": "src/public-api.ts"
+  }
+}
+```
+
+The `package.json` at the workspace root has the **publish + symlink dance** baked into its scripts:
+
+```jsonc templates/module/angular/package.json
+{
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve dev-app --open",
+    "build": "ng build my-project-name --configuration production",
+    "build:app": "npm run symlink:copy -- --no-watch && ng build dev-app --configuration production",
+    "symlink:copy": "npm run build && symlink dist --angular --packages @my-company-name/my-project-name --configuration production",
+    "test": "ng test",
+    "lint": "ng lint",
+    "e2e": "ng e2e"
+  }
+}
+```
+
+`npm run start` builds the library, symlinks `dist/my-project-name` into `node_modules/@my-company-name/my-project-name`, then runs the `dev-app` so you can iterate on both library and consumer at once.
+
+## How a consuming app installs the module
+
+<Steps>
+  <Step title="Install the NuGet packages">
+    Add references in the consumer app's matching projects:
+    ```xml
+    <PackageReference Include="MyCompanyName.MyProjectName.Application" Version="1.0.0" />
+    <PackageReference Include="MyCompanyName.MyProjectName.EntityFrameworkCore" Version="1.0.0" />
+    <PackageReference Include="MyCompanyName.MyProjectName.HttpApi" Version="1.0.0" />
+    <PackageReference Include="MyCompanyName.MyProjectName.Web" Version="1.0.0" />
+    ```
+  </Step>
+  <Step title="Add [DependsOn]">
+    In the consumer's `XxxModule.cs` files, depend on the module's modules so ABP composes them:
+    ```csharp
+    [DependsOn(
+        typeof(MyProjectNameApplicationModule),
+        typeof(MyProjectNameEntityFrameworkCoreModule),
+        typeof(MyProjectNameHttpApiModule),
+        typeof(MyProjectNameWebModule)
+    )]
+    public class ConsumerAppModule : AbpModule { … }
+    ```
+  </Step>
+  <Step title="Extend the DbContext">
+    Have the consumer's `DbContext` implement the module's `IMyProjectNameDbContext` and call `builder.ConfigureMyProjectName()` in `OnModelCreating`.
+  </Step>
+  <Step title="Add migrations">
+    `dotnet ef migrations add Added_MyProjectName --project src/Consumer.EntityFrameworkCore` then run the consumer's `DbMigrator`.
+  </Step>
+  <Step title="Install the Angular library">
+    ```bash
+    npm install @my-company-name/my-project-name
+    ```
+    Add `provideMyProjectName()` (or the `createRoutes()` helper) to the consumer's `app.config.ts`.
+  </Step>
+</Steps>
+
+See [Project building](/cli/project-building) for the full post-`abp new` checklist that applies to both modules and apps.
+
+## What you'll edit first after `abp new -t module`
+
+<CardGroup cols={2}>
+  <Card title="MyProjectNameDbProperties.cs" icon="database">
+    Set `DbTablePrefix` (defaults to `AbpYourModule`) and `ConnectionStringName` to your module's identity.
+  </Card>
+  <Card title="MyProjectNamePermissions / PermissionDefinitionProvider" icon="key">
+    Declare the permissions consumers can grant to roles.
+  </Card>
+  <Card title="MyProjectNameMenuContributor" icon="bars">
+    Register navigation entries for the MVC / Blazor UI variants you ship.
+  </Card>
+  <Card title="src/MyCompanyName.MyProjectName.Domain/*.cs" icon="cube">
+    Add your aggregate roots, then run ABP Suite to scaffold the rest.
+  </Card>
+</CardGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="abp new" icon="terminal" href="/cli/new-command">
+    `-t module` flags: `-u`, `--no-ui`, `-d`.
+  </Card>
+  <Card title="Building" icon="hammer" href="/cli/project-building">
+    `abp install-libs`, NPM, host startup.
+  </Card>
+  <Card title="Layered app" icon="layer-group" href="/templates/app-template-aspnet-core">
+    Compare to the application solution that *consumes* a module.
+  </Card>
+  <Card title="Console template" icon="terminal" href="/templates/console-template">
+    Minimal example of a host that depends on an ABP module.
+  </Card>
+</CardGroup>
