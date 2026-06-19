@@ -361,14 +361,30 @@ export class PermissionService {
 
 `isPolicyGranted` supports `||` and `&&` combinators inside a single key — for example `'AbpIdentity.Users.Create || AbpIdentity.Users.Update'`. The matching directive (`*abpPermission`) and the `permissionGuard` route guard both delegate here.
 
-## `FeatureService` and `SettingsService`
+## Reading features and settings
 
-Both follow the same shape as `PermissionService` — they slice their key out of the `ApplicationConfigurationDto`:
+There are no separate `FeatureService` or `SettingsService` injectables — `ConfigStateService` exposes the accessors directly, since features and settings are slices of the same `ApplicationConfigurationDto` already in memory:
 
-- `FeatureService.getFeature(name)` / `getFeature$(name)` — reads `configState.getOne('features')`.
-- `SettingsService.get(name)` / `get$(name)` — reads from `configState.getOne('setting')`.
+```ts core/src/lib/services/config-state.service.ts
+getFeature(key: string)             { /* reads features.values[key] */ }
+getFeature$(key: string)            { /* observable variant */ }
+getFeatureIsEnabled(key: string)    { /* boolean cast of getFeature */ }
+getFeatureIsEnabled$(key: string)
+getSetting(key: string)             { /* reads setting.values[key] */ }
+getSetting$(key: string)
+getSettings(keyword?: string)       { /* filtered map */ }
+getSettings$(keyword?: string)
+```
 
-A typical guard implementation reads features and settings in the same expression as permissions.
+Inject `ConfigStateService` once and read whichever slice you need. The `*$` variants emit on every `refreshAppState()`, so components react to setting changes without manual subscriptions.
+
+```ts
+const config = inject(ConfigStateService);
+if (config.getFeatureIsEnabled('Identity.UserLockout')) {
+  // …
+}
+const pageSize = Number(config.getSetting('MyApp.DefaultPageSize') ?? 10);
+```
 
 ## HTTP interceptors
 
@@ -435,27 +451,45 @@ It injects:
 
 ## `provideAbpCore` configuration
 
-```ts core/src/lib/core.module.ts
-export function withOptions(options: ABP.Root): EnvironmentProviders {
-  return makeEnvironmentProviders([{ provide: CORE_OPTIONS, useValue: options }]);
+`provideAbpCore` lives in `core/src/lib/providers/core-module-config.provider.ts` and takes a list of `CoreFeature` objects (today just `withOptions`):
+
+```ts core/src/lib/providers/core-module-config.provider.ts
+export function withOptions(options = {} as ABP.Root): CoreFeature<CoreFeatureKind.Options> {
+  // … sets CORE_OPTIONS to `options` and contributes provider entries
 }
 
-export function provideAbpCore(...features: EnvironmentProviders[]) {
-  return makeEnvironmentProviders([
-    provideAppInitializer(() => {
-      const environment = inject<ABP.Root>(CORE_OPTIONS).environment;
-      const envService = inject(EnvironmentService);
-      envService.setState(environment);
-      return inject(ConfigStateService).refreshAppState();
+export function provideAbpCore(...features: CoreFeature<CoreFeatureKind>[]) {
+  const providers = [
+    provideHttpClient(
+      withInterceptorsFromDi(),
+      withXsrfConfiguration({ cookieName: 'XSRF-TOKEN', headerName: 'RequestVerificationToken' }),
+      withFetch(),
+      withInterceptors([transferStateInterceptor, timezoneInterceptor]),
+    ),
+    provideAppInitializer(async () => {
+      inject(LocalizationService);
+      inject(LocalStorageListenerService);
+      inject(RoutesHandler);
+      await getInitialData();      // pulls config + localization
     }),
-    ApiInterceptor,
-    { provide: HTTP_INTERCEPTORS, useExisting: ApiInterceptor, multi: true },
-    ...features,
-  ]);
+    LocaleProvider,
+    CookieLanguageProvider,
+    AuthErrorFilterService,
+    IncludeLocalizationResourcesProvider,
+    { provide: TitleStrategy, useExisting: AbpTitleStrategy },
+  ];
+
+  for (const feature of features) {
+    providers.push(...feature.ɵproviders);
+  }
+
+  return makeEnvironmentProviders(providers);
 }
 ```
 
-The initialiser sequence — set environment, fetch config — means routes don't activate until the policy/feature/setting store is populated, so guards never see an empty state.
+`getInitialData()` is the initialiser that calls `ConfigStateService.refreshAppState()` (and pulls localization resources when configured). Because it returns a promise, routes don't activate until the policy/feature/setting store is populated — guards never see an empty state.
+
+The companion legacy NgModule wrapper (`CoreModule.forRoot(options)` in `core/src/lib/core.module.ts`) simply delegates to `provideAbpCore(withOptions(options))` so existing NgModule‑based apps keep working.
 
 ## Where to next
 

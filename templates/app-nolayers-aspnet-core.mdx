@@ -13,7 +13,7 @@ It's the right pick when:
 
 If any of those become true later, you can graduate to the [layered template](/templates/app-template-aspnet-core) — the building blocks (entities, application services, OpenIddict modules) are the same.
 
-```
+```text
 templates/app-nolayers/aspnet-core/
 ├── MyCompanyName.MyProjectName.slnx          # Solution file
 ├── NuGet.Config                              # Restore feeds
@@ -53,18 +53,19 @@ Only **one** of these host projects survives in the generated solution — `abp 
 
 Open any of these host projects (let's use `MyCompanyName.MyProjectName.Mvc`) and you'll see:
 
-```
+```text
 MyCompanyName.MyProjectName.Mvc/
-├── Controllers/                  # MVC + dynamic API controllers
 ├── Data/                         # MyProjectNameDbContext + MyProjectNameDbMigrationService
 ├── Entities/                     # Aggregate roots and entities
 ├── Localization/                 # XML / JSON localization files + MyProjectNameResource
 ├── Menus/                        # IMenuContributor implementations
-├── Migrations/                   # EF Core migrations
+├── Migrations/                   # EF Core migrations (Mvc only — Mvc.Mongo has none)
 ├── ObjectMapping/                # Mapperly / AutoMapper profiles
 ├── Pages/                        # Razor Pages
 ├── Properties/                   # launchSettings.json
-├── Services/                     # IApplicationService implementations
+├── Services/                     # IApplicationService implementations + Dtos/
+│                                 #   (controllers are auto-generated via
+│                                 #    ConfigureConventionalControllers — no Controllers/ folder)
 ├── MyCompanyName.MyProjectName.Mvc.csproj
 ├── MyProjectNameBrandingProvider.cs
 ├── MyProjectNameGlobalFeatureConfigurator.cs
@@ -78,16 +79,20 @@ MyCompanyName.MyProjectName.Mvc/
 └── wwwroot/
 ```
 
+<Info>
+The `--no-ui` `Host` / `Host.Mongo` projects **do** ship a `Controllers/` folder (they have no Razor Pages, so they expose controllers explicitly). The `Mvc` / `Mvc.Mongo` / `Blazor.Server*` projects don't — they rely on ABP's dynamic API controllers, generated from each `IApplicationService` at startup.
+</Info>
+
 The layering you'd find in the multi-project template still exists *conceptually* — it's just collapsed into folders.
 
 | Layered template project | No-layers folder |
 | --- | --- |
 | `Domain.Shared` (constants, enums) | `Localization/`, `Entities/`*Consts.cs* |
 | `Domain` (entities, repos) | `Entities/`, `Data/` |
-| `Application.Contracts` (DTOs, interfaces) | `Services/` (interfaces alongside implementations) |
+| `Application.Contracts` (DTOs, interfaces) | `Services/` + `Services/Dtos/` (interfaces alongside implementations) |
 | `Application` (impls) | `Services/` |
 | `EntityFrameworkCore` | `Data/`, `Migrations/` |
-| `HttpApi` (controllers) | `Controllers/` |
+| `HttpApi` (controllers) | Dynamic controllers from `Services/` (no folder), or `Controllers/` in `Host`/`Host.Mongo` |
 | `Web` (pages, theme) | `Pages/`, `wwwroot/`, `Menus/` |
 
 ## The combined `MyProjectNameModule`
@@ -285,16 +290,14 @@ The default file ships connection strings, OpenIddict signing/encryption certifi
 
 To make the layout concrete, here's what `abp new Acme.Internal -t app-nolayers -u mvc -d ef` actually produces on disk:
 
-```
+```text
 Acme.Internal/
 ├── Acme.Internal.slnx
 ├── NuGet.Config
 ├── README.md
 ├── migrate-database.ps1
-├── common.props
 └── src/
     └── Acme.Internal.Mvc/      # The single host project — everything lives here
-        ├── Controllers/
         ├── Data/
         ├── Entities/
         ├── Localization/

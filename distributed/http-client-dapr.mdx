@@ -61,7 +61,7 @@ Two things to notice:
 2. `clientBuilder.AddHttpMessageHandler<AbpInvocationHandler>()` is the standard `IHttpClientBuilder` extension. Each named proxy client gets its own `AbpInvocationHandler` instance, registered as `ITransientDependency`.
 
 <Note>
-`ProxyClientBuildActions` is the same list ABP itself uses to add `AbpHttpClientProxyMessageHandler` (the one that injects auth tokens, correlation ids, etc.). Adding `AbpInvocationHandler` to it means the order is deterministic and predictable: ABP's own handler runs first, then the Dapr handler rewrites the outbound URL.
+`ProxyClientBuildActions` is the same list ABP uses elsewhere — for example, the WebAssembly and MAUI hosts add their own Blazor `DelegatingHandler` through it. Auth tokens, the correlation id and the `__tenant` header are not added by a delegating handler at all: `ClientProxyBase` writes them straight onto the `HttpRequestMessage` *before* it enters the `DelegatingHandler` chain. That means by the time `AbpInvocationHandler` sees the request, the ABP headers are already in place — it only has to rewrite the URL and add `dapr-app-id`.
 </Note>
 
 ## The handler
@@ -176,23 +176,24 @@ No ports, no DNS, no TLS certificate ceremony. The host part of each URL is trea
 ABP's HTTP proxy infrastructure assembles a chain like this for each named client (simplified):
 
 ```text
-HttpClient
+ClientProxyBase.AddHeaders(requestMessage)        ← writes auth, correlation, __tenant, culture
+        │
+        ▼
+HttpClient.SendAsync(requestMessage)
 └── DelegatingHandler chain
-    ├── AbpHttpClientProxyMessageHandler   (auth, correlation, tenant)
     ├── (your custom handlers, in registration order)
     ├── AbpInvocationHandler               ← added by AbpHttpClientDaprModule
     └── HttpClientHandler                  (the socket)
 ```
 
-The order matters. ABP's own handler runs **before** `AbpInvocationHandler`, so the request already carries:
+By the time the request enters the handler chain, `ClientProxyBase` has already stamped:
 
-- A bearer token from the configured token provider.
-- The ABP correlation id header.
-- The tenant header.
+- A bearer token from `IRemoteServiceHttpClientAuthenticator` (when one is configured).
+- The ABP correlation id header (`AbpCorrelationIdOptions.HttpHeaderName`).
+- The tenant header (`TenantResolverConsts.DefaultTenantKey`).
 - The accept-language header.
-- The `X-Requested-With: XMLHttpRequest` header (so ABP's exception filter returns JSON).
 
-Only then does `AbpInvocationHandler` rewrite the URL and emit `dapr-app-id`. The result is a request that the receiving ABP service can authenticate, scope to the correct tenant, and log under the original correlation id — exactly as if it had been called directly.
+`AbpInvocationHandler` then rewrites the URL and adds `dapr-app-id`. The result is a request that the receiving ABP service can authenticate, scope to the correct tenant, and log under the original correlation id — exactly as if it had been called directly.
 
 <Note>
 If you add custom delegating handlers via `IHttpClientBuilder.AddHttpMessageHandler(...)` after `AbpHttpClientDaprModule` has loaded, they execute *before* `AbpInvocationHandler` because of the registration order. That's usually what you want — logging and metrics see the logical URL (`http://catalog/...`) rather than the rewritten sidecar URL.
@@ -233,7 +234,7 @@ In Kubernetes the standard pattern is to annotate each pod with `dapr.io/enabled
 
 Two quick checks:
 
-1. Add an `ILogger` line in your `AbpHttpClientProxyMessageHandler` (or a thin custom handler) printing `request.RequestUri`. The logical URL should still be `http://catalog/api/...`, proving that the rewrite happens downstream.
+1. Register a thin custom `DelegatingHandler` via `ProxyClientBuildActions` (or your own `IHttpClientBuilder.AddHttpMessageHandler(...)`) and log `request.RequestUri` from it. The logical URL should still be `http://catalog/api/...`, proving the rewrite happens downstream inside `AbpInvocationHandler`.
 2. Watch the sidecar logs: a successful invoke logs `method=...` and `target=...` lines including the app id.
 
 If you see `connection refused` to `127.0.0.1:3500`, the sidecar is not running or `AbpDaprOptions.HttpEndpoint` is wrong. If you see `404 Not Found` from the sidecar, the app id is misspelled or the peer is not registered.
@@ -253,7 +254,7 @@ Yes — `AbpHttpClientBuilderOptions.ProxyClientBuildActions` is applied to ever
 </Accordion>
 
 <Accordion title="How does this interact with multi-tenancy?">
-`AbpDaprClientFactory.AddHeaders` adds the `__tenant` header on ad-hoc HTTP clients. For typed proxies the existing `AbpHttpClientProxyMessageHandler` already adds tenant context, so nothing extra is required when running over Dapr — the rewrite happens after the tenant header is set.
+`AbpDaprClientFactory.AddHeaders` adds the `__tenant` header on ad-hoc HTTP clients. For typed proxies, `ClientProxyBase` already writes tenant, correlation and auth headers onto each `HttpRequestMessage` before it enters the handler chain, so nothing extra is required when running over Dapr — `AbpInvocationHandler` rewrites the URL after the tenant header is set.
 </Accordion>
 
 ## A realistic example

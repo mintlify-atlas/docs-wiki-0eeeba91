@@ -175,17 +175,28 @@ manageFeatures(tenant: TenantDto) {
 
 `components/feature-management-tab/feature-management-tab.component.ts` is the variant rendered as a tab inside `@abp/ng.setting-management`. The package's `providers/` folder registers a tab contributor so when the setting management page is loaded, a "Feature Management" tab appears for users that have the `FeatureManagement.ManageHostFeatures` permission.
 
-```ts feature-management/src/lib/providers/...
-{
-  provide: SETTING_MANAGEMENT_CONTRIBUTORS,
-  useFactory: () => [
-    { tabName: 'FeatureManagement::Features',
-      component: FeatureManagementTabComponent,
-      requiredPolicy: 'FeatureManagement.ManageHostFeatures' },
-  ],
-  multi: true,
-}
+```ts feature-management/src/lib/providers/feature-management-settings.provider.ts
+import { SettingTabsService } from '@abp/ng.setting-management/config';
+import { inject, provideAppInitializer } from '@angular/core';
+import { eFeatureManagementTabNames } from '../enums/feature-management-tab-names';
+import { FeatureManagementTabComponent } from '../components';
+
+export const FEATURE_MANAGEMENT_SETTINGS_PROVIDERS = [
+  provideAppInitializer(() => {
+    const settingTabs = inject(SettingTabsService);
+    settingTabs.add([
+      {
+        name: eFeatureManagementTabNames.FeatureManagement,
+        order: 100,
+        requiredPolicy: 'FeatureManagement.ManageHostFeatures',
+        component: FeatureManagementTabComponent,
+      },
+    ]);
+  }),
+];
 ```
+
+The tab is registered through `SettingTabsService.add(...)` inside an `APP_INITIALIZER` — no separate multi‑provider token is needed. The same pattern works in your own app to push extra setting tabs.
 
 ## Wiring the module
 
@@ -285,13 +296,12 @@ interface UpdateFeaturesDto { features: UpdateFeatureDto[] }
 ## `eFeatureManagementComponents`
 
 ```ts feature-management/src/lib/enums/components.ts
-export enum eFeatureManagementComponents {
+export const enum eFeatureManagementComponents {
   FeatureManagement = 'FeatureManagement.FeatureManagementComponent',
-  FeatureManagementTab = 'FeatureManagement.FeatureManagementTabComponent',
 }
 ```
 
-`FeatureManagement` is the modal key consumed by tenant management; `FeatureManagementTab` is the settings‑page tab key consumed by the setting management tab service.
+The single `FeatureManagement` key is the modal consumed by tenant management. The settings‑page tab is registered via `SettingTabsService` with a string `name` (`'FeatureManagement::Features'`) rather than a replaceable component key — see the tab contributor snippet above.
 
 ## Cross‑links
 

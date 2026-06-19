@@ -22,7 +22,7 @@ The module is shipped as five focused NuGet packages — one per ABP layer:
 | `Volo.Abp.OpenIddict.Domain` | `Volo.Abp.OpenIddict.Domain/` | `OpenIddictApplication` / `OpenIddictAuthorization` / `OpenIddictScope` / `OpenIddictToken` aggregate roots, the `Abp*` managers and stores that replace OpenIddict's defaults, distributed caches, and the `TokenCleanupBackgroundWorker`. |
 | `Volo.Abp.OpenIddict.EntityFrameworkCore` | `Volo.Abp.OpenIddict.EntityFrameworkCore/` | `OpenIddictDbContext`, `IOpenIddictDbContext`, `EfCoreOpenIddict*Repository` implementations. |
 | `Volo.Abp.OpenIddict.MongoDB` | `Volo.Abp.OpenIddict.MongoDB/` | `OpenIddictMongoDbContext` and `MongoOpenIddict*Repository` implementations. |
-| `Volo.Abp.OpenIddict.AspNetCore` | `Volo.Abp.OpenIddict.AspNetCore/` | `AbpOpenIddictAspNetCoreModule` that calls `AddOpenIddict().AddServer(...)`, the controllers (`TokenController`, `AuthorizeController`, `UserInfoController`, `EndSessionController`), the claim‑destination pipeline, wildcard‑domain handlers, and extension grant types. |
+| `Volo.Abp.OpenIddict.AspNetCore` | `Volo.Abp.OpenIddict.AspNetCore/` | `AbpOpenIddictAspNetCoreModule` that calls `AddOpenIddict().AddServer(...)`, the controllers (`TokenController`, `AuthorizeController`, `UserInfoController`, `LogoutController` — file `EndSessionController.cs`), the claim‑destination pipeline, wildcard‑domain handlers, and extension grant types. |
 
 ## What flows through the server
 
@@ -39,7 +39,7 @@ flowchart TB
         AUTH[AuthorizeController<br/>GET /connect/authorize]
         TOK[TokenController<br/>POST /connect/token]
         UI[UserInfoController<br/>GET /connect/userinfo]
-        END[EndSessionController<br/>/connect/endsession]
+        ENDS[LogoutController<br/>POST /connect/endsession]
         CP[AbpOpenIddictClaimsPrincipalManager<br/>+ IAbpOpenIddictClaimsPrincipalHandler chain]
         DEST[AbpDefaultOpenIddictClaimsPrincipalHandler<br/>SetDestinations: AccessToken / IdentityToken]
     end
@@ -70,7 +70,7 @@ flowchart TB
     AUTH --> MGR
     TOK --> MGR
     UI --> MGR
-    END --> MGR
+    ENDS --> MGR
     MGR --> STO
     STO --> CACHE
     STO --> REPO
@@ -159,7 +159,7 @@ builder
 | `GET /connect/authorize` | `AuthorizeController` | Interactive authorization code / implicit / hybrid / none flows. |
 | `POST /connect/token` | `TokenController` (`.Password`, `.ClientCredentials`, `.AuthorizationCode`, `.RefreshToken`, `.DeviceCode`, `.TokenExchange`) | All grant types. |
 | `GET /connect/userinfo` | `UserInfoController` | Returns claims for a bearer token. |
-| `POST /connect/endsession` | `EndSessionController` | RP‑initiated logout. |
+| `GET /connect/endsession` | `LogoutController` | RP‑initiated logout (the controller class is `LogoutController`; the file is `EndSessionController.cs`). |
 | `POST /connect/introspect` | (OpenIddict built‑in) | Token introspection. |
 | `POST /connect/revocat` | (OpenIddict built‑in) | Token revocation. |
 | `POST /device` & `GET /connect/verify` | `TokenController.DeviceCode` | OAuth 2.0 device authorization grant. |

@@ -270,6 +270,46 @@ The factory pattern in `AbpControllerBase` and `ApplicationService` exposes `Gui
   </Accordion>
 </AccordionGroup>
 
+## Composing into an entity
+
+ABP's `Entity<Guid>` and `AggregateRoot<Guid>` base classes accept the id in their constructor, and the consuming application service is expected to mint it through `IGuidGenerator`:
+
+```csharp
+public class BookAppService : ApplicationService, IBookAppService
+{
+    private readonly IBookRepository _repository;
+
+    public BookAppService(IBookRepository repository)
+    {
+        _repository = repository;
+    }
+
+    public async Task<BookDto> CreateAsync(CreateBookDto input)
+    {
+        // GuidGenerator is inherited from ApplicationService;
+        // it is the framework-registered IGuidGenerator (SequentialGuidGenerator).
+        var book = new Book(GuidGenerator.Create(), input.Title);
+
+        await _repository.InsertAsync(book, autoSave: true);
+        return ObjectMapper.Map<Book, BookDto>(book);
+    }
+}
+```
+
+`ApplicationService.GuidGenerator` is property-injected via [`IAbpLazyServiceProvider`](/core/dependency-injection#iabplazyserviceprovider-and-cachedserviceprovider), so derived services don't even need to add it to their constructor.
+
+## Where the GUID actually ends up in the database
+
+The `SequentialGuidType` you pick is purely about the *bytes the database compares*. The `Guid` your C# code sees is identical across all three layouts in terms of `.ToString()`. What changes:
+
+| `SequentialGuidType` | First bytes of `ToByteArray()` | First chars of `ToString()` | What sorts ascending |
+| --- | --- | --- | --- |
+| `SequentialAsString` | random | timestamp | The string form (`Guid` cast to text, `CHAR(36)` columns). |
+| `SequentialAsBinary` | timestamp | random | The byte array (Oracle `RAW(16)`, MongoDB BSON binary subtype 4). |
+| `SequentialAtEnd` | random | random | The SQL Server comparison (Data4 last 6 bytes — `uniqueidentifier`). |
+
+Pick the one that matches the index your hot-path queries actually use. The framework picks `SequentialAtEnd` by default because SQL Server is the most common deployment target.
+
 ## Related reading
 
 <CardGroup cols={2}>

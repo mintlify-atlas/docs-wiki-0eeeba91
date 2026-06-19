@@ -93,7 +93,7 @@ public class AbpAuditLoggingDomainModule : AbpModule
 }
 ```
 
-The `[DependsOn(typeof(AbpAuditingModule))]` line is what allows the module's `AuditingStore : IAuditingStore, ITransientDependency` to *replace* the framework's default `SimpleLogAuditingStore` — both are registered, but `AbpAuditingOptions.IsEnabled` and the DI container resolve to the database-backed one because the module-level registration runs after the framework defaults.
+The `[DependsOn(typeof(AbpAuditingModule))]` line is what allows the module's `AuditingStore : IAuditingStore, ITransientDependency` to *replace* the framework's default `SimpleLogAuditingStore` (registered as `ISingletonDependency`). Both are valid registrations of the same service type; because the module-level registration runs after the framework defaults, the last-wins DI convention causes `IAuditingStore` to resolve to the database-backed store at runtime.
 
 ## Database connection string
 
@@ -249,21 +249,36 @@ See [/auditing/auditing-module](/auditing/auditing-module) for the complete `Abp
 
 ## Replacing the store
 
-Because everything goes through `IAuditingStore`, swapping persistence is a one-liner. A common case is to ship audit logs to an OLAP system while still keeping the relational schema for hot queries:
+Because everything goes through `IAuditingStore`, swapping persistence is a one-liner. A common case is to ship audit logs to an OLAP system instead of (or in addition to) the relational schema:
 
 ```csharp
 context.Services.Replace(
     ServiceDescriptor.Transient<IAuditingStore, MyKafkaAuditingStore>());
 ```
 
-or to fan out:
+`AuditingManager` resolves a single `IAuditingStore` — the last registration wins. If you need fan-out (e.g. persist to SQL **and** publish to Kafka), wrap both behind one composite implementation:
 
 ```csharp
-context.Services.AddTransient<IAuditingStore, AuditingStore>();          // existing
-context.Services.AddTransient<IAuditingStore, MyKafkaAuditingStore>();   // additional
+public class CompositeAuditingStore : IAuditingStore, ITransientDependency
+{
+    private readonly AuditingStore _sql;
+    private readonly MyKafkaAuditingStore _kafka;
+
+    public CompositeAuditingStore(AuditingStore sql, MyKafkaAuditingStore kafka)
+    {
+        _sql = sql;
+        _kafka = kafka;
+    }
+
+    public async Task SaveAsync(AuditLogInfo auditInfo)
+    {
+        await _sql.SaveAsync(auditInfo);
+        await _kafka.SaveAsync(auditInfo);
+    }
+}
 ```
 
-`AuditingManager.SaveAsync` resolves `IEnumerable<IAuditingStore>` and invokes every registered store, so both run for the same `AuditLogInfo`.
+and replace the `IAuditingStore` registration with `CompositeAuditingStore`.
 
 ## Multi-tenancy
 
@@ -275,7 +290,7 @@ When the framework's data-filter system is on, `AbpDataFilter.Disable<IMultiTena
 
 The module is consumed by:
 
-- **`Volo.AuditLogging.AspNetCore`** (commercial) which mounts the module's repositories behind REST endpoints under `/api/audit-logging`.
+- **Management UIs in the ABP commercial stack** that mount these repositories behind REST endpoints for an audit-log explorer (out of scope for this open-source documentation set — what's documented here is the domain / persistence surface every consumer uses).
 - **`AbpAuditingOptions`** in the framework — toggle `IsEnabled`, `IsEnabledForAnonymousUsers`, `EntityHistorySelectors`, `IgnoredTypes` to control what ends up in the store. See [/auditing/auditing-module](/auditing/auditing-module) for the full options surface.
 - **Custom dashboards** — query `IAuditLogRepository.GetAverageExecutionDurationPerDayAsync` to plot p50 latency, or `GetCountAsync(hasException: true, ...)` to drive an error-rate widget.
 - **Entity history pages** — call `GetEntityChangesWithUsernameAsync(entityId, entityTypeFullName)` from any application service to render "who changed what" for a given record.

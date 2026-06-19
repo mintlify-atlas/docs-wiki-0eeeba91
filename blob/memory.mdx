@@ -121,7 +121,7 @@ public class MemoryBlobProvider : BlobProviderBase, ITransientDependency
 
 Three properties of this implementation matter in practice:
 
-1. **The store is an instance field**. `MemoryBlobProvider` is registered as transient, but `BlobProviderBase` is resolved through DI once per call — so each provider instance has its own `ConcurrentDictionary`. In an ABP test host the provider is a transient registration on a singleton-scoped DI container, which means in a single test all blobs share one dictionary. Across processes, of course, nothing is shared.
+1. **The store is an instance field**. `MemoryBlobProvider` is registered as `ITransientDependency`, and the `ConcurrentDictionary` is `new`'d in its constructor — so every fresh resolution gets its own empty dictionary. To make different call sites observe the same store, register the provider as a singleton (see the *What there is not* section below). Across processes, nothing is shared regardless of lifetime.
 2. **The cache key encodes the tenant**. `GetCacheKey` includes `CurrentTenant.Id`, so a multi‑tenant container automatically partitions its blobs by tenant exactly like every other provider — without doing any naming gymnastics. See [/tenancy/multi-tenancy-core](/tenancy/multi-tenancy-core).
 3. **`SaveAsync` reads the stream fully**. `CopyToAsync` into a `MemoryStream` materializes the entire payload up front. Do not use this provider with very large blobs — that is what real backends are for.
 

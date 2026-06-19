@@ -192,7 +192,7 @@ Menus/
 └── PageChangedHandler.cs            # syncs MenuItem.Url when Page.Slug changes
 ```
 
-`MenuItem` carries an optional `PageId` and `RequiredPermissionName`. `PageChangedHandler` is a `ILocalEventHandler<EntityChangedEventData<Page>>` that keeps `MenuItem.Url` in sync with `Page.Slug`. See [Menus & Media](/modules/cms-kit/menus-and-media).
+`MenuItem` carries an optional `PageId` and `RequiredPermissionName`. `PageChangedHandler` is a `ILocalEventHandler<EntityUpdatedEventData<Page>>` that keeps `MenuItem.Url` in sync with `Page.Slug`. See [Menus & Media](/modules/cms-kit/menus-and-media).
 
 ### `MediaDescriptors/` — file metadata, blob bytes elsewhere
 
@@ -253,7 +253,7 @@ Users/
 └── CmsUserSynchronizer.cs           # distributed-event listener
 ```
 
-`CmsUser` is a *projection*, not a foreign key. `CmsUserSynchronizer` listens for `EntityCreatedEto<IdentityUser>` and `EntityUpdatedEto<IdentityUser>` events and upserts a `CmsUser` row. This lets CMS Kit avoid a hard dependency on the [Identity module](/modules/identity/overview) — a host using a different user store can publish equivalent events.
+`CmsUser` is a *projection*, not a foreign key. `CmsUserSynchronizer` listens for distributed `EntityUpdatedEto<UserEto>` events (where `UserEto` is `Volo.Abp.Users.UserEto`, raised by Identity and any other user store) and upserts a `CmsUser` row. This lets CMS Kit avoid a hard dependency on the [Identity module](/modules/identity/overview) — a host using a different user store can publish equivalent events.
 
 ### `Settings/` — configuration knobs
 
@@ -368,7 +368,7 @@ public abstract class CmsKitDomainServiceBase : DomainService
 }
 ```
 
-A trivial base class so all CMS Kit domain services share an inheritance root. Only `MenuItemManager` uses it directly today; the rest derive from `DomainService` for historical reasons. New domain services should prefer `CmsKitDomainServiceBase`.
+A trivial base class so all CMS Kit domain services share an inheritance root. Three managers (`MenuItemManager`, `MarkedItemManager`, `ReactionManager`) use it directly today; the rest (`BlogManager`, `BlogPostManager`, `BlogFeatureManager`, `CommentManager`, `GlobalResourceManager`, `MediaDescriptorManager`, `PageManager`, `RatingManager`, `TagManager`, `EntityTagManager`) still derive from `Volo.Abp.Domain.Services.DomainService` for historical reasons. New domain services should prefer `CmsKitDomainServiceBase`.
 
 ## How a typical capability folder is structured
 
@@ -397,7 +397,7 @@ Knowing this template makes onboarding fast: open any folder and you already kno
 - `AbpFeaturesModule` — for `[RequiresFeature]`.
 - `AbpGlobalFeaturesModule` — for `[RequiresGlobalFeature]`.
 - `AbpSettingManagementModule` — for `ISettingManager` (read by `CommentManager`).
-- `AbpDistributedEventBusModule` — for `EntityCreatedEto<IdentityUser>` subscription in `CmsUserSynchronizer`.
+- `AbpDistributedEventBusModule` — for `EntityUpdatedEto<UserEto>` subscription in `CmsUserSynchronizer`.
 - `CmsKitDomainSharedModule` — sibling project with consts, enums, permissions, features.
 
 ## Related reading

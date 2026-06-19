@@ -434,14 +434,43 @@ public virtual void OnMessageReceived(Func<Message<string, byte[]>, Task> callba
 }
 ```
 
-The flow is identical in spirit to the RabbitMQ consumer:
+The flow is broadly the same shape as the RabbitMQ consumer, but with two important differences worth knowing:
 
 1. `Initialize` records the topic, group and connection, then starts the `AbpAsyncTimer` (which fires immediately because `RunOnStart = true`).
-2. `Timer_Elapsed` lazily resolves an `IConsumer<string, byte[]>` from `ConsumerPool`, ensures the topic is auto-created if `AbpKafkaOptions.ConfigureTopic` is set (the event-bus layer reads from there), subscribes, then polls in a loop.
-3. Each polled message is dispatched to every callback in `Callbacks`. Exceptions are reported through `IExceptionNotifier`.
-4. After all callbacks complete, the consumer commits the offset — only then is the message considered processed.
+2. `Timer_Elapsed` runs only once. On the first tick (when `Consumer == null`) it auto-creates the topic via `AdminClientBuilder` + `CreateTopicsAsync` — even without `ConfigureTopic`, a `TopicSpecification { NumPartitions = 1, ReplicationFactor = 1 }` is used. `Options.ConfigureTopic` (if set) is invoked on that spec to override partition count or replication factor. `TopicAlreadyExists` errors are swallowed so the call is idempotent.
+3. It then spins up a long-running `Task` with `Task.Factory.StartNew(..., TaskCreationOptions.LongRunning)`. That task subscribes the consumer and enters a `while (true) Consumer.Consume()` loop — actual polling does **not** ride on the 5-second timer; the timer's only job is the one-time bootstrap.
+4. Each polled message is dispatched to every callback in `Callbacks`. `ConsumeException`s in the outer loop are routed through `IExceptionNotifier` and the loop continues.
 
-Because `EnableAutoCommit` is false by default, **the consumer commits only after handlers succeed**. A handler that throws does *not* advance the offset, so the message is re-polled on the next tick. Combined with topic durability, that gives at-least-once delivery to your handlers.
+The commit semantics are subtler than they look. Here's the dispatch path:
+
+```csharp
+// framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/KafkaMessageConsumer.cs
+protected virtual async Task HandleIncomingMessage(ConsumeResult<string, byte[]> consumeResult)
+{
+    try
+    {
+        foreach (var callback in Callbacks)
+        {
+            await callback(consumeResult.Message);
+        }
+    }
+    catch (Exception ex)
+    {
+        Logger.LogException(ex);
+        await ExceptionNotifier.NotifyAsync(ex);
+    }
+    finally
+    {
+        Consumer?.Commit(consumeResult);
+    }
+}
+```
+
+The commit is in `finally` — **the offset advances whether or not the callbacks throw**. `EnableAutoCommit = false` doesn't buy you handler-failure retries here; it only ensures the *timing* of the commit (explicit, after the dispatch) rather than the SDK's periodic auto-commit. If a handler throws, the exception is logged and notified via `IExceptionNotifier`, and the next poll moves on.
+
+<Warning>
+  If you need at-least-once retries on handler failure, **do not rely on offset rewinding** at this layer. Either let your callback succeed and re-publish to a dead-letter / retry topic (which is what `KafkaDistributedEventBus` does — it accepts `IProducerPool` for exactly that reason), or build your own committed-offset tracking on top of the raw `IConsumerPool`.
+</Warning>
 
 ### Holding a producer reference
 
@@ -500,7 +529,7 @@ There is no first-party Kafka background-job package — for queue-style workloa
 - **`Lazy<>` short-circuits double-build.** Concurrent `Get` calls for the same `connectionName` will end up with the same instance — the loser of the `GetOrAdd` race discards its own `Lazy` without ever evaluating `.Value`.
 - **`EnableAutoCommit = false` is non-negotiable from the default code path.** If you flip it back on via `ConfigureConsumer`, you're trading at-least-once for at-most-once.
 - **No connection-level cluster split.** Unlike `Volo.Abp.RabbitMQ`, the Kafka pool does not split a `;`-delimited host string — `Confluent.Kafka` already accepts a comma-separated `BootstrapServers` value natively.
-- **Topics are not auto-created here.** The pool only builds producers/consumers. Topic creation is the responsibility of `Volo.Abp.EventBus.Kafka` (which reads `AbpKafkaOptions.ConfigureTopic`) or your infra tooling.
+- **Topics *are* auto-created by `KafkaMessageConsumer`** on first tick — but only by consumers, not producers. The pool layer itself (`ProducerPool`, `ConsumerPool`) never touches `AdminClient`. If you publish via `IProducerPool.Get(...)` to a non-existent topic, Confluent.Kafka's default broker behaviour (or your infra tooling) decides whether the topic is created. Set `AbpKafkaOptions.ConfigureTopic` if you need non-default partition counts or replication factor for consumer-side auto-creation.
 
 ## Related
 

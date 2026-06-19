@@ -102,7 +102,7 @@ public interface IApplicationService : IRemoteService
 - The HTTP host module exposes `IApplicationService` implementations as MVC controllers via `Volo.Abp.AspNetCore.Mvc`.
 - The HTTP client side generates proxies for the same interfaces — so a Blazor WASM project only ever references `Application.Contracts`.
 
-`IRemoteService` lives in `Volo.Abp.Http`; the parent `AbpDddApplicationModule` excludes it from the API description so swagger/openapi generation doesn't try to model it as a parameter — see the snippet in [Application](/ddd/application).
+`IRemoteService` lives in `framework/src/Volo.Abp.Core/Volo/Abp/IRemoteService.cs` (namespace `Volo.Abp`); the parent `AbpDddApplicationModule` excludes it from the API description so swagger/openapi generation doesn't try to model it as a parameter — see the snippet in [Application](/ddd/application).
 
 ## CRUD-style service contracts
 
@@ -152,15 +152,23 @@ Each of the small pieces is also a usable contract on its own:
 
 ```csharp
 // ICreateAppService.cs
-public interface ICreateAppService<TEntityDto, in TCreateInput> : IApplicationService
+public interface ICreateAppService<TEntityDto>
+    : ICreateAppService<TEntityDto, TEntityDto> { }
+
+public interface ICreateAppService<TGetOutputDto, in TCreateInput>
+    : IApplicationService
 {
-    Task<TEntityDto> CreateAsync(TCreateInput input);
+    Task<TGetOutputDto> CreateAsync(TCreateInput input);
 }
 
 // IUpdateAppService.cs
-public interface IUpdateAppService<TEntityDto, in TKey, in TUpdateInput> : IApplicationService
+public interface IUpdateAppService<TEntityDto, in TKey>
+    : IUpdateAppService<TEntityDto, TKey, TEntityDto> { }
+
+public interface IUpdateAppService<TGetOutputDto, in TKey, in TUpdateInput>
+    : IApplicationService
 {
-    Task<TEntityDto> UpdateAsync(TKey id, TUpdateInput input);
+    Task<TGetOutputDto> UpdateAsync(TKey id, TUpdateInput input);
 }
 
 // IDeleteAppService.cs
@@ -170,10 +178,15 @@ public interface IDeleteAppService<in TKey> : IApplicationService
 }
 
 // ICreateUpdateAppService.cs
-public interface ICreateUpdateAppService<TEntityDto, in TKey, in TCreateInput, in TUpdateInput>
-    : ICreateAppService<TEntityDto, TCreateInput>,
-      IUpdateAppService<TEntityDto, TKey, TUpdateInput>
-{ }
+public interface ICreateUpdateAppService<TEntityDto, in TKey>
+    : ICreateUpdateAppService<TEntityDto, TKey, TEntityDto> { }
+
+public interface ICreateUpdateAppService<TEntityDto, in TKey, in TCreateUpdateInput>
+    : ICreateUpdateAppService<TEntityDto, TKey, TCreateUpdateInput, TCreateUpdateInput> { }
+
+public interface ICreateUpdateAppService<TGetOutputDto, in TKey, in TCreateUpdateInput, in TUpdateInput>
+    : ICreateAppService<TGetOutputDto, TCreateUpdateInput>,
+      IUpdateAppService<TGetOutputDto, TKey, TUpdateInput> { }
 ```
 
 If you only need a "create + list" service, you can inherit `IReadOnlyAppService` and `ICreateAppService` directly and skip `ICrudAppService`.

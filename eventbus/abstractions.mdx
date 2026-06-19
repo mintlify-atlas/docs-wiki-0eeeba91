@@ -377,18 +377,15 @@ public class LocalEventHandlerOrderAttribute : Attribute
 
 Stamp this on a local handler to control its position relative to other handlers for the same event. The local bus sorts factories by ascending `Order` before dispatching.
 
-## Event data migration
+## Evolving event schemas
 
-When you change the payload shape of an already-deployed event, ABP gives you `IEventDataMigrator<TEvent>` to upgrade an old serialized event into the new shape before it reaches the handler. The inbox calls every registered migrator for the event type in turn, threading the result through. Implementations live alongside your event types and are picked up automatically through DI conventions.
+There is no in-framework migrator interface — `Volo.Abp.EventBus.Abstractions` does not ship an `IEventDataMigrator<T>` hook. Schema evolution is handled at the type level:
 
-```csharp
-public interface IEventDataMigrator<TEvent>
-{
-    Task<TEvent?> MigrateAsync(TEvent eventData);
-}
-```
+- Add new optional properties; old consumers ignore them.
+- Never rename or remove a property on a published event. Add a new field instead.
+- When the shape change is breaking, mint a new event by **versioning the wire name**: `[EventName("orders.order_placed.v2")]`. Producers publish both versions during the rollout window; consumers subscribe to the version they understand.
 
-Use this when you add a field, drop a field, or split an event in two and need to upgrade in-flight messages without coordinating a global redeploy.
+Because every consumer routes by `EventNameAttribute.GetNameOrDefault(eventType)`, a `v1` and a `v2` event type are independent endpoints across every broker adapter.
 
 ## `IEventBusConsts`
 

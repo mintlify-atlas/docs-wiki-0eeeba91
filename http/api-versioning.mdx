@@ -4,7 +4,7 @@ sidebarTitle: "API Versioning"
 description: "Volo.Abp.ApiVersioning.Abstractions: exposes IRequestedApiVersion to non-MVC layers so client proxies and audit logs can record the active API version."
 ---
 
-`Volo.Abp.ApiVersioning.Abstractions` is the smallest module in the framework — one interface, one null implementation, one module class. Its job is to give *non-MVC* layers (the client proxy, the audit log, the local event bus, custom telemetry) a way to ask "what API version is currently being served?" without taking a hard dependency on `Microsoft.AspNetCore.Mvc.Versioning`. The MVC versioning module (when present) replaces the null implementation with a request-scoped one that reads the version from the route / header / query string; without it, callers see `null` and proceed unversioned.
+`Volo.Abp.ApiVersioning.Abstractions` is the smallest module in the framework — one interface, one null implementation, one module class. Its job is to give *non-MVC* layers (the client proxy, the audit log, the local event bus, custom telemetry) a way to ask "what API version is currently being served?" without taking a hard dependency on `Asp.Versioning`. When the host opts in to API versioning by calling `services.AddAbpApiVersioning(...)` (an extension shipped in `Volo.Abp.AspNetCore.Mvc`), the null registration is replaced with `HttpContextRequestedApiVersion`, which reads the active version from the current `HttpContext`. Without that call, callers see `null` and proceed unversioned.
 
 Module path: `framework/src/Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/`.
 
@@ -59,7 +59,7 @@ public class AbpApiVersioningAbstractionsModule : AbpModule
 }
 ```
 
-A single DI registration. The downstream `Volo.Abp.AspNetCore.Mvc.Versioning` package replaces this singleton with a scoped implementation that reads the active version from the current `HttpContext`.
+A single DI registration. When the host calls `services.AddAbpApiVersioning(...)` (from `Volo.Abp.AspNetCore.Mvc`'s `AbpApiVersioningExtensions`), the registration is replaced with a transient `HttpContextRequestedApiVersion` that reads the active version from the current `HttpContext`.
 
 ## Why the indirection?
 
@@ -96,28 +96,42 @@ public class ClientProxyBase<TService>
 
 So if a server-side action has `SupportedVersions = ["1.0", "2.0"]`, the client proxy *removes* any explicit `api-version` argument from the method's parameter list — and lets the version routing be handled by URL or header instead.
 
-## Example: replacing the null implementation
+## The shipped replacement: `HttpContextRequestedApiVersion`
+
+`Volo.Abp.AspNetCore.Mvc` ships the production implementation (in `Volo.Abp.AspNetCore.Mvc.Versioning`):
 
 ```csharp
-public class HttpContextRequestedApiVersion
-    : IRequestedApiVersion, ITransientDependency
-{
-    private readonly IHttpContextAccessor _accessor;
-    public HttpContextRequestedApiVersion(IHttpContextAccessor accessor) => _accessor = accessor;
+namespace Volo.Abp.AspNetCore.Mvc.Versioning;
 
-    public string? Current
+public class HttpContextRequestedApiVersion : IRequestedApiVersion
+{
+    public string? Current => _httpContextAccessor.HttpContext?.GetRequestedApiVersion()?.ToString();
+
+    private readonly IHttpContextAccessor _httpContextAccessor;
+
+    public HttpContextRequestedApiVersion(IHttpContextAccessor httpContextAccessor)
     {
-        get
-        {
-            var feature = _accessor.HttpContext?.Features
-                .Get<Asp.Versioning.IApiVersioningFeature>();
-            return feature?.RequestedApiVersion?.ToString();
-        }
+        _httpContextAccessor = httpContextAccessor;
     }
 }
 ```
 
-Register it with `[Dependency(ReplaceServices = true)]` (or `context.Services.Replace(...)`) and every existing caller — client proxies, audit log, custom code — instantly reads the right value.
+It is wired in by `AbpApiVersioningExtensions.AddAbpApiVersioning`:
+
+```csharp
+public static IApiVersioningBuilder AddAbpApiVersioning(
+    this IServiceCollection services,
+    Action<ApiVersioningOptions>? apiVersioningOptionsSetupAction = null,
+    Action<MvcApiVersioningOptions>? mvcApiVersioningOptionsSetupAction = null)
+{
+    services.AddTransient<IRequestedApiVersion, HttpContextRequestedApiVersion>();
+    services.AddTransient<IApiControllerSpecification, AbpConventionalApiControllerSpecification>();
+    // ...
+    return services.AddApiVersioning(apiVersioningOptionsSetupAction).AddMvc(mvcApiVersioningOptionsSetupAction);
+}
+```
+
+Call this from your MVC host module's `ConfigureServices` to opt in to API versioning — every existing caller (client proxies, audit log, custom code) instantly reads the request-scoped value instead of `null`.
 
 ## Edge cases
 
@@ -214,10 +228,10 @@ framework/src/Volo.Abp.ApiVersioning.Abstractions/Volo/Abp/ApiVersioning/
 
 ## Lifetime and resolution
 
-The interface is registered as a **singleton** in the abstractions module. When the full versioning package is loaded (`Volo.Abp.AspNetCore.Mvc.Versioning`), the singleton is replaced with a **scoped** implementation that depends on `IHttpContextAccessor`. Two consequences:
+The interface is registered as a **singleton** in the abstractions module. When `services.AddAbpApiVersioning(...)` runs, the registration is replaced with a **transient** `HttpContextRequestedApiVersion` that depends on `IHttpContextAccessor`. Two consequences:
 
-- A `IRequestedApiVersion` resolved from a singleton consumer always returns the null instance unless you switch your consumer to scoped too.
-- Inside a request scope, the resolved value reflects the current `HttpContext` — and is cached per request because the implementation reads `HttpContext.Features` (immutable for the duration of the pipeline).
+- A `IRequestedApiVersion` resolved from a singleton consumer captured before the replacement ran always returns the null instance — resolve it per call (or inject a scoped/transient wrapper) so the swap takes effect.
+- Inside a request, the resolved value reflects the current `HttpContext` — practically cached per request because `HttpContext.GetRequestedApiVersion()` is set once by the versioning middleware.
 
 ```csharp
 public class AuditPropertyContributor : ITransientDependency

@@ -207,7 +207,7 @@ Treat each consumer as a permanent worker — create one per `(queue, subscripti
 | Connection | `IConnectionPool` → `IConnection` | (folded into producer/consumer) | `IConnectionPool` → `ServiceBusClient` + `ServiceBusAdministrationClient` |
 | Send channel | `IChannelPool` → `IChannelAccessor` | `IProducerPool` → `IProducer<string, byte[]>` | `IPublisherPool` → `ServiceBusSender` |
 | Receive worker | `IRabbitMqMessageConsumerFactory` | `IKafkaMessageConsumerFactory` | `IAzureServiceBusMessageConsumerFactory` |
-| Recovery model | `AbpAsyncTimer` re-declares every 5 s (SDK auto-recovery disabled) | `AbpAsyncTimer` polls every 5 s | SDK `ServiceBusProcessor` event loop |
+| Recovery model | `AbpAsyncTimer` re-declares every 5 s (SDK auto-recovery disabled) | `AbpAsyncTimer` boots once; long-running `Task` then polls in `while (true)` | SDK `ServiceBusProcessor` event loop |
 | Serializer | `IRabbitMqSerializer` (default `Utf8JsonRabbitMqSerializer`) | `IKafkaSerializer` (default `Utf8JsonKafkaSerializer`) | `IAzureServiceBusSerializer` (default `Utf8JsonAzureServiceBusSerializer`) |
 
 The `IConnectionPool` columns are deliberately different. RabbitMQ separates "connection" (TCP) from "channel" (multiplexed logical session) — so ABP pools them separately. Kafka folds the connection inside the producer/consumer SDK objects, so the pool keys are simply `connectionName`. Azure Service Bus needs two clients per connection — a data-plane `ServiceBusClient` and a management-plane `ServiceBusAdministrationClient` — so the pool returns both.
@@ -220,7 +220,7 @@ Two of the three transports auto-create their broker entities. The contracts are
 | --- | --- | --- |
 | RabbitMQ | Exchange + queue + bindings | `RabbitMqMessageConsumer` recovery tick — `ExchangeDeclareConfiguration` and `QueueDeclareConfiguration` are passed to the factory. |
 | Azure Service Bus | Topic + subscription | `PublisherPool.GetAsync` / `ProcessorPool.GetAsync` call `SetupTopicAsync` / `SetupSubscriptionAsync` extensions on the admin client. |
-| Kafka | Topic (optional, via `AbpKafkaOptions.ConfigureTopic`) | Not in the transport package — `Volo.Abp.EventBus.Kafka` does it explicitly when configured. |
+| Kafka | Topic (single partition, RF=1 by default) | `KafkaMessageConsumer.CreateTopicAsync` runs on the first timer tick. `AbpKafkaOptions.ConfigureTopic` lets you override the `TopicSpecification`; `TopicAlreadyExists` is swallowed for idempotency. Producer-side creation is left to the broker / your infra. |
 
 Pre-create entities only when you need non-default properties (quorum queues, TTL policies, partition counts). Otherwise the transport will do the right thing.
 

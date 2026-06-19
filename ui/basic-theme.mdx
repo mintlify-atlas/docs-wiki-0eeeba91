@@ -54,7 +54,7 @@ modules/basic-theme/src/
 ## The `ITheme` implementation
 
 ```csharp
-// Volo/Abp/AspNetCore/Mvc/UI/Theme/Basic/BasicTheme.cs
+// modules/basic-theme/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic/BasicTheme.cs
 [ThemeName(Name)]
 public class BasicTheme : ITheme, ITransientDependency
 {
@@ -232,15 +232,19 @@ The two view components it adds — `LanguageSwitchViewComponent` and `UserMenuV
 
 ## Choosing the layout in a Razor page
 
+You usually do not have to set `Layout` at all — `Theme.Shared` ships a `Pages/_ViewStart.cshtml` that runs `Layout = ThemeManager.CurrentTheme.GetApplicationLayout();`. That extension calls `ITheme.GetLayout(StandardLayouts.Application)`, which for `BasicTheme` returns `~/Themes/Basic/Layouts/Application.cshtml`.
+
+When you need a different layout — e.g. the unauthenticated `Account` layout — set the standard name as a string. The theme's `GetLayout(...)` resolves it to a `.cshtml` path at render time:
+
 ```cshtml
 @page
 @using Volo.Abp.AspNetCore.Mvc.UI.Theming
 @{
-    Layout = ThemingConsts.LayoutTypes.Application;  // or .Account / .Empty
+    Layout = StandardLayouts.Account;  // or .Empty
 }
 ```
 
-`Layout` is set to the *standard name*, not the `cshtml` path. At render time the theme's `GetLayout(...)` maps the name to a path. Swap `BasicTheme` for `LeptonXTheme` (commercial) by changing only your module's `[DependsOn]`, and the same Razor Page now picks up `~/Themes/LeptonX/Layouts/Application.cshtml`.
+Swap `BasicTheme` for `LeptonXTheme` (commercial) by changing only your module's `[DependsOn]`, and the same Razor Page now picks up `~/Themes/LeptonX/Layouts/Account.cshtml`.
 
 ## What the layout actually renders
 
@@ -311,17 +315,17 @@ public virtual string GetLayout(string name, bool fallbackToDefault = true)
 - `Account` — no menu, language switch only. Used by `/Account/Login`, `/Account/Register`, `/Account/ForgotPassword`, etc. so the same look-and-feel is preserved across the identity flow.
 - `Empty` — `<body>@RenderBody()</body>`. Used for embedded modal pages and the error page if you want a stripped layout.
 
-A consuming Razor Page selects the layout by name:
+A consuming Razor Page picks up `Application` automatically via `_ViewStart.cshtml`. To override, set the standard name as a string:
 
 ```cshtml
 @page
 @using Volo.Abp.AspNetCore.Mvc.UI.Theming
 @{
-    Layout = ThemingConsts.LayoutTypes.Application;  // or .Account / .Empty
+    Layout = StandardLayouts.Account;  // or StandardLayouts.Empty
 }
 ```
 
-Because `Layout` is the standard name, the same Razor Page works under any theme that implements `ITheme` — swap `BasicTheme` for `LeptonXTheme` (commercial) and `~/Themes/LeptonX/Layouts/Application.cshtml` is picked up instead.
+Because `Layout` is the standard name, the same Razor Page works under any theme that implements `ITheme` — swap `BasicTheme` for `LeptonXTheme` (commercial) and `~/Themes/LeptonX/Layouts/Account.cshtml` is picked up instead.
 
 ## Cross-references
 

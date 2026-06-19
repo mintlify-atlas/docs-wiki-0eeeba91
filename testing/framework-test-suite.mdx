@@ -1,18 +1,21 @@
 ---
-title: "framework/test/: The 84 Test Projects, By Category"
+title: "framework/test/: The Test Projects, By Category"
 sidebarTitle: "Framework test suite"
 description: "A categorized index of every test project under framework/test/ — AbpTestBase, AspNetCore, BackgroundJobs, BlobStoring, Caching, EntityFrameworkCore, EventBus, MongoDB, and the rest."
 ---
 
-`framework/test/` contains **84 directories**: 81 test projects, two shared support projects (`AbpTestBase`, `Volo.Abp.TestApp`), and the `SimpleConsoleDemo` sample. Every directory maps one-to-one to a `framework/src/Volo.Abp.{Name}/` package — if there's a source project, there's almost always a `{Name}.Tests` next to it. This page enumerates them by category so you can find the prior art that matches whatever you're testing.
+`framework/test/` contains **84 directories**: 78 xUnit test projects ending in `.Tests`, plus 6 support directories — `AbpTestBase` (shared helpers), `Volo.Abp.TestApp` (a miniature reusable domain), `SimpleConsoleDemo` (a console sample), `Volo.Abp.AspNetCore.Mvc.PlugIn` (a plug-in MVC project loaded by `Mvc.Tests`), and two `*.Tests.SecondContext` projects that supply a second DbContext to the multi-context UoW tests. Every test directory maps one-to-one to a `framework/src/Volo.Abp.{Name}/` package — if there's a source project, there's almost always a `{Name}.Tests` next to it. This page enumerates them by category so you can find the prior art that matches whatever you're testing.
 
 ```
 framework/test/
 ├── AbpTestBase/                                 // shared helpers
 ├── SimpleConsoleDemo/                           // sample, not a test project
+├── Volo.Abp.AspNetCore.Mvc.PlugIn/              // plug-in loaded by Mvc.Tests
+├── Volo.Abp.EntityFrameworkCore.Tests.SecondContext/   // 2nd DbContext rig
+├── Volo.Abp.MongoDB.Tests.SecondContext/        // 2nd Mongo DbContext rig
 ├── Volo.Abp.TestApp/                            // shared "TestApp" entities/services
 ├── Volo.Abp.TestApp.Tests/                      // tests using TestApp + Memory DB
-└── Volo.Abp.{...}.Tests/                        // 80 individual test projects
+└── Volo.Abp.{...}.Tests/                        // the remaining test projects
 ```
 
 Every test project uses xUnit + Shouldly + NSubstitute. `common.test.props` (imported at the top of every `*.Tests.csproj`) provides the package references:
@@ -33,7 +36,7 @@ Every test project uses xUnit + Shouldly + NSubstitute. `common.test.props` (imp
 
 <CardGroup cols={3}>
   <Card title="AbpTestBase" icon="hammer">
-    Cross-test helpers. Contains `Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs` (extension methods like `services.ShouldContainSingleton<TService, TImpl>()`) and `Volo/Abp/TestBase/Logging/ICanLogOnObject.cs`. Many test projects reference it.
+    Cross-test helpers. Contains `Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs` (`services.ShouldContainSingleton(typeof(IFoo), typeof(Foo))`, plus `ShouldContainTransient`, `ShouldContainScoped`, `ShouldContainTransientImplementationFactory`, `ShouldContain(serviceType, implementationType, lifetime)`, `ShouldNotContainService(serviceType)`) and `Volo/Abp/TestBase/Logging/ICanLogOnObject.cs`. Many test projects reference it.
   </Card>
   <Card title="Volo.Abp.TestApp" icon="building">
     A miniature ABP "application" — `Person`, `City`, `PersonRepository`, `IPersonAppService`, plus an `AbpTestAppDomainModule`. Used by data and DI tests that need real entities without dragging in a full module.
@@ -229,17 +232,18 @@ Reading the pattern back out of this list:
 ## A grep-friendly count, by prefix
 
 ```
-AbpTestBase / Volo.Abp.TestApp / SimpleConsoleDemo .... 3 support projects
-Volo.Abp.AspNetCore.*.Tests .......................... 10
+AbpTestBase / TestApp / SimpleConsoleDemo / Mvc.PlugIn /
+  EntityFrameworkCore.Tests.SecondContext /
+  MongoDB.Tests.SecondContext ........................ 6 support projects
+Volo.Abp.AspNetCore.*.Tests .......................... 9
 Volo.Abp.BlobStoring.*.Tests ......................... 9
 Volo.Abp.Imaging.*.Tests ............................. 5
 Volo.Abp.TextTemplating.*.Tests ...................... 3
 Volo.Abp.Caching.*.Tests ............................. 2
 Volo.Abp.Http.*.Tests ................................ 3
 Volo.Abp.Sms.*.Tests ................................. 2
-Volo.Abp.EntityFrameworkCore.* / MongoDB.* contexts .. 4
-Other Volo.Abp.{...}.Tests projects .................. 43
-Total ............................................... 84
+Other Volo.Abp.{...}.Tests projects .................. 45
+Total directories under framework/test/ .............. 84
 ```
 
 The repository's CI build runs every one of these against in-memory backing stores; the provider-specific ones (Aws/Azure/Google blob, Aliyun/TencentCloud SMS) ship integration tests that are gated behind environment variables for credentials.

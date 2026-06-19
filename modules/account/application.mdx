@@ -332,7 +332,8 @@ The orchestration is uniform: every write goes through `IdentityUserManager` (so
 ```csharp modules/account/src/Volo.Abp.Account.Application/Volo/Abp/Account/AbpAccountApplicationModule.cs
 [DependsOn(
     typeof(AbpAccountApplicationContractsModule),
-    typeof(AbpIdentityDomainModule),
+    typeof(AbpIdentityApplicationModule),
+    typeof(AbpUiNavigationModule),
     typeof(AbpEmailingModule),
     typeof(AbpMapperlyModule)
 )]
@@ -340,15 +341,28 @@ public class AbpAccountApplicationModule : AbpModule
 {
     public override void ConfigureServices(ServiceConfigurationContext context)
     {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountApplicationModule>();
+        });
+
+        Configure<AppUrlOptions>(options =>
+        {
+            options.Applications["MVC"].Urls[AccountUrlNames.PasswordReset] = "Account/ResetPassword";
+        });
+
         context.Services.AddMapperlyObjectMapper<AbpAccountApplicationModule>();
     }
 }
 ```
 
-The two key dependencies are:
+The key dependencies are:
 
-- **`AbpIdentityDomainModule`** — gives access to `IdentityUserManager`, `IIdentityRoleRepository`, `IdentitySecurityLogManager`, and the identity event handlers.
+- **`AbpIdentityApplicationModule`** — transitively pulls in `AbpIdentityDomainModule`, giving access to `IdentityUserManager`, `IIdentityRoleRepository`, `IdentitySecurityLogManager`, and the identity event handlers, plus the Identity application services and DTOs (`IdentityUserDto`, `IdentityAppServiceBase`).
 - **`AbpEmailingModule`** — gives access to `IEmailSender` and the `StandardEmailTemplates` machinery used by `AccountEmailer`.
+- **`AbpUiNavigationModule`** — required because `AccountUrlNames` plugs into `AppUrlOptions` (the URL provider used to build the password-reset link inside emails).
+
+The `AppUrlOptions` registration above is what tells `AppUrlProviderAccountExtensions.GetPasswordResetUrlAsync(...)` that the canonical reset path on the `"MVC"` application is `Account/ResetPassword`; override or add applications here to send reset emails that point back to a SPA host or a custom URL.
 
 ## Calling the services
 

@@ -453,7 +453,31 @@ protected virtual void StartProcessing()
 }
 ```
 
-The handler invokes every callback registered via `OnMessageReceived` with the `ServiceBusReceivedMessage`. Because `ClientConfig.Processor.AutoCompleteMessages` defaults to `false`, **your callback is responsible for `CompleteMessageAsync`** (or `AbandonMessageAsync`, `DeadLetterMessageAsync`, …). Higher-level layers like `AzureServiceBusDistributedEventBus` perform that step automatically.
+The handler invokes every callback registered via `OnMessageReceived` with the `ServiceBusReceivedMessage`, then calls `args.CompleteMessageAsync(args.Message)` itself once every callback has returned successfully. The relevant snippet:
+
+```csharp
+// framework/src/Volo.Abp.AzureServiceBus/Volo/Abp/AzureServiceBus/AzureServiceBusMessageConsumer.cs
+protected virtual async Task HandleIncomingMessage(ProcessMessageEventArgs args)
+{
+    try
+    {
+        foreach (var callback in _callbacks)
+        {
+            await callback(args.Message);
+        }
+
+        await args.CompleteMessageAsync(args.Message);
+    }
+    catch (Exception exception)
+    {
+        await HandleError(exception);
+    }
+}
+```
+
+Because `ClientConfig.Processor.AutoCompleteMessages` defaults to `false`, the SDK does *not* settle the message on its own — the consumer above is the single point where settling happens. If any callback throws, `CompleteMessageAsync` is skipped and the exception is routed through `IExceptionNotifier`; the message returns to the subscription according to Service Bus's lock-renewal and delivery-count rules (eventually landing in the dead-letter queue once `MaxDeliveryCount` is exceeded).
+
+**Your callback should not call `CompleteMessageAsync`, `AbandonMessageAsync`, or `DeadLetterMessageAsync` directly** — the transport owns settling. To dead-letter a poison message, throw out of the callback and let the SDK's `MaxDeliveryCount` policy do the work.
 
 ## Putting it together
 
@@ -483,7 +507,8 @@ public class OrderSubscriber : ISingletonDependency
         {
             var dto = _serializer.Deserialize(message.Body.ToArray(), typeof(OrderCreatedEto));
             await HandleAsync((OrderCreatedEto)dto);
-            // NOTE: the wrapping layer (event bus) is what calls CompleteMessageAsync.
+            // NOTE: AzureServiceBusMessageConsumer calls CompleteMessageAsync itself
+            // after every callback returns — do not call it here.
         });
     }
 

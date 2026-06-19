@@ -448,7 +448,12 @@ protected virtual async Task<TenantConfigurationCacheItem> SetCacheAsync(string 
 
 ### Cache invalidation
 
-`TenantConfigurationCacheItemInvalidator` handles `TenantChangedEvent` (raised by `TenantManager`) **and** the standard EF Core change-tracking events for `Tenant`. Whenever a tenant's name changes or it is deleted, the corresponding cache key — derived from `TenantConfigurationCacheItem.CalculateCacheKey(id, normalizedName)` — is evicted.
+`TenantConfigurationCacheItemInvalidator` is a `[LocalEventHandlerOrder(-1)]` handler that subscribes to **two** local events:
+
+- `TenantChangedEvent` — raised by `TenantManager.ChangeNameAsync` and by the connection-string operations on `TenantAppService`.
+- `EntityChangedEventData<Tenant>` — ABP's standard entity-change event, dispatched by the EF Core / MongoDB change-tracker on every update or delete of `Tenant` (it skips `EntityCreatedEventData<Tenant>` because there is nothing to invalidate yet).
+
+Both handlers funnel into `ClearCacheAsync`, which removes the three keys derived from `TenantConfigurationCacheItem.CalculateCacheKey` — `(id, null)`, `(null, normalizedName)`, and `(id, normalizedName)` — under `considerUow: true` so the eviction is rolled back if the surrounding unit of work fails.
 
 ## Distributed events
 

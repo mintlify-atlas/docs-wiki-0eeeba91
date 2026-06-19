@@ -324,15 +324,39 @@ A tiny two-method service that backs the "Site CSS / Site JS" admin form. The si
 ## Base class and module wire-up
 
 ```csharp
-public abstract class CmsKitAdminAppServiceBase : ApplicationService
+// modules/cms-kit/src/Volo.CmsKit.Admin.Application/Volo/CmsKit/Admin/CmsKitAdminAppServiceBase.cs
+public abstract class CmsKitAdminAppServiceBase : CmsKitAppServiceBase
 {
     protected CmsKitAdminAppServiceBase()
     {
-        LocalizationResource = typeof(CmsKitResource);
-        ObjectMapperContext  = typeof(CmsKitAdminApplicationModule);
+        ObjectMapperContext = typeof(CmsKitAdminApplicationModule);
+    }
+
+    /// <summary>
+    /// Checks given policies until finding a granted one. If none is granted, throws <see cref="AbpAuthorizationException"/>.
+    /// </summary>
+    protected async Task CheckAnyOfPoliciesAsync([NotNull] IEnumerable<string> policies)
+    {
+        Check.NotNull(policies, nameof(policies));
+
+        foreach (var policy in policies)
+        {
+            if (await AuthorizationService.IsGrantedAsync(policy))
+            {
+                return;
+            }
+        }
+
+        throw new AbpAuthorizationException();
     }
 }
 ```
+
+`CmsKitAppServiceBase` (in `Volo.CmsKit.Common.Application`) is itself the project's `ApplicationService` subclass; it sets `LocalizationResource = typeof(CmsKitResource)` once for all CMS Kit app services. The admin base only overrides `ObjectMapperContext` so admin DTO mappings resolve out of `CmsKitAdminApplicationModule`'s AutoMapper profile.
+
+`CheckAnyOfPoliciesAsync` is the helper used by methods like `BlogPostAdminAppService` when an action is permitted under any of several permissions (e.g. "Update *or* Publish" both let you save a draft change).
+
+Two of the admin services — `BlogPostAdminAppService` and `TagAdminAppService` — actually derive directly from `CmsKitAppServiceBase` (skipping the admin base) for historical reasons; the rest go through `CmsKitAdminAppServiceBase`. New services should prefer the admin base.
 
 `CmsKitAdminApplicationModule` depends on:
 
